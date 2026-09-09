@@ -43,7 +43,7 @@ void printLog();
 /**
  * Global variables */
 // Sample time can not go lower than 300us
-const uint32_t sampleTimeUs = 10000; // desired sample time in us
+const uint32_t sampleTimeUs = 300; // desired sample time in us
 // const float ts = sampleTimeUs * 1e-6; // sample time in seconds
 // Robot configuration
 const float gear = 9.6;
@@ -126,7 +126,7 @@ void printLog()
   Serial.println("% 3   Desired value");
   Serial.println("% 4-5 motor voltage (left,right) (V)");
   Serial.println("% 6-7 Encoder count (left, right)");
-  Serial.println("% 8-9 motor vel (left, right) (rad/s)");
+  Serial.println("% 8-9 motor vel (left, right) (rad/s)");    
   Serial.println("% 10  Battery voltage (V)");
   Serial.println("% 11-14 pose (x,y,theta,distA) (m,m,rad,m)");
   Serial.println("% 15-16 motor current (left, right) (A)");
@@ -277,7 +277,7 @@ void sequenceTwoSteps()
       // stop after end time
       if (time_sec > endTime)
       { // stop, but continue logging for a while (0.3 sec)
-        stop(0.3); // actually sets state to 999 (i.e. default:)
+        stop(0.6); // actually sets state to 999 (i.e. default:)
       }
       break;
     default: // Hold until finished
@@ -370,7 +370,8 @@ void loop ( void )
       imu2.tick();
       encoder.tick();
       // updatePose();
-      sequenceTwoSteps();
+      spikeSequence();
+      
       //
       if (state > 0)
       { // Only if started

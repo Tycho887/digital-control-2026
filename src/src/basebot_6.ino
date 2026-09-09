@@ -40,8 +40,9 @@ void printLog();
 
 /**
  * Global variables */
-// Sample time can not go lower than 300us
-const uint32_t sampleTimeUs = 10000; // desired sample time in us
+// A complete three-spike capture lasts about 3.1 s. At 1 ms this fits in
+// the fixed 400 kB log buffer (3225 samples) with a small margin.
+const uint32_t sampleTimeUs = 1000; // desired sample time in us
 // const float ts = sampleTimeUs * 1e-6; // sample time in seconds
 // Robot configuration
 const float gear = 9.6;
@@ -107,7 +108,8 @@ void printLog()
   Serial.println("% 6-7 Encoder count (left, right)");
   Serial.println("% 8-9 motor vel (left, right) (rad/s)");
   Serial.println("% 10  Battery voltage (V)");
-  Serial.println("% 11  Pose (x,y,theta) (m, m, rad)");
+  Serial.println("% 11-13 pose (x,y,theta) (m, m, rad)");
+  Serial.println("% 14 trip distance (m)");
 
   Serial.println("% 15-16 motor current (left, right) (A)");
   for (int i = 0; i < logsCnt; i++)
@@ -198,6 +200,91 @@ void finished()
   // wait for next button press
   state = 0;
   printLog();
+}
+
+/**
+ * Simple 3-step sequence */
+void SpikeSequence()
+{ // this function is called at every sample time
+  // and should never wait in a loop.
+  // Update variables as needed and return.
+  bool button;
+  //
+  // this is a state machine
+  // state 0: wait for start button press
+  // other states are part of a sequence
+  switch (state)
+  { // run mission, initial value
+    case 0: // State 0 is just inactive, waiting for the start signal.
+      button = digitalReadFast(PIN_START_BUTTON);
+      if (button or robot.missionStart)
+      { // starting by a short time to get zero velocity data to the log
+        // reset for new run
+        start();
+        // Prepare next state
+        desiredValue = 0; // reference value to the controller
+        // to get start the log with no velocity
+        endTime = time_sec + 0.020; // new state to end after 20ms
+        state = 10;
+      }
+      break;
+    case 10: // Waiting for first step (zero velocity to log) to finish.
+      if (time_sec > endTime)
+      { // change to next values - drive
+        desiredValue = 6;  // should be in meters/sec, but is motor voltage for now,
+        endTime = time_sec + 0.48 ; // ~ 0.5 second
+        state = 11;
+      }
+      break;
+    case 11: // First step
+      // test if ready for next state
+      if (time_sec > endTime)
+      { // change to next values
+        desiredValue = 0;
+        endTime = time_sec + 0.50;
+        state = 12;
+      }
+      break;
+    case 12: // First 0 V interval
+      // test if this state is finished
+      if (time_sec > endTime)
+      { // change to next values
+        desiredValue = 6;
+        endTime = time_sec + 0.5;
+        state = 13;
+      }
+      break;
+    case 13: // Second 6 V spike
+      // test if this state is finished
+      if (time_sec > endTime)
+      { // change to next values
+        desiredValue = 0;
+        endTime = time_sec + 0.5;
+        state = 14;
+      }
+      break;
+    case 14: // Second 0 V interval
+      // test if this state is finished
+      if (time_sec > endTime)
+      { // change to next values
+        desiredValue = 6;
+        endTime = time_sec + 0.5;
+        state = 100;
+      }
+      break;
+    case 100: // Third 6 V spike
+      // Stop after the last spike's end time.
+      if (time_sec > endTime)
+      { // Stop, but continue logging for a while to capture the decay.
+        stop(0.6); // stop() changes state to 2, handled by default below.
+      }
+      break;
+    default: // Hold until finished
+      // this state is needed to enable a new start
+      if (time_sec > endTime)
+        finished();
+      break;
+  }
 }
 
 /**
@@ -301,6 +388,11 @@ void updateLog()
     logs[logsCnt].motorVel[0] = -encoder.motorVelocity[0];
     logs[logsCnt].motorVel[1] = encoder.motorVelocity[1];
     logs[logsCnt].battery = robot.batteryVoltage;
+    logs[logsCnt].pose[0] = pose[0];
+    logs[logsCnt].pose[1] = pose[1];
+    logs[logsCnt].pose[2] = pose[2];
+    logs[logsCnt].pose[3] = pose[3];
+    logs[logsCnt].distA = distA;
     // the last part is offset of current measurement (in Amps)
     // take the initial current readings and add or subtract as needed
     // these values fits Tania: (+0.260A, -0.275A)
@@ -349,7 +441,7 @@ void loop ( void )
       imu2.tick();
       encoder.tick();
       // updatePose();
-      sequenceTwoSteps();
+      SpikeSequence();
       //
       if (state > 0)
       { // Only if started
