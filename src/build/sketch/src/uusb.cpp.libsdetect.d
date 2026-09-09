@@ -1,0 +1,20 @@
+uusb.o: \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/uusb.cpp \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/core_pins.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/imxrt.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/pins_arduino.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_serial.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_desc.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/Stream.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/Print.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/core_id.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/WString.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/avr_functions.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/avr/pgmspace.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/Printable.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/wiring.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/binary.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/main.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/uusb.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/urobot.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/HardwareSerial.h

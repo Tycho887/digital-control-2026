@@ -1,0 +1,22 @@
+/Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/core/usb.c.o: \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb.c \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_dev.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/imxrt.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_desc.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_serial.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_seremu.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_rawhid.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_keyboard.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/keylayouts.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/avr/pgmspace.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_mouse.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_joystick.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_flightsim.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_touch.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_midi.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_audio.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/usb_mtp.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/core_pins.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/pins_arduino.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/avr/pgmspace.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/debug/printf.h

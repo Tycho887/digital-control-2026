@@ -1,0 +1,24 @@
+/Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/basebot_6.ino.cpp.o: \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/basebot_6.ino.cpp \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/IntervalTimer.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/udisplay.h \
+ /Users/michaeljohansen/Documents/Arduino/libraries/Adafruit_GFX_Library/Adafruit_GFX.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/pch/Arduino.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/Print.h \
+ /Users/michaeljohansen/Documents/Arduino/libraries/Adafruit_GFX_Library/gfxfont.h \
+ /Users/michaeljohansen/Documents/Arduino/libraries/Adafruit_BusIO/Adafruit_I2CDevice.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/libraries/Wire/Wire.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/libraries/Wire/WireIMXRT.h \
+ /Users/michaeljohansen/Documents/Arduino/libraries/Adafruit_BusIO/Adafruit_SPIDevice.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/libraries/SPI/SPI.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/DMAChannel.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/EventResponder.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/Adafruit_SSD1306_mod.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/urobot.h \
+ /Users/michaeljohansen/Library/Arduino15/packages/teensy/hardware/avr/1.62.0/cores/teensy4/HardwareSerial.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/main.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/uusb.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/umotor.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/uimu2.h \
+ /Users/michaeljohansen/Documents/Arduino/libraries/MPU9250_asukiaaa/src/MPU9250_asukiaaa.h \
+ /Users/michaeljohansen/Autumn2026/digital-control/week-01/basebot_6/build/sketch/src/uencoder.h
