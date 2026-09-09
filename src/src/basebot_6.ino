@@ -109,7 +109,7 @@ void printLog()
   Serial.println("% 10  Battery voltage (V)");
   Serial.println("% 11  Pose (x,y,theta) (m, m, rad)");
 
-  Serial.println("% 12-13 motor current (left, right) (A)");
+  Serial.println("% 15-16 motor current (left, right) (A)");
   for (int i = 0; i < logsCnt; i++)
   {
     // Serial.print(" ");
