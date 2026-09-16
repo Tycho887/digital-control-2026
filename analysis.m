@@ -13,7 +13,7 @@ cfg.TauFraction = 0.632;
 cfg.MinVelocity_rad_s = 1e-6;
 
 % Physical parameters used for the reflected-inertia estimate.
-cfg.RobotMass_kg = 1.000;
+cfg.RobotMass_kg = 927;
 cfg.WheelRadius_m = 0.03;
 cfg.GearRatio = 9.68;
 cfg.MotorCoreInertia_kgm2 = 1.01e-6;
