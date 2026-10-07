@@ -118,3 +118,93 @@ load-torque, traction or robot-body dynamics.
 Run `addpath('week06'); verify_week06` to verify defaults, script overrides,
 reverse motion, agreement with week05 and two independently parameterized
 wheel copies. Verification requires MATLAB and Simulink.
+
+## Composite robot: velocity and turn-rate commands
+
+`week06_robot_model.slx` exposes two scalar inputs: commanded forward velocity
+(m/s) and commanded turn rate (rad/s). Its reusable masked **Robot** subsystem
+outputs four scalar signals, ordered as signed distance (m), actual velocity
+(m/s), unwrapped turn angle (rad), and actual turn rate (rad/s). The scope and
+`out.robotOutputs` timeseries use the same output order.
+
+All physical, controller and initial-state defaults are defined in MATLAB:
+
+```matlab
+addpath('week06')
+[wheels, robot] = robot_model_defaults();
+robot.trackWidth = 0.14;       % wheel spacing, m
+robot.initialDistance = 0;    % signed distance, m
+robot.initialAngle = 0;       % heading, rad
+wheels(1).Kp = 2.03180408641676;
+wheels(2).Kp = 0.766619928019031;
+model = configure_robot_model(wheels, robot);
+```
+
+Alternatively run `week06/init_robot_model.m` for the saved week06 defaults.
+`configure_robot_model` installs parameters in the model workspace and applies
+MATLAB-owned solver settings. Changes are in memory; use `save_system(model)`
+to persist them. Reducing a wheel's Ts also requires reducing `robot.maxStep`
+to at most `min([wheels.Ts])/10`. Saved defaults permit opening the model in a
+clean session without rerunning identification or tuning.
+
+Example external commands, when simulation is desired:
+
+```matlab
+t = [0; 0.2; 0.201; robot.stopTime];
+commands = [t, [0; 0; 0.1; 0.1], [0; 0; 0.5; 0.5]];
+input = Simulink.SimulationInput(model);
+input = input.setExternalInput(commands);
+out = sim(input);
+```
+
+Steering uses `leftRef = velocityRef - trackWidth*turnRateRef/2` and
+`rightRef = velocityRef + trackWidth*turnRateRef/2`. Robot motion comes from
+actual wheel speeds: velocity is their average and turn rate is right minus
+left divided by track width. Positive turns are counterclockwise. Reversing
+decreases signed distance. The unequal tuned P loops can produce residual
+heading drift even with a zero turn command. No chassis or slip dynamics are
+added. The wheel radius and gearing retain the values used for tuning.
+
+Each wheel also exposes MATLAB parameters `initialMotorSpeed` (motor rad/s),
+`initialCurrent` (A), `initialSensorSpeed` (delayed motor rad/s), and
+`diagnosticVoltageScale`. The Robot mask accepts `wheelParameters` and
+`robotParameters` structures: when copying Robot, define those structures in
+the destination workspace and set its two mask fields to their names. Configure
+the destination solver suitably for the wheel sample times.
+
+Run `build_robot_model` to regenerate the model from the saved week06 wheel
+blocks and MATLAB defaults. Close the robot model before rebuilding; rebuilding
+overwrites the generated file. Fixed factors such as averaging by `1/2` are
+mathematical constants, while adjustable values use workspace expressions.
+
+### Command response and nominal stability experiment
+
+Run `run('week06/simulate_robot_response.m')` from the repository root. Edit
+`commandSchedule` in the script to change the held [time, velocity, turn rate]
+commands, and override `wheels` or `robot` before configuration to investigate
+parameter changes. Input interpolation is disabled in memory for this run.
+The script logs both wheel voltages, plots all four robot outputs and the
+wheel responses, and saves `response.png`, `response.mat`, `segments.csv` and
+`stability.csv` in `week06/robot_results`. It requires Simulink and Control
+System Toolbox. It leaves the model open with experiment settings in memory;
+close without saving to restore its saved configuration.
+
+The default 20 s experiment covers rest, straight driving, turning in place,
+combined commands in both turn directions, reverse driving, and stopping.
+With the saved parameters and Ts=1 ms, all held segments settled. The nominal
+ZOH + one-sample latency linear model gives maximum pole magnitudes 0.94242
+(left) and 0.86668 (right), both below one. Phase margins are 15.515 degrees
+and 36.962 degrees; gain margins are 2.4083 dB and 6.1229 dB. The left loop
+therefore has the smaller robustness margin. These are actual achieved
+margins, not the tuner's requested 60-degree target.
+
+At a straight 0.1 m/s command, predicted/simulated steady robot speed is
+0.099145 m/s and residual turn rate is -0.0047246 rad/s (about -0.271 deg/s).
+Unequal P-controller steady errors cause this drift. Steering does not add
+feedback between the independent wheel loops, so nominal wheel-loop stability
+is preserved in the composite speed response. Distance and heading integrate
+the resulting motion and can grow under constant commands or accumulated
+tracking error; there is no outer position/heading regulator. The linear
+margins use the tuning approximation; the actual sampled, saturated model is
+also simulated. Neither this experiment nor nominal margins guarantee
+stability for different sample times, gains, loading, or real traction.
