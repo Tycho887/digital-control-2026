@@ -43,7 +43,7 @@ void printLog();
 /**
  * Global variables */
 // Sample time can not go lower than 300us
-const uint32_t sampleTimeUs = 300; // desired sample time in us
+const uint32_t sampleTimeUs = 1000; // desired sample time in us
 // const float ts = sampleTimeUs * 1e-6; // sample time in seconds
 // Robot configuration
 const float gear = 9.6;
@@ -293,6 +293,8 @@ void sequenceTwoSteps()
 void controlUpdate()
 { // do control during a mission only.
   // called at every tick
+  float velLeft = encoder.motorVelocity[0];
+  float velRight = encoder.motorVelocity[1];
   //
   float velRef = desiredValue;
   //
@@ -306,6 +308,13 @@ void controlUpdate()
   //
   // in the main loop, there is a motor.tick() that actually send the
   // values to the motor.
+  float error_left = velRef - velLeft;
+  float error_right = velRef - velRight;
+  
+  float gain = 0.5; // just a test value
+  // implement a P-controller for each motor
+  motor.motorVoltage[0] = -velRef + gain * error_left;
+  motor.motorVoltage[1] = velRef + gain * error_right;
 }
 
 void updateLog()

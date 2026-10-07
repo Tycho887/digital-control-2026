@@ -41,7 +41,7 @@ void printLog();
 /**
  * Global variables */
 // A complete three-spike capture lasts about 3.1 s. At 1 ms this fits in
-// the fixed 400 kB log buffer (3225 samples) with a small margin.
+// the fixed 400 kB log buffer. Unused fields are omitted to retain capacity.
 const uint32_t sampleTimeUs = 1000; // desired sample time in us
 // const float ts = sampleTimeUs * 1e-6; // sample time in seconds
 // Robot configuration
@@ -70,15 +70,11 @@ typedef struct
   float pose[4];
   float distA;
   float poseVel[2];
-  float inVelLeft;
-  float inVelRight;
-  float gyro[3];
-  float headU;
-  float accVel;
-  float accTurn;
-  float gyro1;
-  float gyro2;
-  float gyro3;
+  uint32_t captureUs;
+  uint16_t currentADC[2];
+  int16_t pwmRequest[2];
+  uint8_t driverState; // bits: enabled L/R, sleeping L/R
+  float encoderDelay[2];
 
 } LogData;
 //
@@ -86,6 +82,9 @@ typedef struct
 // (specific for this micro processor, a Teensy 4)
 const int logsMax = 400000 / sizeof(LogData); // allocates 400kBytes
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
+const float currentScale = 0.0045; // A/count; requires hardware calibration
+const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
+uint32_t captureStartUs = 0;
 int logsCnt = 0; // next log entry to use / i.e. number of used log entries
 
 void printLog()
@@ -111,7 +110,18 @@ void printLog()
   Serial.println("% 11-13 pose (x,y,theta) (m, m, rad)");
   Serial.println("% 14 trip distance (m)");
 
-  Serial.println("% 15-16 motor current (left, right) (A)");
+  Serial.println("% 15-16 legacy calibrated current (left, right) (A), forward-positive");
+  Serial.println("% 17 capture timestamp (us since start), ADC read follows actuator update");
+  Serial.println("% 18-19 raw current ADC counts (left A1, right A0), 12 bit");
+  Serial.println("% 20-21 signed PWM request (left,right), forward-positive, full scale 4096");
+  Serial.println("% 22 driver flags: bits 0/1 enable L/R, bits 2/3 sleeping L/R");
+  Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
+  Serial.print("% Current A/count "); Serial.print(currentScale,7);
+  Serial.print(" offsets L/R "); Serial.print(currentOffset[0],6);
+  Serial.print(" "); Serial.println(currentOffset[1],6);
+  Serial.print("% PWM frequency Hz "); Serial.println(motor.PWMfrq);
+  Serial.println("% Voltage columns 4-5 are requests, NOT measured terminal voltages.");
+  Serial.println("% Driver assumes supply loss 1 V, adds +/-0.4 V; battery <5.5 V uses 11.1 V fallback.");
   for (int i = 0; i < logsCnt; i++)
   {
     // Serial.print(" ");
@@ -129,8 +139,16 @@ void printLog()
     Serial.print(" ");    Serial.print(d->pose[1],4);      // 12 (m)
     Serial.print(" ");    Serial.print(d->pose[2],4);      // 13 (rad)
     Serial.print(" ");    Serial.print(d->distA,4);        // 14 (m)
-    Serial.print(" ");    Serial.print(d->motorCurrent[0],2);      // 15 (A)
-    Serial.print(" ");    Serial.print(d->motorCurrent[1],2);      // 16 (A)
+    Serial.print(" ");    Serial.print(d->motorCurrent[0],6);      // 15 (A)
+    Serial.print(" ");    Serial.print(d->motorCurrent[1],6);      // 16 (A)
+    Serial.print(" "); Serial.print(d->captureUs); // 17
+    Serial.print(" "); Serial.print(d->currentADC[0]); // 18
+    Serial.print(" "); Serial.print(d->currentADC[1]); // 19
+    Serial.print(" "); Serial.print(d->pwmRequest[0]); // 20
+    Serial.print(" "); Serial.print(d->pwmRequest[1]); // 21
+    Serial.print(" "); Serial.print(d->driverState); // 22
+    Serial.print(" "); Serial.print(d->encoderDelay[0],7); // 23
+    Serial.print(" "); Serial.print(d->encoderDelay[1],7); // 24
     Serial.println("");
     d++;
   }
@@ -169,6 +187,7 @@ void start()
 { // Start timing
   // reset log and encoders
   logsCnt = 0;
+  captureStartUs = micros();
   // change motor PWM frequency for sampling time test
   // should not be above 100000 (100kHz), default is 80kHz.
   motor.setPWMfrq(80000);
@@ -397,15 +416,21 @@ void updateLog()
     // take the initial current readings and add or subtract as needed
     // these values fits Tania: (+0.260A, -0.275A)
     logs[logsCnt].desiredHeading = desiredHeading;
-    logs[logsCnt].motorCurrent[0] = -(analogRead(A1) - 2048) * 0.0045 + 0.260;
-    logs[logsCnt].motorCurrent[1] =  (analogRead(A0) - 2048) * 0.0045 - 0.275;
+    logs[logsCnt].captureUs = micros() - captureStartUs;
+    logs[logsCnt].currentADC[0] = analogRead(A1);
+    logs[logsCnt].currentADC[1] = analogRead(A0);
+    logs[logsCnt].motorCurrent[0] = -(int(logs[logsCnt].currentADC[0]) - 2048) * currentScale + currentOffset[0];
+    logs[logsCnt].motorCurrent[1] =  (int(logs[logsCnt].currentADC[1]) - 2048) * currentScale + currentOffset[1];
+    logs[logsCnt].pwmRequest[0] = -motor.getPWMRequest(0);
+    logs[logsCnt].pwmRequest[1] = motor.getPWMRequest(1);
+    logs[logsCnt].driverState = motor.motorEnable[0] | (motor.motorEnable[1] << 1)
+        | (motor.isSleeping(0) << 2) | (motor.isSleeping(1) << 3);
+    logs[logsCnt].encoderDelay[0] = encoder.encoderDelay[0];
+    logs[logsCnt].encoderDelay[1] = encoder.encoderDelay[1];
     logs[logsCnt].poseVel[0] = poseVel[0];
     logs[logsCnt].poseVel[1] = poseVel[1];
     // add more items as needed, NB! also the the struct definition at top.
-    // We store the parameters from the Gyro, from imu2
-    logs[logsCnt].gyro[0] = imu2.gyro[0];
-    logs[logsCnt].gyro[1] = imu2.gyro[1];
-    logs[logsCnt].gyro[2] = imu2.gyro[2];
+
     logsCnt++;
   }
 }

@@ -31,7 +31,7 @@ class CCDE:
 def part_1_tests():
     case_1a = np.array([1, -0.5, 0.3])
     case_1b = np.array([1, -1.6, 1])
-    case_1c = np.array([1, -0.8, 0.4])
+    case_1c = np.array([1, -0.8, -0.4])
     for case in [case_1a, case_1b, case_1c]:
         ccde = CCDE(case)
         roots = ccde.find_roots()

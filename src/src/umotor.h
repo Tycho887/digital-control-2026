@@ -33,6 +33,9 @@ class UMotor //: public USubss
 public:
   // motor voltage
   float motorVoltage[2];
+  // Signed PWM request after deadband, not a measured terminal voltage.
+  int getPWMRequest(int wheel) const { return motorAnkerPWM[wheel]; }
+  bool isSleeping(int wheel) const { return motorSleeping[wheel]; }
   bool motorEnable[2] = {false};
   /** PWM frequency (100kHz is probably maximum) */
   int PWMfrq = 68000; //
