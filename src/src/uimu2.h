@@ -67,6 +67,8 @@ public:
   /**
    * Newest obtained gyro values
    * in degrees per second */
+  bool accelFresh = false, gyroFresh = false;
+  uint32_t accelTimestampUs = 0, gyroTimestampUs = 0;
   float gyro[3] = {0}; // in degrees per second
   /**
    * Newest accelerometer values

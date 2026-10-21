@@ -5,7 +5,9 @@
 % is required.
 
 %% Editable settings
-cfg.LogDirectory = fullfile(fileparts(mfilename('fullpath')), 'src', 'logs');
+notebookFolder = fileparts(mfilename('fullpath'));
+repoRoot = fileparts(fileparts(notebookFolder));
+cfg.LogDirectory = fullfile(repoRoot, 'src', 'logs');
 cfg.VoltageChangeTolerance_V = 0.05;
 cfg.SteadyWindow_s = 0.012;
 cfg.BaselineWindow_s = 0.012;

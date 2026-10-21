@@ -21,7 +21,7 @@ add_block('built-in/Subsystem',body,'Position',[230 80 460 240]);
 mask = Simulink.Mask.create(body);
 mask.addParameter('Type','edit','Name','wheelParameters','Prompt','Left/right wheel structures','Value','wheels');
 mask.addParameter('Type','edit','Name','robotParameters','Prompt','Robot structure','Value','robot');
-mask.Display = "disp('Two-wheel robot'); port_label('input',1,'velocity ref (m/s)'); port_label('input',2,'turn rate ref (rad/s)'); port_label('output',1,'distance (m)'); port_label('output',2,'velocity (m/s)'); port_label('output',3,'turn angle (rad)'); port_label('output',4,'turn rate (rad/s)');";
+mask.Display = "disp('Two-wheel robot'); port_label('input',1,'velocity ref (m/s)'); port_label('input',2,'turn rate ref (rad/s)'); port_label('output',1,'distance (m)'); port_label('output',2,'turn angle (rad)'); port_label('output',3,'x (m)'); port_label('output',4,'y (m)');";
 add_block('built-in/Inport',[body '/Velocity reference'],'Position',[30 65 60 85],'Port','1');
 add_block('built-in/Inport',[body '/Turn rate reference'],'Position',[30 175 60 195],'Port','2');
 add_block('built-in/Gain',[body '/Half track width'],'Position',[100 165 200 195],'Gain','robotParameters.trackWidth/2');
@@ -69,8 +69,26 @@ add_block('built-in/Integrator',[body '/Distance'],'Position',[850 30 890 60],'I
 add_block('built-in/Integrator',[body '/Turn angle'],'Position',[850 190 890 220],'InitialCondition','robotParameters.initialAngle');
 add_line(body,'Average velocity/1','Distance/1');
 add_line(body,'Turn rate/1','Turn angle/1');
-outputs = {'Distance','Velocity','Turn angle','Turn rate'};
-sources = {'Distance','Average velocity','Turn angle','Turn rate'};
+% Project velocity into axes fixed to the initial robot orientation.
+add_block('built-in/Constant',[body '/Initial heading'],'Value','robotParameters.initialAngle');
+add_block('built-in/Sum',[body '/Relative heading'],'Inputs','+-');
+add_line(body,'Turn angle/1','Relative heading/1');
+add_line(body,'Initial heading/1','Relative heading/2');
+for axisName = {'X','Y'}
+    axis = axisName{1};
+    if strcmp(axis,'X'), operator = 'cos'; field = 'initialX';
+    else, operator = 'sin'; field = 'initialY'; end
+    add_block('simulink/Math Operations/Trigonometric Function',[body '/' axis ' direction'],'Operator',operator);
+    add_block('built-in/Product',[body '/' axis ' velocity']);
+    add_block('built-in/Integrator',[body '/' axis ' position'], ...
+        'InitialCondition',['robotParameters.' field]);
+    add_line(body,'Relative heading/1',[axis ' direction/1']);
+    add_line(body,'Average velocity/1',[axis ' velocity/1']);
+    add_line(body,[axis ' direction/1'],[axis ' velocity/2']);
+    add_line(body,[axis ' velocity/1'],[axis ' position/1']);
+end
+outputs = {'Distance','Turn angle','X','Y'};
+sources = {'Distance','Turn angle','X position','Y position'};
 for k = 1:4
     y = 30+70*(k-1);
     add_block('built-in/Outport',[body '/' outputs{k} ' output'],'Position',[970 y 1000 y+20],'Port',num2str(k));

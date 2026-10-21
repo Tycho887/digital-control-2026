@@ -93,6 +93,13 @@ void UImu2::sendHelp()
 
 void UImu2::tick()
 { // read data - first time will fail
+  accelFresh = gyroFresh = false;
+  // INT_STATUS bit 0 distinguishes new sensor samples from repeated register reads.
+  bool dataReady = false;
+  Wire.beginTransmission(ADDRESS_MPU);
+  Wire.write(0x3A);
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom(uint8_t(ADDRESS_MPU), uint8_t(1)) == 1)
+    dataReady = (Wire.read() & 1) != 0;
   tickCnt++;
   if (imuAvailable > 0)
   {
@@ -104,7 +111,9 @@ void UImu2::tick()
       lastRead = nt;
       sampleTimeus = dt;
       if (mpu.accelUpdate() == 0)
-      { // rectify raw data - except magnetometer
+      {
+        accelFresh = dataReady; accelTimestampUs = micros();
+        // rectify raw data - except magnetometer
 //         int16_t * a = mpu.getAcc();
         float accw[3];
         accw[0] = mpu.accelX();
@@ -117,6 +126,7 @@ void UImu2::tick()
       // Gyro
       if (mpu.gyroUpdate() == 0)
       { // gyro
+        gyroFresh = dataReady; gyroTimestampUs = micros();
         if (gyroOffsetDone)
         { // production
           gyro[0] = mpu.gyroX() - offsetGyro[0];

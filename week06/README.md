@@ -45,11 +45,11 @@ summary = run_basebot_test;
 open_system('week06_basebot_test')
 ```
 
-`run_basebot_test.m` runs the root `analysis.m` on the 6 V step from
+`run_basebot_test.m` runs `analysis.m` in this folder on the 6 V step from
 `src/logs/device-monitor-260909-113357.log`, loads each motor's R, L, Kb,
 D and reflected J, and assumes Kt=Kb in SI units. The inertia includes
-half of the 0.927 kg robot mass for each wheel. This uses the root analysis;
-the separate notebook analysis currently specifies 927 kg.
+half of the 0.927 kg robot mass for each wheel. The separate notebook
+analysis in `week02/notebooks` currently specifies 927 kg.
 
 Edit Kp, Ts, referenceSpeed and the simulation duration at the top of the
 test script. The generated `week06_basebot_test.slx` has two masked Wheel
@@ -123,8 +123,8 @@ wheel copies. Verification requires MATLAB and Simulink.
 
 `week06_robot_model.slx` exposes two scalar inputs: commanded forward velocity
 (m/s) and commanded turn rate (rad/s). Its reusable masked **Robot** subsystem
-outputs four scalar signals, ordered as signed distance (m), actual velocity
-(m/s), unwrapped turn angle (rad), and actual turn rate (rad/s). The scope and
+outputs four scalar signals, ordered as signed distance (m), unwrapped turn angle (rad), x position (m), and
+y position (m). The scope and
 `out.robotOutputs` timeseries use the same output order.
 
 All physical, controller and initial-state defaults are defined in MATLAB:
@@ -135,6 +135,8 @@ addpath('week06')
 robot.trackWidth = 0.14;       % wheel spacing, m
 robot.initialDistance = 0;    % signed distance, m
 robot.initialAngle = 0;       % heading, rad
+robot.initialX = 0;           % initial forward coordinate, m
+robot.initialY = 0;           % initial left coordinate, m
 wheels(1).Kp = 2.03180408641676;
 wheels(2).Kp = 0.766619928019031;
 model = configure_robot_model(wheels, robot);
@@ -177,14 +179,41 @@ blocks and MATLAB defaults. Close the robot model before rebuilding; rebuilding
 overwrites the generated file. Fixed factors such as averaging by `1/2` are
 mathematical constants, while adjustable values use workspace expressions.
 
+### Programmed trajectory: four time plots
+
+See [the trajectory and results guide](programmed_trajectory.md) for the phase
+timings and interpretation of the four plots.
+
+Run `run('week06/simulate_programmed_trajectory.m')` from the repository root
+to simulate the forward–turn–forward sequence in `src/src/trajectory.h` using
+the existing robot model and tuned wheel parameters. Edit the `trajectory`
+structure in the script to change the distances, speed, turn angle/rate or rests.
+Defaults are 4 s rest, 0.5 m forward at 0.15 m/s, 0.5 s pause, a 90-degree
+counterclockwise turn at 0.5 rad/s, 0.5 s pause, another 0.5 m forward and
+1 s final rest (about 15.81 s total). Commands are held between exact segment
+boundaries, with input interpolation disabled for this simulation.
+
+The script produces a 2×2 figure of **x, y, signed accumulated forward distance,
+and unwrapped yaw versus time**, with dashed ideal-command curves. Distances
+are in metres and yaw is in radians; +x is initially forward and +y initially
+left. Reverse motion would subtract from signed distance. The ideal endpoint
+is `(x, y) = (0.5, 0.5)` m, distance 1 m and yaw π/2 rad; wheel transients and
+unequal tracking errors cause the simulated endpoint to differ.
+
+The figure and simulation data are saved as `programmed_trajectory.png` and
+`programmed_trajectory.mat` in `week06/robot_results`. The MAT file includes
+`out`, parameters, trajectory settings, the command schedule, and sampled
+`time`, `actual` and `ideal` arrays in `[distance, yaw, x, y]` order, documented
+by `outputColumns`. Requires MATLAB and Simulink. Overrides are temporary and
+the script does not save changes to the model or overwrite other experiments.
+
 ### Command response and nominal stability experiment
 
 Run `run('week06/simulate_robot_response.m')` from the repository root. Edit
 `commandSchedule` in the script to change the held [time, velocity, turn rate]
 commands, and override `wheels` or `robot` before configuration to investigate
 parameter changes. Input interpolation is disabled in memory for this run.
-The script logs both wheel voltages, plots all four robot outputs and the
-wheel responses, and saves `response.png`, `response.mat`, `segments.csv` and
+The script logs both wheel voltages, plots the internal speed responses, distance, heading and an x–y trajectory, and saves `response.png`, `response.mat`, `segments.csv` and
 `stability.csv` in `week06/robot_results`. It requires Simulink and Control
 System Toolbox. It leaves the model open with experiment settings in memory;
 close without saving to restore its saved configuration.
@@ -208,3 +237,28 @@ tracking error; there is no outer position/heading regulator. The linear
 margins use the tuning approximation; the actual sampled, saturated model is
 also simulated. Neither this experiment nor nominal margins guarantee
 stability for different sample times, gains, loading, or real traction.
+
+
+### Position outputs and initial reference frame
+
+The four public ports and `out.robotOutputs` columns are now ordered
+**[signed distance, turn angle, x, y]**. Internal velocity and turn rate are
+computed from logged wheel diagnostics in the experiment. Update consumers
+that previously read velocity from column 2 or turn rate from column 4.
+
+Position is expressed in a fixed frame aligned with the robot at the start:
++x points forward and +y points left. The model integrates
+`xdot = actualVelocity*cos(angle-initialAngle)` and
+`ydot = actualVelocity*sin(angle-initialAngle)`. Initial x/y offsets are set
+in MATLAB with `robot.initialX` and `robot.initialY`. The turn angle output
+retains its configured initial heading and stays unwrapped. Total traveled
+distance times the current heading is not the position along a curved path.
+
+The experiment also saves `trajectory.png` comparing wheel-based odometry to
+exact integration of the held ideal commands, plus `pose_summary.csv` with
+final position/heading errors and numerical odometry integration errors.
+The ideal trajectory assumes perfect tracking; deviations reflect the wheel
+model's transients and unequal steady errors. Position is model-predicted
+odometry, without external localization or traction correction.
+Run `addpath('week06'); verify_robot_position` to check initial offsets,
+initial-frame orientation, a positive arc, and the projection equations.

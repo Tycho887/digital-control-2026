@@ -11,9 +11,9 @@ stepTime = 0.2;
 stopTime = 3;
 steadyWindow = 0.5;
 
-% Reuse the root analysis: the 6 V step at 0.020–0.500 s in this log.
+% Reuse this week's analysis: the 6 V step at 0.020–0.500 s in this log.
 % It uses 0.927 kg robot mass and motor-side reflected inertia.
-run(fullfile(folder,'..','analysis.m'));
+run(fullfile(folder,'analysis.m'));
 measured = [left right];
 wheels = repmat(struct('L',0,'R',0,'Kt',0,'Kb',0,'J',0,'D',0, ...
     'gear',9.68,'wheelRadius',0.03,'Kp',0,'Ts',Ts,'voltageLimit',9),1,2);

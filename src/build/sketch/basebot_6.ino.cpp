@@ -55,6 +55,31 @@ float pose[4];
 float poseVel[2];
 bool velSaturated = false;
 
+struct PID_gains
+{
+  float Kp;
+  float Ki;
+  float Kd;
+};
+
+struct motor_coefficients
+{
+  float L;
+  float R;
+  float Kt;
+  float Kb;
+  float J;
+  float B;
+};
+
+PID_gains left_motor_gains = {0.05, 0.0, 0.0};
+PID_gains right_motor_gains = {0.05, 0.0, 0.0};
+
+motor_coefficients left_motor_coeffs = {0.00768482, 6.41140, 0.0102936, 0.0102936, 5.46186e-6, 6.52401e-7};
+motor_coefficients right_motor_coeffs = {0.00332761, 2.86396, 0.00798363, 0.00798363, 5.46186e-6, 3.37901};
+
+
+
 // ////////////////////////////////////////
 // define a structure for log elements
 typedef struct
@@ -288,33 +313,67 @@ void sequenceTwoSteps()
   }
 }
 
+// What we need to define: a P-controller for each motor.
+// Then combine these into a differential drive controller for the robot: takes velocity and angle-rate as input, and outputs left and right motor velocities.
+
+struct PolarTrajectoryCommand
+{
+  float linear_velocity; // desired linear velocity (m/s)
+  float angular_velocity; // desired angular velocity (rad/s)
+};
+
+struct LinearCommand
+{
+  float left_motor_velocity; // desired left motor velocity (rad/s)
+  float right_motor_velocity; // desired right motor velocity (rad/s)
+};
+
+float invertVelocity(float desired_velocity, float R, float D, float Kt, float Kb) {
+  return (R * D / Kt + Kb) * desired_velocity;
+}
+
+LinearCommand motorVoltageController(const PolarTrajectoryCommand& command, const float left_motor_velocity, const float right_motor_velocity)
+{
+  LinearCommand output;
+  
+  float left_motor_velocity = (command.linear_velocity - (command.angular_velocity * wheelBase / 2.0)) / wheelRadius;
+  float right_motor_velocity = (command.linear_velocity + (command.angular_velocity * wheelBase / 2.0)) / wheelRadius;
+
+  output.left_motor_velocity = left_motor_velocity;
+  output.right_motor_velocity = right_motor_velocity;
+
+  return output;
+}
+
 /**
  * make the control */
-void controlUpdate()
+void controlUpdate(PolarTrajectoryCommand command)
 { // do control during a mission only.
   // called at every tick
+
+  LinearCommand linear_set_points = motorVoltageController(command, encoder.motorVelocity[0], encoder.motorVelocity[1]);
+
+  // First, measure the current velocities of the motors using the encoder readings.
+
   float velLeft = encoder.motorVelocity[0];
   float velRight = encoder.motorVelocity[1];
-  //
-  float velRef = desiredValue;
-  //
-  // For a start, the desiredValue
-  // is just used as motor voltage
-  //
-  // Left motor voltage (-9V to +9V)
-  motor.motorVoltage[0] = -velRef;
-  // Right motor voltage (-9V to +9V)
-  motor.motorVoltage[1] = velRef;
-  //
-  // in the main loop, there is a motor.tick() that actually send the
-  // values to the motor.
-  float error_left = velRef - velLeft;
-  float error_right = velRef - velRight;
   
-  float gain = 0.5; // just a test value
-  // implement a P-controller for each motor
-  motor.motorVoltage[0] = -velRef + gain * error_left;
-  motor.motorVoltage[1] = velRef + gain * error_right;
+  // Then compute the errors
+
+  float error_left = linear_set_points.left_motor_velocity - velLeft;
+  float error_right = linear_set_points.right_motor_velocity - velRight;
+
+  float updated_left_motor_velocity = velLeft + left_motor_gains.Kp * error_left;
+  float updated_right_motor_velocity = velRight + right_motor_gains.Kp * error_right;
+
+  // Invert the velocities to get the desired voltages for the next iteration
+  float updated_left_motor_voltage = invertVelocity(updated_left_motor_velocity, left_motor_coeffs.R, left_motor_coeffs.J, left_motor_coeffs.Kt, left_motor_coeffs.Kb );
+  float updated_right_motor_voltage = invertVelocity(updated_right_motor_velocity, right_motor_coeffs.R, right_motor_coeffs.J, right_motor_coeffs.Kt, right_motor_coeffs.Kb);
+
+  // Left motor voltage (-9V to +9V)
+  motor.motorVoltage[0] = updated_left_motor_voltage;
+  // Right motor voltage (-9V to +9V)
+  motor.motorVoltage[1] = updated_right_motor_voltage;
 }
 
 void updateLog()

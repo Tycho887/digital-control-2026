@@ -1,7 +1,8 @@
 %% Motor values from one repeatable 6 V step
 % The selected pulse starts at 0.020 s and ends at 0.500 s.
 
-logPath = fullfile(fileparts(mfilename('fullpath')), 'src', 'logs', ...
+repoRoot = fileparts(fileparts(mfilename('fullpath')));
+logPath = fullfile(repoRoot, 'src', 'logs', ...
     'device-monitor-260909-113357.log');
 stepStart_s = 0.020;
 stepEnd_s = 0.500;

@@ -1,28 +1,28 @@
 /***************************************************************************
-*   Copyright (C) 2024 by DTU                             *
-*   jcan@dtu.dk                                                    *
+-   Copyright (C) 2024 by DTU                             *
+-   jcan@dtu.dk                                                    *
 *
-*   Base Teensy firmware
-*   build for Teensy 4.1,
-*   intended for digital control course
-* 
-* The MIT License (MIT)  https://mit-license.org/
-* 
-* Permission is hereby granted, free of charge, to any person obtaining a copy of this software
-* and associated documentation files (the “Software”), to deal in the Software without restriction, 
-* including without limitation the rights to use, copy, modify, merge, publish, distribute, 
-* sublicense, and/or sell copies of the Software, and to permit persons to whom the Software 
-* is furnished to do so, subject to the following conditions:
-* 
-* The above copyright notice and this permission notice shall be included in all copies 
-* or substantial portions of the Software.
-* 
-* THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
-* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
-* PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
-* FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
-* ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN 
-* THE SOFTWARE. */
+-   Base Teensy firmware
+-   build for Teensy 4.1,
+-   intended for digital control course
+- 
+- The MIT License (MIT)  https://mit-license.org/
+- 
+- Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+- and associated documentation files (the “Software”), to deal in the Software without restriction, 
+- including without limitation the rights to use, copy, modify, merge, publish, distribute, 
+- sublicense, and/or sell copies of the Software, and to permit persons to whom the Software 
+- is furnished to do so, subject to the following conditions:
+- 
+- The above copyright notice and this permission notice shall be included in all copies 
+- or substantial portions of the Software.
+- 
+- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+- INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+- PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+- FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+- ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN 
+- THE SOFTWARE. */
 
 void printLog();
 
@@ -39,11 +39,8 @@ void printLog();
 #include "uencoder.h"
 
 /**
- * Global variables */
-// A complete three-spike capture lasts about 3.1 s. At 1 ms this fits in
-// the fixed 400 kB log buffer. Unused fields are omitted to retain capacity.
+- Global variables */
 const uint32_t sampleTimeUs = 1000; // desired sample time in us
-// const float ts = sampleTimeUs * 1e-6; // sample time in seconds
 // Robot configuration
 const float gear = 9.6;
 const float wheelRadius = 0.0315; // (m)
@@ -75,11 +72,10 @@ typedef struct
   int16_t pwmRequest[2];
   uint8_t driverState; // bits: enabled L/R, sleeping L/R
   float encoderDelay[2];
+  float controlSignal[2]; // Computed PID control signals (left, right)
 
 } LogData;
-//
-// allocate memory for data log in memory block 2 available only through malloc/new
-// (specific for this micro processor, a Teensy 4)
+
 const int logsMax = 400000 / sizeof(LogData); // allocates 400kBytes
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 const float currentScale = 0.0045; // A/count; requires hardware calibration
@@ -87,12 +83,68 @@ const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
 uint32_t captureStartUs = 0;
 int logsCnt = 0; // next log entry to use / i.e. number of used log entries
 
+struct PID_Coefficients 
+{
+  float b0;
+  float b1;
+  float b2;
+  float a1;
+  float a2;
+};
+
+class WheelController {
+  public: 
+    PID_Coefficients coeffs;
+    float u1 = 0.0f, u2 = 0.0f;
+    float e1 = 0.0f, e2 = 0.0f;
+    float error = 0.0f;
+    float ComputeCCDE(float error);
+    void reset() {
+      u1 = 0.0f;
+      u2 = 0.0f;
+      e1 = 0.0f;
+      e2 = 0.0f;
+      error = 0.0f;
+    }
+    WheelController(PID_Coefficients x) {
+      coeffs = x;
+    }
+};
+
+float WheelController::ComputeCCDE(float err)
+{
+    error = err;
+    // Difference equation execution
+    float u = (coeffs.b0 * error) + (coeffs.b1 * e1) + (coeffs.b2 * e2) - (coeffs.a1 * u1) - (coeffs.a2 * u2);
+
+    // State updates for next sample step
+    e2 = e1;
+    e1 = error;
+    
+    // Saturation 
+    if (u > 9.0f) u = 9.0f;
+    else if (u < -9.0f) u = -9.0f;
+
+    u2 = u1;
+    u1 = u;
+
+    return u;
+}
+
+// Instantiate controller coefficients and controller objects globally
+PID_Coefficients left_wheel_coeffs = {0.274814, -0.490478, 0.216625, -1.850534, 0.850534};
+PID_Coefficients right_wheel_coeffs = {0.274348, -0.506012, 0.232552, -1.874889, 0.874889};
+
+WheelController leftController(left_wheel_coeffs);
+WheelController rightController(right_wheel_coeffs);
+
+float computedControl[2] = {0.0f, 0.0f};
+
 void printLog()
 {
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
-  // hard-coded settings
   Serial.print("% Sample time ");  Serial.print(sampleTimeUs);
   Serial.print(" us, Gear ");  Serial.print(gear);
   Serial.print(", Wheels ");  Serial.print(wheelRadius);
@@ -109,22 +161,23 @@ void printLog()
   Serial.println("% 10  Battery voltage (V)");
   Serial.println("% 11-13 pose (x,y,theta) (m, m, rad)");
   Serial.println("% 14 trip distance (m)");
-
   Serial.println("% 15-16 legacy calibrated current (left, right) (A), forward-positive");
   Serial.println("% 17 capture timestamp (us since start), ADC read follows actuator update");
   Serial.println("% 18-19 raw current ADC counts (left A1, right A0), 12 bit");
   Serial.println("% 20-21 signed PWM request (left,right), forward-positive, full scale 4096");
   Serial.println("% 22 driver flags: bits 0/1 enable L/R, bits 2/3 sleeping L/R");
   Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
+  Serial.println("% 25-26 computed control signal (left,right) (V)");
+  
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
   Serial.print(" offsets L/R "); Serial.print(currentOffset[0],6);
   Serial.print(" "); Serial.println(currentOffset[1],6);
   Serial.print("% PWM frequency Hz "); Serial.println(motor.PWMfrq);
   Serial.println("% Voltage columns 4-5 are requests, NOT measured terminal voltages.");
   Serial.println("% Driver assumes supply loss 1 V, adds +/-0.4 V; battery <5.5 V uses 11.1 V fallback.");
+  
   for (int i = 0; i < logsCnt; i++)
   {
-    // Serial.print(" ");
     Serial.print(d->time,4);    // 1
     Serial.print(" ");    Serial.print(d->state);          // 2
     Serial.print(" ");    Serial.print(d->desiredValue,2); // 3
@@ -149,6 +202,8 @@ void printLog()
     Serial.print(" "); Serial.print(d->driverState); // 22
     Serial.print(" "); Serial.print(d->encoderDelay[0],7); // 23
     Serial.print(" "); Serial.print(d->encoderDelay[1],7); // 24
+    Serial.print(" "); Serial.print(d->controlSignal[0],4); // 25
+    Serial.print(" "); Serial.print(d->controlSignal[1],4); // 26
     Serial.println("");
     d++;
   }
@@ -157,14 +212,11 @@ void printLog()
   Serial.println(" log lines");
 }
 
-// ////////////////////////////////////////
-
 /**
- * Global variables for timing */
+- Global variables for timing */
 bool isSampleTime = false;
 float time_sec = 0;
 
-// Timer that controls sample time (interrupt based)
 IntervalTimer sampleTimer;
 
 void timerInterrupt()
@@ -172,134 +224,112 @@ void timerInterrupt()
   isSampleTime = true;
   time_sec += sampleTimeUs / 1e6;
 }
-/**
- * declaration, that there is a reset function */
+
 void reset();
 
 /**
- * Global variables for state machine */
-int state = 0;               // actual sequence state
-float endTime = 0;           // for current state
-float desiredValue = 0;      // desired (reference) value send to controller
+- Global variables for state machine */
+int state = 0;               
+float endTime = 0;           
+float desiredValue = 0;      
 float desiredHeading = 0;
 
 void start()
-{ // Start timing
-  // reset log and encoders
+{ 
   logsCnt = 0;
   captureStartUs = micros();
-  // change motor PWM frequency for sampling time test
-  // should not be above 100000 (100kHz), default is 80kHz.
   motor.setPWMfrq(80000);
   time_sec = 0;
-  encoder.encoder[0] = 0; // left motor encoder
-  encoder.encoder[1] = 0; // right motor encoder
-  // Update of display takes too long for fast sampling
-  // so, disable during sequence.
+  encoder.encoder[0] = 0; 
+  encoder.encoder[1] = 0; 
   display.useDisplay = false;
+  
+  // Reset controllers for a clean run
+  leftController.reset();
+  rightController.reset();
 }
 
 void stop(float after)
-{ // stop, but allow continued logging for a while
+{ 
   state = 2;
   desiredValue = 0;
-  // end log after an additional short time
   endTime = time_sec + after;
 }
 
 void finished()
-{ // prepare for a new start
-  // stop motors
-  motor.motorVoltage[0] = 0; // left motor
-  motor.motorVoltage[1] = 0;  // right motor
-  // set default PWM frequency
+{ 
+  motor.motorVoltage[0] = 0; 
+  motor.motorVoltage[1] = 0;  
   motor.setPWMfrq(80000);
-  // start updating display
   display.useDisplay = true;
-  // wait for next button press
   state = 0;
   printLog();
 }
 
 /**
- * Simple 3-step sequence */
+- Simple 3-step sequence */
 void SpikeSequence()
-{ // this function is called at every sample time
-  // and should never wait in a loop.
-  // Update variables as needed and return.
+{ 
   bool button;
-  //
-  // this is a state machine
-  // state 0: wait for start button press
-  // other states are part of a sequence
   switch (state)
-  { // run mission, initial value
-    case 0: // State 0 is just inactive, waiting for the start signal.
+  { 
+    case 0: 
       button = digitalReadFast(PIN_START_BUTTON);
       if (button or robot.missionStart)
-      { // starting by a short time to get zero velocity data to the log
-        // reset for new run
+      { 
         start();
-        // Prepare next state
-        desiredValue = 0; // reference value to the controller
-        // to get start the log with no velocity
-        endTime = time_sec + 0.020; // new state to end after 20ms
+        desiredValue = 0; 
+        endTime = time_sec + 0.020; 
         state = 10;
       }
       break;
-    case 10: // Waiting for first step (zero velocity to log) to finish.
+    case 10: 
       if (time_sec > endTime)
-      { // change to next values - drive
-        desiredValue = 6;  // should be in meters/sec, but is motor voltage for now,
-        endTime = time_sec + 0.48 ; // ~ 0.5 second
+      { 
+        desiredValue = 6;  
+        endTime = time_sec + 0.48 ; 
         state = 11;
       }
       break;
-    case 11: // First step
-      // test if ready for next state
+    case 11: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 0;
         endTime = time_sec + 0.50;
         state = 12;
       }
       break;
-    case 12: // First 0 V interval
-      // test if this state is finished
+    case 12: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 6;
         endTime = time_sec + 0.5;
         state = 13;
       }
       break;
-    case 13: // Second 6 V spike
-      // test if this state is finished
+    case 13: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 0;
         endTime = time_sec + 0.5;
         state = 14;
       }
       break;
-    case 14: // Second 0 V interval
-      // test if this state is finished
+    case 14: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 6;
         endTime = time_sec + 0.5;
         state = 100;
       }
       break;
-    case 100: // Third 6 V spike
-      // Stop after the last spike's end time.
+    case 100: 
       if (time_sec > endTime)
-      { // Stop, but continue logging for a while to capture the decay.
-        stop(0.6); // stop() changes state to 2, handled by default below.
+      { 
+        stop(0.6); 
       }
       break;
-    default: // Hold until finished
-      // this state is needed to enable a new start
+    default: 
       if (time_sec > endTime)
         finished();
       break;
@@ -307,100 +337,106 @@ void SpikeSequence()
 }
 
 /**
- * Simple 2-step sequence */
+- Simple 2-step sequence */
 void sequenceTwoSteps()
-{ // this function is called at every sample time
-  // and should never wait in a loop.
-  // Update variables as needed and return.
+{ 
   bool button;
-  //
-  // this is a state machine
-  // state 0: wait for start button press
-  // other states are part of a sequence
   switch (state)
-  { // run mission, initial value
-    case 0: // State 0 is just inactive, waiting for the start signal.
+  { 
+    case 0: 
       button = digitalReadFast(PIN_START_BUTTON);
       if (button or robot.missionStart)
-      { // starting by a short time to get zero velocity data to the log
-        // reset for new run
+      { 
         start();
-        // Prepare next state
-        desiredValue = 0; // reference value to the controller
-        // to get start the log with no velocity
-        endTime = time_sec + 0.020; // new state to end after 20ms
+        desiredValue = 0; 
+        endTime = time_sec + 0.020; 
         state = 10;
       }
       break;
-    case 10: // Waiting for first step (zero velocity to log) to finish.
+    case 10: 
       if (time_sec > endTime)
-      { // change to next values - drive
-        desiredValue = 1.5;  // should be in meters/sec, but is motor voltage for now,
-        endTime = time_sec + 0.48 ; // ~ 0.5 second
+      { 
+        desiredValue = 1.5;  
+        endTime = time_sec + 0.48 ; 
         state = 11;
       }
       break;
-    case 11: // First step
-      // test if ready for next state
+    case 11: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 3;
         endTime = time_sec + 0.50;
         state = 12;
       }
       break;
-    case 12: // Second step
-      // test if this state is finished
+    case 12: 
       if (time_sec > endTime)
-      { // change to next values
+      { 
         desiredValue = 6;
         endTime = time_sec + 0.5;
         state = 100;
       }
       break;
-    case 100: // Maintain last step
-      // stop after end time
+    case 100: 
       if (time_sec > endTime)
-      { // stop, but continue logging for a while (0.3 sec)
-        stop(0.3); // actually sets state to 999 (i.e. default:)
+      { 
+        stop(0.3); 
       }
       break;
-    default: // Hold until finished
-      // this state is needed to enable a new start
+    default: 
       if (time_sec > endTime)
         finished();
       break;
   }
 }
 
+struct TrajectoryPoint 
+{
+  float time; 
+  float yaw_rate; 
+  float velocity;   
+};
+
+struct MotorCoefficients 
+{
+  float L;
+  float R;
+  float Kt;
+  float Kb;
+  float J;
+  float D;
+};
+
 /**
- * make the control */
+- make the control */
 void controlUpdate()
-{ // do control during a mission only.
-  // called at every tick
-  //
+{ 
   float velRef = desiredValue;
-  //
-  // For a start, the desiredValue
-  // is just used as motor voltage
-  //
-  // Left motor voltage (-9V to +9V)
-  motor.motorVoltage[0] = -velRef;
-  // Right motor voltage (-9V to +9V)
+  
+  // Compute tracking errors based on forward-positive measurements
+  float velLeftMeas = -encoder.motorVelocity[0];
+  float velRightMeas = encoder.motorVelocity[1];
+  
+  float errorLeft = velRef - velLeftMeas;
+  float errorRight = velRef - velRightMeas;
+
+  // Compute control signals without applying them to motors
+  computedControl[0] = leftController.ComputeCCDE(errorLeft);
+  computedControl[1] = rightController.ComputeCCDE(errorRight);
+
+  // Execute original open-loop preplanned trajectory on the actuators
+  motor.motorVoltage[0] = velRef;
   motor.motorVoltage[1] = velRef;
-  //
-  // in the main loop, there is a motor.tick() that actually send the
-  // values to the motor.
 }
 
 void updateLog()
-{ // step response mode
+{ 
   if (state > 0 and logsCnt < logsMax)
-  { // save data for this sample into dataLog structure
+  { 
     logs[logsCnt].time = time_sec;
     logs[logsCnt].state = state;
     logs[logsCnt].desiredValue = desiredValue;
-    logs[logsCnt].motorVolt[0] = -motor.motorVoltage[0]; // The left motor runs backwards, therefore the sign.
+    logs[logsCnt].motorVolt[0] = -motor.motorVoltage[0]; 
     logs[logsCnt].motorVolt[1] = motor.motorVoltage[1];
     logs[logsCnt].encoder[0] = -encoder.encoder[0];
     logs[logsCnt].encoder[1] = encoder.encoder[1];
@@ -412,9 +448,6 @@ void updateLog()
     logs[logsCnt].pose[2] = pose[2];
     logs[logsCnt].pose[3] = pose[3];
     logs[logsCnt].distA = distA;
-    // the last part is offset of current measurement (in Amps)
-    // take the initial current readings and add or subtract as needed
-    // these values fits Tania: (+0.260A, -0.275A)
     logs[logsCnt].desiredHeading = desiredHeading;
     logs[logsCnt].captureUs = micros() - captureStartUs;
     logs[logsCnt].currentADC[0] = analogRead(A1);
@@ -429,60 +462,52 @@ void updateLog()
     logs[logsCnt].encoderDelay[1] = encoder.encoderDelay[1];
     logs[logsCnt].poseVel[0] = poseVel[0];
     logs[logsCnt].poseVel[1] = poseVel[1];
-    // add more items as needed, NB! also the the struct definition at top.
+    
+    // Store computed control signals in log
+    logs[logsCnt].controlSignal[0] = computedControl[0];
+    logs[logsCnt].controlSignal[1] = computedControl[1];
 
     logsCnt++;
   }
 }
 
-
-void setup()   // INITIALIZATION
-{ // to be able to print to USB interface
+void setup()   
+{ 
   Serial.begin(12000000);
   sampleTimer.begin(timerInterrupt, sampleTimeUs);
-  // initialize sensors, safety and display
-  robot.setup(); // alive LED, display and battery
-  motor.setup(); // motor voltage
-  encoder.setup(); // motor encoders to velocity
+  robot.setup(); 
+  motor.setup(); 
+  encoder.setup(); 
   encoder.pulsPerRev = 48;
-  imu2.setup(); // gyro and accelerometer
-  motor.setPWMfrq(0x13000); // 0x13000 = 77824 Hz
+  imu2.setup(); 
+  motor.setPWMfrq(0x13000); 
   usb.setup();
   display.useDisplay = true;
 }
 
 /**
-* Main loop
-* */
+- Main loop
+- */
 void loop ( void )
-{ // init sample time
+{ 
   while ( true )
-  { // main loop
-    // loop until time for next sample
-    if (isSampleTime) // start of new control cycle
-    { // time for next tick
+  { 
+    if (isSampleTime) 
+    { 
       isSampleTime = false;
-      // read sensors
       imu2.tick();
       encoder.tick();
-      // updatePose();
       SpikeSequence();
-      //
+      
       if (state > 0)
-      { // Only if started
-        // Calculate new motor voltage
+      { 
         controlUpdate();
       }
-      // give value to actuators
       motor.tick();
-      // save relevant values
       updateLog();
-      // support functions
-      robot.tick();   // measure battery voltage etc.
-      display.tick(); // update O-LED display
+      robot.tick();   
+      display.tick(); 
     }
-    usb.tick(); // listen to incoming from USB
+    usb.tick(); 
   }
 }
-
-/////////////////////////////////////////////////////////////////

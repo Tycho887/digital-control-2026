@@ -21,7 +21,7 @@ for name = {'trackWidth','stopTime','relativeTolerance','absoluteTolerance','max
     assert(isnumeric(value)&&isscalar(value)&&isfinite(value)&&value>0, ...
         'robot.%s must be finite and positive.',name{1});
 end
-for name = {'initialDistance','initialAngle'}
+for name = {'initialDistance','initialAngle','initialX','initialY'}
     value = robot.(name{1});
     assert(isnumeric(value)&&isscalar(value)&&isfinite(value), ...
         'robot.%s must be a finite scalar.',name{1});
