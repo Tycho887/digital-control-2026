@@ -14,8 +14,8 @@ r2m = wrad/gear; % (radian/s to meter/s)
 Kp = 0.05;
 B = 0.15;
 s = tf('s');
-Kpt = 5;
-taui_t = 0.2;
+Kpt = 5; % Kp Turnrate controller
+taui_t = 0.2; % Taui turn controller
 
 
 
