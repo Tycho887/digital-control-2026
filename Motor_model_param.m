@@ -13,4 +13,9 @@ wrad = 0.03; % (m)
 r2m = wrad/gear; % (radian/s to meter/s)
 Kp = 0.05;
 B = 0.15;
+s = tf('s');
+Kpt = 5;
+taui_t = 0.2;
+
+
 
