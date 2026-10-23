@@ -6,12 +6,14 @@
 clear; clc;
 
 %% ===== 1. Physical constants =====
-L = 0.00768482381376416;  R = 6.41139804096171;
-Kt = 0.010293561274142;   Kb = Kt;
-J = 5.46186035789905e-06; D = 6.52401278374518e-07;
-%L = 0.0033; R = 2.86;
-%Kb = 0.00798; Kt = Kb;
-%J = 5.46e-6; D = 3.38e-6;
+% For the left motor
+%L = 0.00768482381376416;  R = 6.41139804096171;
+%Kt = 0.010293561274142;   Kb = Kt;
+%J = 5.46186035789905e-06; D = 6.52401278374518e-07;
+% For the right motor.
+L = 0.0033; R = 2.86;
+Kb = 0.00798; Kt = Kb;
+J = 5.46e-6; D = 3.38e-6;
 
 
 gear = 9.68;  wheelRadius = 0.03;
@@ -32,11 +34,9 @@ workspace = get_param(model, 'ModelWorkspace');
 %% ===== 4. Tuning: wc-sweep on the delayed plant (PID3 logic) =====
 e_max = referenceSpeed * (gear / wheelRadius);
 
-C_template = pid(1, 1, 1, 0.002, Ts, ...
-    'IFormula','ForwardEuler', ...
-    'DFormula','BackwardEuler');
+C_template = pid(1, 1, 0, 0, Ts, 'IFormula', 'ForwardEuler');
 
-opts = pidtuneOptions('PhaseMargin', 50, 'DesignFocus','balanced');
+opts = pidtuneOptions('PhaseMargin', 65, 'DesignFocus','reference-tracking');
 
 target_peak_V = 0.99 * voltageLimit;
 wc_candidates = linspace(25, 150, 126);
@@ -70,8 +70,9 @@ fprintf('u[k] = %.6f*e[k] + %.6f*e[k-1] + %.6f*e[k-2] - (%.6f*u[k-1] + %.6f*u[k-
 
 %% ===== 6. Push into Simulink =====
 wheel = struct('L', L, 'R', R, 'Kt', Kt, 'Kb', Kb, 'J', J, 'D', D, ...
-    'gear', gear, 'wheelRadius', wheelRadius, 'Kp', C.Kp, 'Ts', Ts, ...
-    'voltageLimit', voltageLimit);
+    'gear', gear, 'wheelRadius', wheelRadius, ...
+    'Kp', C.Kp, 'Ki', C.Ki, 'Kd', C.Kd, 'Tf', C.Tf, ...
+    'Ts', Ts, 'voltageLimit', voltageLimit);
 assignin(workspace, 'wheel', wheel);
 assignin(workspace, 'referenceSpeed', referenceSpeed);
 assignin(workspace, 'stepTime', stepTime);
@@ -100,10 +101,14 @@ y_mot = zeros(1, N_steps);
 for k = 3:N_steps
     y_mot(k) = -p1*y_mot(k-1) - p2*y_mot(k-2) + q1*u_act(k-1) + q2*u_act(k-2);
     e(k)     = r_mot(k) - y_mot(k-1);
-    u(k)     = b0*e(k) + b1*e(k-1) + b2*e(k-2) - (a1*u(k-1) + a2*u(k-2));
-    u_act(k) = min(max(u(k), -voltageLimit), voltageLimit);
+    
+    % Compute raw CCDE output
+    u_raw    = b0*e(k) + b1*e(k-1) + b2*e(k-2) - (a1*u(k-1) + a2*u(k-2));
+    
+    % Saturate BEFORE storing in u(k) so u(k-1) and u(k-2) are clamped
+    u(k)     = min(max(u_raw, -voltageLimit), voltageLimit);
+    u_act(k) = u(k);
 end
-
 y_wheel = y_mot * (wheelRadius / gear);
 
 %% ===== 9. Plot =====

@@ -76,12 +76,72 @@ typedef struct
 
 } LogData;
 
-const int logsMax = 400000 / sizeof(LogData); // allocates 400kBytes
+// The forward sequence lasts 0.2 + 3.0 + 0.4 = 3.6 s. Retain every 1 ms
+// sample, with margin for state transitions (3750 rows at 112 bytes/row).
+const int logBufferBytes = 420000;
+const int logsMax = logBufferBytes / sizeof(LogData);
+static_assert(logsMax * sampleTimeUs >= 3700000,
+              "Log buffer must cover the complete forward sequence plus margin");
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 const float currentScale = 0.0045; // A/count; requires hardware calibration
 const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
 uint32_t captureStartUs = 0;
 int logsCnt = 0; // next log entry to use / i.e. number of used log entries
+bool logPending = false; // preserve a completed capture until USB is connected
+bool logTruncated = false;
+
+// State is also used to prevent a USB log request from blocking control.
+int state = 0;
+float endTime = 0;
+float desiredValue = 0;
+float desiredHeading = 0;
+
+class AlphaBetaFilter {
+  public:
+    // ---- Tuning ----
+    float alpha;   // position gain,        0 < alpha < 2
+    float beta;    // velocity gain,        0 < beta < alpha
+    float Ts;      // sample time (seconds)
+
+    // ---- State ----
+    float position;  // smoothed position estimate  (same units as measurement)
+    float velocity;  // smoothed velocity estimate  (measurement units per second)
+
+    AlphaBetaFilter(float alpha_ = 0.30f, float beta_ = 0.05f, float Ts_ = 0.025f)
+      : alpha(alpha_), beta(beta_), Ts(Ts_), position(0.0f), velocity(0.0f) {}
+
+    void setSampleTime(float Ts_) { Ts = Ts_; }
+
+    // Reset to a known state (call from start(), alongside controller.reset())
+    void reset(float initialPosition = 0.0f, float initialVelocity = 0.0f) {
+      position = initialPosition;
+      velocity = initialVelocity;
+    }
+
+    // Prime with the very first measurement (optional; reduces start-up lag)
+    void primeWith(float firstMeasurement) {
+      position = firstMeasurement;
+      velocity = 0.0f;
+    }
+
+    // Feed a new position measurement, return the smoothed velocity.
+    float update(float measuredPosition) {
+      // 1. Predict using the constant-velocity model
+      float posPred = position + velocity * Ts;
+
+      // 2. Innovation (residual)
+      float residual = measuredPosition - posPred;
+
+      // 3. Correct
+      position = posPred + alpha * residual;
+      velocity = velocity + (beta / Ts) * residual;
+
+      return velocity;
+    }
+};
+
+AlphaBetaFilter leftVelFilter (0.5f, 0.1f, sampleTimeUs * 1e-6f);
+AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
 
 struct PID_Coefficients 
 {
@@ -99,6 +159,7 @@ class WheelController {
     float e1 = 0.0f, e2 = 0.0f;
     float error = 0.0f;
     float ComputeCCDE(float error);
+    float ComputePID(float error);
     void reset() {
       u1 = 0.0f;
       u2 = 0.0f;
@@ -109,6 +170,7 @@ class WheelController {
     WheelController(PID_Coefficients x) {
       coeffs = x;
     }
+
 };
 
 float WheelController::ComputeCCDE(float err)
@@ -122,8 +184,8 @@ float WheelController::ComputeCCDE(float err)
     e1 = error;
     
     // Saturation 
-    if (u > 9.0f) u = 9.0f;
-    else if (u < -9.0f) u = -9.0f;
+    if (u > 3.0f) u = 3.0f;
+    else if (u < -3.0f) u = -3.0f;
 
     u2 = u1;
     u1 = u;
@@ -131,9 +193,53 @@ float WheelController::ComputeCCDE(float err)
     return u;
 }
 
+float WheelController::ComputePID(float err)
+{
+    // ---- Tunable parameters ----
+    // Ts comes from the global sampleTimeUs so this stays correct
+    // whatever sample time you experiment with.
+    const float Ts   = sampleTimeUs * 1e-6f;   // seconds
+    const float Kp   = 0.10f;                  // V per rad/s of error
+    const float Ki   = 1.0f;                   // V per (rad/s · s) of error
+    const float uMax = 3.0f;
+
+    // ---- PI update ----
+    // u[k] = Kp*e[k] + I[k]
+    // I[k] = I[k-1] + Ki * Ts * e[k]     (with anti-windup below)
+    //
+    // Pure P  : leave Ki = 0.0f   (u2 stays at 0, u = Kp*err)
+    // Pure I  : leave Kp = 0.0f   (u2 is the only state)
+    // PI      : both non-zero     (recommended)
+
+    error = err;
+
+    // Integrate the error
+    u2 += Ki * Ts * err;
+
+    // Compute unsaturated output
+    float u = Kp * err + u2;
+
+    // Saturate and back-calculate the integrator (anti-windup).
+    // Setting u2 = u - Kp*err makes the very next call start from a
+    // state that produces exactly the saturated output, so the
+    // integrator does not "wind up" while clamped.
+    if (u > uMax) {
+        u  = uMax;
+        u2 = u - Kp * err;
+    } else if (u < -uMax) {
+        u  = -uMax;
+        u2 = u - Kp * err;
+    }
+
+    u1 = u;   // kept for continuity with the rest of your code
+    return u;
+}
+
+
 // Instantiate controller coefficients and controller objects globally
-PID_Coefficients left_wheel_coeffs = {0.274814, -0.490478, 0.216625, -1.850534, 0.850534};
-PID_Coefficients right_wheel_coeffs = {0.274348, -0.506012, 0.232552, -1.874889, 0.874889};
+// Update to these PI parameters for left: u[k] = 0.273519*e[k] + -0.267766*e[k-1] + 0.000000*e[k-2] - (-1.000000*u[k-1] + 0.000000*u[k-2])
+PID_Coefficients left_wheel_coeffs  = {0.273519f, -0.267766f, 0.0f, -1.000000f, 0.0f};
+PID_Coefficients right_wheel_coeffs = {0.275100f, -0.271207f, 0.0f, -1.000000f, 0.0f};
 
 WheelController leftController(left_wheel_coeffs);
 WheelController rightController(right_wheel_coeffs);
@@ -142,6 +248,19 @@ float computedControl[2] = {0.0f, 0.0f};
 
 void printLog()
 {
+  if (state > 0)
+  {
+    usb.send("% Log capture in progress; request log after the run finishes.\n");
+    return;
+  }
+  if (!Serial)
+    return;
+  if (logs == nullptr)
+  {
+    Serial.println("% Log buffer allocation failed; run disabled.");
+    return;
+  }
+  logPending = false;
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
@@ -151,6 +270,8 @@ void printLog()
   Serial.print(" m, PPR ");  Serial.println(encoder.pulsPerRev);
   Serial.print("% maximum log samples ");  Serial.print(logsMax);
   Serial.print(" each sized ");  Serial.print(sizeof(LogData)); Serial.println(" bytes");
+  if (logTruncated)
+    Serial.println("% WARNING: log buffer filled; final samples are missing.");
   // Columns
   Serial.println("% 1 time (sec)");
   Serial.println("% 2 state");
@@ -227,15 +348,15 @@ void timerInterrupt()
 
 void reset();
 
-/**
-- Global variables for state machine */
-int state = 0;               
-float endTime = 0;           
-float desiredValue = 0;      
-float desiredHeading = 0;
-
-void start()
+bool start()
 { 
+  if (logs == nullptr)
+  {
+    usb.send("% Log buffer allocation failed; run disabled.\n");
+    return false;
+  }
+  logPending = false;
+  logTruncated = false;
   logsCnt = 0;
   captureStartUs = micros();
   motor.setPWMfrq(80000);
@@ -247,6 +368,7 @@ void start()
   // Reset controllers for a clean run
   leftController.reset();
   rightController.reset();
+  return true;
 }
 
 void stop(float after)
@@ -260,10 +382,13 @@ void finished()
 { 
   motor.motorVoltage[0] = 0; 
   motor.motorVoltage[1] = 0;  
+  // Apply zero PWM before any blocking serial transfer. PI outputs during
+  // the settling phase may still be nonzero even with a zero speed target.
+  motor.tick();
   motor.setPWMfrq(80000);
   display.useDisplay = true;
   state = 0;
-  printLog();
+  logPending = true;
 }
 
 /**
@@ -277,7 +402,7 @@ void SpikeSequence()
       button = digitalReadFast(PIN_START_BUTTON);
       if (button or robot.missionStart)
       { 
-        start();
+        if (!start()) break;
         desiredValue = 0; 
         endTime = time_sec + 0.020; 
         state = 10;
@@ -347,7 +472,7 @@ void sequenceTwoSteps()
       button = digitalReadFast(PIN_START_BUTTON);
       if (button or robot.missionStart)
       { 
-        start();
+        if (!start()) break;
         desiredValue = 0; 
         endTime = time_sec + 0.020; 
         state = 10;
@@ -390,6 +515,44 @@ void sequenceTwoSteps()
   }
 }
 
+/**
+- Forward at 0.1 cm/s (0.001 m/s) for 3.0 seconds */
+void forwardThreeSeconds()
+{
+  bool button;
+  switch (state)
+  {
+    case 0:
+      button = digitalReadFast(PIN_START_BUTTON);
+      if (button or robot.missionStart)
+      {
+        if (!start()) break;
+        desiredValue = 0.0f;
+        endTime = time_sec + 0.2f; // 0.2s baseline at standstill
+        state = 10;
+      }
+      break;
+    case 10:
+      if (time_sec > endTime)
+      {
+        desiredValue = 0.5f;       // 2 cm/s (0.02 m/s) forward
+        endTime = time_sec + 3.00f; // Hold for 3 seconds
+        state = 100;
+      }
+      break;
+    case 100:
+      if (time_sec > endTime)
+      {
+        stop(0.40f);                // Command 0 m/s for 0.4s to capture deceleration
+      }
+      break;
+    default:
+      if (time_sec > endTime)
+        finished();
+      break;
+  }
+}
+
 struct TrajectoryPoint 
 {
   float time; 
@@ -410,28 +573,37 @@ struct MotorCoefficients
 /**
 - make the control */
 void controlUpdate()
-{ 
-  float velRef = desiredValue;
-  
-  // Compute tracking errors based on forward-positive measurements
-  float velLeftMeas = -encoder.motorVelocity[0];
-  float velRightMeas = encoder.motorVelocity[1];
-  
-  float errorLeft = velRef - velLeftMeas;
+{
+  float velRef = desiredValue * (gear / wheelRadius);
+
+  // Feed encoder counts (with sign convention: forward positive on both sides)
+  float leftCounts  = -encoder.encoder[0];
+  float rightCounts =  encoder.encoder[1];
+
+  // Smoothed velocity, in encoder counts per second
+  float leftCountsPerSec  = leftVelFilter.update(leftCounts);
+  float rightCountsPerSec = rightVelFilter.update(rightCounts);
+
+  // Convert counts/s to motor-shaft rad/s
+  const float countsToRad = 2.0f * PI / encoder.pulsPerRev;
+  float velLeftMeas  = leftCountsPerSec  * countsToRad;
+  float velRightMeas = rightCountsPerSec * countsToRad;
+
+  float errorLeft  = velRef - velLeftMeas;
   float errorRight = velRef - velRightMeas;
 
-  // Compute control signals without applying them to motors
-  computedControl[0] = leftController.ComputeCCDE(errorLeft);
-  computedControl[1] = rightController.ComputeCCDE(errorRight);
+  computedControl[0] = leftController.ComputePID(errorLeft);
+  computedControl[1] = rightController.ComputePID(errorRight);
 
-  // Execute original open-loop preplanned trajectory on the actuators
-  motor.motorVoltage[0] = velRef;
-  motor.motorVoltage[1] = velRef;
+  motor.motorVoltage[0] = -computedControl[0];
+  motor.motorVoltage[1] =  computedControl[1];
 }
 
 void updateLog()
 { 
-  if (state > 0 and logsCnt < logsMax)
+  if (state > 0 and logsCnt >= logsMax)
+    logTruncated = true;
+  if (logs != nullptr and state > 0 and logsCnt < logsMax)
   { 
     logs[logsCnt].time = time_sec;
     logs[logsCnt].state = state;
@@ -497,8 +669,7 @@ void loop ( void )
       isSampleTime = false;
       imu2.tick();
       encoder.tick();
-      SpikeSequence();
-      
+      forwardThreeSeconds();
       if (state > 0)
       { 
         controlUpdate();
@@ -509,5 +680,7 @@ void loop ( void )
       display.tick(); 
     }
     usb.tick(); 
+    if (logPending and state == 0 and Serial)
+      printLog();
   }
 }
