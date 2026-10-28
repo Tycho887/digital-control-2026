@@ -3,52 +3,22 @@
     "tasks": [
         {
             "label": "Upload and Monitor (automatic logging)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Upload current Teensy firmware",
-                "Monitor Teensy and record logs"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "Upload current Teensy firmware",
             "type": "process",
             "command": "${userHome}/.platformio/penv/bin/platformio",
             "args": [
                 "run",
                 "--project-dir", "${workspaceFolder}",
                 "--environment", "teensy41",
-                "--target", "upload"
+                "--target", "upload",
+                "--target", "monitor"
             ],
             "options": { "cwd": "${workspaceFolder}" },
-            "problemMatcher": ["$platformio"],
-            "hide": true
-        },
-        {
-            "label": "Monitor Teensy and record logs",
-            "type": "process",
-            "command": "${userHome}/.platformio/penv/bin/platformio",
-            "args": [
-                "device", "monitor",
-                "--project-dir", "${workspaceFolder}",
-                "--environment", "teensy41",
-                "--port", "/dev/cu.usbmodem*",
-                "--dtr", "1",
-                "--eol", "LF",
-                "--filter", "default",
-                "--filter", "log2file"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "env": { "PLATFORMIO_MONITOR_RAW": "false" }
-            },
             "presentation": {
                 "reveal": "always",
                 "focus": true,
                 "panel": "dedicated"
             },
-            "problemMatcher": [],
-            "hide": true
+            "problemMatcher": ["$platformio"]
         }
     ]
 }

@@ -570,11 +570,28 @@ struct MotorCoefficients
   float D;
 };
 
+struct Trajectory {
+  float timestamp;
+  float velocity;
+  float turn_rate;
+};
+
+// Here we used the v = (x_L + x_R) * 0.5, h' = (x_L - x_R) / B
+// Putting this in matrix form and inverting, gives the system below.
+
+float left_wheel_rad_p_s(float velocity, float turn_rate) {
+  return velocity - 0.5 * wheelBase * turn_rate;
+}
+float right_wheel_rad_p_s(float velocity, float turn_rate) {
+  return velocity + 0.5 * wheelBase * turn_rate;
+}
 /**
 - make the control */
 void controlUpdate()
 {
   float velRef = desiredValue * (gear / wheelRadius);
+  float left_wheel_setpoint = left_wheel_rad_p_s(velRef, 0.0f);
+  float right_wheel_setpoint = right_wheel_rad_p_s(velRef, 0.0f);
 
   // Feed encoder counts (with sign convention: forward positive on both sides)
   float leftCounts  = -encoder.encoder[0];
@@ -589,8 +606,8 @@ void controlUpdate()
   float velLeftMeas  = leftCountsPerSec  * countsToRad;
   float velRightMeas = rightCountsPerSec * countsToRad;
 
-  float errorLeft  = velRef - velLeftMeas;
-  float errorRight = velRef - velRightMeas;
+  float errorLeft  = left_wheel_setpoint - velLeftMeas;
+  float errorRight = right_wheel_setpoint - velRightMeas;
 
   computedControl[0] = leftController.ComputePID(errorLeft);
   computedControl[1] = rightController.ComputePID(errorRight);

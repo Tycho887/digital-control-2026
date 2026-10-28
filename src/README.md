@@ -3,11 +3,14 @@
 Open this directory (`src` in the repository) as the PlatformIO project.
 Its source directory is `src/src`, including `basebot_6.ino`.
 
-Use **Terminal → Run Task → Upload and Monitor (automatic logging)** in VS
-Code. This saved task uploads the current `teensy41` firmware, then opens a
-monitor with the project path, environment, USB port, DTR, and `log2file`
-filter explicitly selected. After upload succeeds, the monitor automatically
-starts recording to `src/logs`. Its
+Use PlatformIO's normal **Upload and Monitor** action. The project hook in
+`scripts/wait_for_monitor.py` waits up to 30 seconds for the Teensy's USB serial
+port to reappear and remain present for one second after uploading. It only
+enumerates USB devices and never opens the serial port. This prevents
+PlatformIO's one-time wildcard lookup from missing the rebooting board and
+stopping at `Enter port index or full name` before the logger starts.
+The hook reports `Teensy USB serial ready: ...` before the monitor opens.
+After upload succeeds, the monitor automatically starts recording to `src/logs`. Its
 startup output must include `Logging an output to .../src/logs/...` and the
 Teensy's `/dev/cu.usbmodem...` port. The project also forces DTR active, which
 the Teensy requires to recognize an attached serial reader. Wait for that
@@ -20,15 +23,35 @@ the firmware cannot create a file on the computer without an active monitor.
 Only one monitor should own the serial port at a time.
 Before repeating the task, terminate the previous monitor task using the
 terminal's trash button. Leave the monitor open while executing a run.
-The built-in PlatformIO **Upload and Monitor** action should also inherit the
-same project settings; the saved task makes the recording options explicit.
+The optional **Terminal → Run Task → Upload and Monitor (automatic logging)**
+task uses the same combined upload/monitor command and project hook. Close
+this custom task before uploading again; PlatformIO's automatic monitor
+closure handles its own built-in tasks, but does not handle custom process tasks.
 
-For a monitor-only session, the equivalent terminal command from this
-directory is:
+If an already running monitor is stopped at `Enter port index or full name`,
+the startup lookup has already failed. Enter the full current robot port
+(for example `/dev/cu.usbmodem145870301`) in that existing terminal to connect
+without uploading again. Keep the robot powered: a completed capture pending
+in RAM is transmitted when the monitor connects. Future combined uploads use
+the project hook automatically. A new log file is created when the monitor
+connects, even before a robot run; no new file means the file logger has not
+started, rather than an empty firmware capture.
+
+PlatformIO's VS Code extension installs its command-line tools in
+`~/.platformio/penv/bin`, which may not be on your terminal's `PATH`.
+No separate installation is needed. For an optional monitor-only session,
+this command works from any directory:
 
 ```sh
-pio device monitor -e teensy41
+"$HOME/.platformio/penv/bin/platformio" run \
+  --project-dir "$HOME/Autumn2026/digital-control-2026/src" \
+  --target monitor --environment teensy41
 ```
+
+Close an existing monitor before starting another. The normal VS Code
+**Upload and Monitor** action already uses the installed executable directly;
+it does not require `pio` to be available in your shell. The `pio` shorthand
+in the diagnostic commands below refers to `~/.platformio/penv/bin/pio`.
 
 The configured monitor port matches `/dev/cu.usbmodem*` on macOS, excluding
 Bluetooth devices and the debug console. Check the port in the monitor's
