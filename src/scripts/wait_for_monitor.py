@@ -55,5 +55,7 @@ def wait_after_upload(source, target, env):
 
 
 Import("env")
-if {"upload", "monitor"}.issubset(COMMAND_LINE_TARGETS):
+# PlatformIO strips "monitor" before invoking SCons, so it never appears in
+# COMMAND_LINE_TARGETS for a combined upload+monitor request.
+if "upload" in COMMAND_LINE_TARGETS:
     env.AddPostAction("upload", wait_after_upload)

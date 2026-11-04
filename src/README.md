@@ -63,13 +63,20 @@ For diagnostics, `log` plus Enter requests the samples already held in RAM;
 it does not start the motors. Even with no samples, the robot prints a header
 and `% sent 0 log lines`. The current firmware prints
 `% 25-26 computed control signal (left,right) (V)` in the header; columns 27-28
-are the Kalman filter's linear and angular velocity (m/s, rad/s), and column 29
-is the magnetometer heading (rad).
+are the Kalman filter's linear and angular velocity (m/s, rad/s), column 29 is
+the magnetometer heading (rad), columns 30-31 are the wheel-speed controller
+setpoints (left, right, motor rad/s), columns 32-38 are the Kalman state
+`[s, theta, v, omega, b_a, b_g, b_m]`, and columns 39-66 are the lower triangle
+of the filter covariance `P`, stored row-major as
+`P00; P10 P11; P20 P21 P22; ...; P66`. Because `P` is symmetric, the lower
+triangle is the full matrix.
 
 To capture a new run, keep the monitor open and press the robot's start button.
-The current forward sequence takes about 3.6 seconds (0.2 seconds at rest,
-3 seconds driving at 0.02 m/s, and 0.4 seconds settling). The 420 kB buffer
-holds 3750 samples at 1 ms with the current 112-byte rows, covering the full run.
+The active `sequenceTwoSteps` run lasts about 1.8 seconds. The 495 kB buffer
+holds 1903 samples at 1 ms with the current 260-byte rows, covering about
+1.9 seconds. For the 3.6-second `forwardThreeSeconds` sequence, set
+`logDivider = 2` (500 Hz) and `logCoverageUs = 3700000` in `basebot_6.ino`; the
+buffer then covers about 3.8 seconds.
 The firmware applies zero PWM before printing the completed log. It waits
 for a connected USB serial monitor before automatically sending a completed
 capture, so opening the monitor after the run can still retrieve the output.
@@ -92,13 +99,14 @@ feedback to the wheel-speed controller. Distance and heading are integrated
 from the filter's own velocity and turn rate, so wheel slip cannot inject an
 absolute pose error; the heading stays anchored by the gyro and magnetometer.
 Columns 11-14 report its x, y, heading and distance, columns 27-28 its linear
-and angular velocity, and column 29 the magnetometer heading, which prints
+and angular velocity, columns 32-38 its state and columns 39-66 its covariance,
+and column 29 the magnetometer heading, which prints
 `NaN` until the magnetometer has a valid fix. The IMU driver enables the
 AK8963; `magc` runs a hard-iron calibration (rotate the robot 360 degrees by
 hand for 8 seconds), and `mag 0` / `mag 1` disable or enable the magnetometer
 heading. Mag offsets are RAM-only and printed after calibration; reboot after
 calibrating so the filter starts from the calibrated heading. The `LogData`
-row stays 112 bytes and the 420 kB buffer still holds 3750 samples.
+row is 260 bytes and the 495 kB buffer holds 1903 samples.
 
 For manual builds and uploads, use PlatformIO:
 

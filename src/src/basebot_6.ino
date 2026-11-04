@@ -114,20 +114,29 @@ typedef struct
   uint8_t driverState; // bits: enabled L/R, sleeping L/R
   float encoderDelay[2];
   float controlSignal[2]; // Computed PID control signals (left, right)
+  float controlSetpoint[2]; // Wheel-speed reference (left, right) (motor rad/s)
+  float kfState[KF_N]; // [s, theta, v, omega, b_a, b_g, b_m]
+  float kfCov[KF_N * (KF_N + 1) / 2]; // lower triangle of P, row-major
 
 } LogData;
 
-// The forward sequence lasts 0.2 + 3.0 + 0.4 = 3.6 s. Retain every 1 ms
-// sample, with margin for state transitions (3750 rows at 112 bytes/row).
-const int logBufferBytes = 420000;
+// The active sequenceTwoSteps run lasts 1.8 s. A row is now 260 bytes after
+// adding the controller setpoints and Kalman state/covariance, so the buffer
+// covers about 1.9 s at 1 kHz. For the 3.6 s forwardThreeSeconds run set
+// logDivider to 2 (500 Hz) and logCoverageUs to 3700000.
+const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
-static_assert(logsMax * sampleTimeUs >= 3700000,
-              "Log buffer must cover the complete forward sequence plus margin");
+const int logDivider = 1; // log one row per N control ticks
+const uint32_t logCoverageUs = 1900000;
+static_assert(logDivider >= 1, "logDivider must be at least 1");
+static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
+              "Log buffer must cover the complete sequence plus margin");
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 const float currentScale = 0.0045; // A/count; requires hardware calibration
 const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
 uint32_t captureStartUs = 0;
 int logsCnt = 0; // next log entry to use / i.e. number of used log entries
+uint32_t logTickCnt = 0; // control ticks since start, for logDivider
 bool logPending = false; // preserve a completed capture until USB is connected
 bool logTruncated = false;
 
@@ -286,6 +295,14 @@ WheelController leftController(left_wheel_coeffs);
 WheelController rightController(right_wheel_coeffs);
 
 float computedControl[2] = {0.0f, 0.0f};
+float controlSetpoint[2] = {0.0f, 0.0f};
+
+void printLogValue(float value)
+{
+  char buf[24];
+  snprintf(buf, sizeof(buf), " %.9g", value);
+  Serial.print(buf);
+}
 
 void printLog()
 {
@@ -332,6 +349,12 @@ void printLog()
   Serial.println("% 25-26 computed control signal (left,right) (V)");
   Serial.println("% 27-28 Kalman velocity and yaw rate (m/s, rad/s)");
   Serial.println("% 29 magnetometer heading (rad, NaN if unavailable)");
+  Serial.println("% 30-31 controller setpoint (left,right) (motor rad/s)");
+  Serial.println("% 32-38 Kalman state [s, theta, v, omega, b_a, b_g, b_m]");
+  Serial.println("%       (m, rad, m/s, rad/s, m/s^2, rad/s, rad)");
+  Serial.println("% 39-66 Kalman covariance lower triangle, row-major:");
+  Serial.println("%       P00; P10 P11; P20 P21 P22; ...; P66");
+  Serial.println("%       P is symmetric, so the lower triangle is the full matrix.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
   Serial.print(" offsets L/R "); Serial.print(currentOffset[0],6);
@@ -371,6 +394,9 @@ void printLog()
     Serial.print(" "); Serial.print(d->poseVel[0],4); // 27
     Serial.print(" "); Serial.print(d->poseVel[1],4); // 28
     Serial.print(" "); Serial.print(d->pose[3],4); // 29
+    for (int k = 0; k < 2; k++) printLogValue(d->controlSetpoint[k]); // 30-31
+    for (int k = 0; k < KF_N; k++) printLogValue(d->kfState[k]); // 32-38
+    for (int k = 0; k < KF_N * (KF_N + 1) / 2; k++) printLogValue(d->kfCov[k]); // 39-66
     Serial.println("");
     d++;
   }
@@ -404,6 +430,9 @@ bool start()
   logPending = false;
   logTruncated = false;
   logsCnt = 0;
+  logTickCnt = 0;
+  controlSetpoint[0] = 0.0f;
+  controlSetpoint[1] = 0.0f;
   captureStartUs = micros();
   motor.setPWMfrq(80000);
   time_sec = 0;
@@ -652,6 +681,8 @@ void controlUpdate()
   float velRef = desiredValue * (gear / wheelRadius);
   float left_wheel_setpoint = left_wheel_rad_p_s(velRef, 0.0f);
   float right_wheel_setpoint = right_wheel_rad_p_s(velRef, 0.0f);
+  controlSetpoint[0] = left_wheel_setpoint;
+  controlSetpoint[1] = right_wheel_setpoint;
 
   // Feed encoder counts (with sign convention: forward positive on both sides)
   float leftCounts  = -encoder.encoder[0];
@@ -841,6 +872,16 @@ void updateLog()
     logs[logsCnt].controlSignal[0] = computedControl[0];
     logs[logsCnt].controlSignal[1] = computedControl[1];
 
+    logs[logsCnt].controlSetpoint[0] = controlSetpoint[0];
+    logs[logsCnt].controlSetpoint[1] = controlSetpoint[1];
+    for (int k = 0; k < KF_N; k++)
+      logs[logsCnt].kfState[k] = kf.x[k];
+    // P is symmetric; store the lower triangle row by row.
+    int covIndex = 0;
+    for (int i = 0; i < KF_N; i++)
+      for (int j = 0; j <= i; j++)
+        logs[logsCnt].kfCov[covIndex++] = kf.P[i * KF_N + j];
+
     logsCnt++;
   }
 }
@@ -885,7 +926,9 @@ void loop ( void )
         controlUpdate();
       }
       motor.tick();
-      updateLog();
+      if (logTickCnt % logDivider == 0)
+        updateLog();
+      logTickCnt++;
       robot.tick();   
       display.tick(); 
     }
