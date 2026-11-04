@@ -1,4 +1,4 @@
-#pragma once
+/* #pragma once
 #include <math.h>
 
 // Amounts are commanded travel and heading, implemented by time at fixed speed.
@@ -46,3 +46,4 @@ inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig& c, float elap
   if(elapsed<end) return {0,0,16};
   return {0,0,0};
 }
+ */

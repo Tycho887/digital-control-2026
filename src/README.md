@@ -62,7 +62,9 @@ The Teensy has USB vendor/product ID `16C0:0483`.
 For diagnostics, `log` plus Enter requests the samples already held in RAM;
 it does not start the motors. Even with no samples, the robot prints a header
 and `% sent 0 log lines`. The current firmware prints
-`% 25-26 computed control signal (left,right) (V)` in the header.
+`% 25-26 computed control signal (left,right) (V)` in the header; columns 27-28
+are the Kalman filter's linear and angular velocity (m/s, rad/s), and column 29
+is the magnetometer heading (rad).
 
 To capture a new run, keep the monitor open and press the robot's start button.
 The current forward sequence takes about 3.6 seconds (0.2 seconds at rest,
@@ -79,6 +81,24 @@ remains powered; rebooting or starting another run replaces the samples.
 Requests during a run are rejected so serial printing cannot stall motor
 control. A buffer allocation failure prevents starting a run; if a future
 sequence exceeds capacity, its log includes a warning about missing samples.
+
+The pose and velocity columns come from the 7-state Kalman filter in
+`src/src/kalman.h` and `kalman.cpp`. It runs at 1 kHz and fuses forward
+acceleration (as a control input), gyro yaw rate, linear and angular velocity
+derived from the two AS5047P/AS5147 absolute-angle sensors over SPI (angle
+differences over a 10 ms window), and a gated magnetometer heading. The stock
+48-edge quadrature encoders no longer feed the filter: they now only provide
+feedback to the wheel-speed controller. Distance and heading are integrated
+from the filter's own velocity and turn rate, so wheel slip cannot inject an
+absolute pose error; the heading stays anchored by the gyro and magnetometer.
+Columns 11-14 report its x, y, heading and distance, columns 27-28 its linear
+and angular velocity, and column 29 the magnetometer heading, which prints
+`NaN` until the magnetometer has a valid fix. The IMU driver enables the
+AK8963; `magc` runs a hard-iron calibration (rotate the robot 360 degrees by
+hand for 8 seconds), and `mag 0` / `mag 1` disable or enable the magnetometer
+heading. Mag offsets are RAM-only and printed after calibration; reboot after
+calibrating so the filter starts from the calibrated heading. The `LogData`
+row stays 112 bytes and the 420 kB buffer still holds 3750 samples.
 
 For manual builds and uploads, use PlatformIO:
 

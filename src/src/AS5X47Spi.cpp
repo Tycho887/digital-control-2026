@@ -79,6 +79,7 @@ uint16_t AS5X47Spi::readData(uint16_t command, uint16_t nopCommand)
 //   receivedData = SPI.transfer16(nopCommand);
 //   delayMicroseconds(1);
 //   digitalWrite(chipSelectPin, HIGH);
-//   SPI.endTransaction();
+	// Release the bus: both wheel sensors share the hardware SPI port.
+	SPI.endTransaction();
 	return receivedData;
 }

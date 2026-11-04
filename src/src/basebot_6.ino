@@ -37,6 +37,8 @@ void printLog();
 #include "umotor.h"
 #include "uimu2.h"
 #include "uencoder.h"
+#include "AS5X47.h"
+#include "kalman.h"
 
 /**
 - Global variables */
@@ -49,7 +51,37 @@ const float wheelBase = 0.14;
 float distA = 0; // trip distance
 float pose[4];
 float poseVel[2];
+// Kalman filter estimator state
+const float imuForwardAccelSign = -1.0f;  // forward = -IMU Z
+const float imuYawRateSign = -1.0f;       // CCW yaw = -IMU X
+const float gravity = 9.80665f;
+const float gyroToRad = PI / 180.0f;
+float kfAccelBias = 0.0f;
+uint32_t kfAccelCalCnt = 0;
+bool kfAccelCalDone = false;
+bool kfHeadingInit = false;
+float kfStartS = 0.0f, kfStartTheta = 0.0f;
+float kfX = 0.0f, kfY = 0.0f;
+float kfPrevS = 0.0f, kfPrevTheta = 0.0f;
+uint32_t kfLastUs = 0;
 bool velSaturated = false;
+
+// Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
+// the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
+// assumptions to be confirmed against the harness.
+const uint8_t AS5X47_LEFT_CS = 24;
+const uint8_t AS5X47_RIGHT_CS = 25;
+// Sensor direction vs forward travel; flip a sign if a sensor is mounted
+// mirrored. The left sign matches the quadrature encoder convention below.
+const float AS5X47_LEFT_DIR = -1.0f;
+const float AS5X47_RIGHT_DIR = 1.0f;
+AS5X47 as5x47Left(AS5X47_LEFT_CS);
+AS5X47 as5x47Right(AS5X47_RIGHT_CS);
+// 10 ms angle-differencing state, in motor-shaft radians
+bool wheelOdoInit = false;
+float wheelOdoPrevAngle[2] = {0.0f, 0.0f};
+float wheelOdoAccum[2] = {0.0f, 0.0f};
+uint32_t wheelOdoStartUs = 0;
 
 // ////////////////////////////////////////
 // define a structure for log elements
@@ -289,6 +321,8 @@ void printLog()
   Serial.println("% 22 driver flags: bits 0/1 enable L/R, bits 2/3 sleeping L/R");
   Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
   Serial.println("% 25-26 computed control signal (left,right) (V)");
+  Serial.println("% 27-28 Kalman velocity and yaw rate (m/s, rad/s)");
+  Serial.println("% 29 magnetometer heading (rad, NaN if unavailable)");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
   Serial.print(" offsets L/R "); Serial.print(currentOffset[0],6);
@@ -325,6 +359,9 @@ void printLog()
     Serial.print(" "); Serial.print(d->encoderDelay[1],7); // 24
     Serial.print(" "); Serial.print(d->controlSignal[0],4); // 25
     Serial.print(" "); Serial.print(d->controlSignal[1],4); // 26
+    Serial.print(" "); Serial.print(d->poseVel[0],4); // 27
+    Serial.print(" "); Serial.print(d->poseVel[1],4); // 28
+    Serial.print(" "); Serial.print(d->pose[3],4); // 29
     Serial.println("");
     d++;
   }
@@ -363,11 +400,25 @@ bool start()
   time_sec = 0;
   encoder.encoder[0] = 0; 
   encoder.encoder[1] = 0; 
+  // Restart the wheel-speed window so the run begins from a clean seed.
+  wheelOdoInit = false;
+  wheelOdoAccum[0] = 0.0f;
+  wheelOdoAccum[1] = 0.0f;
   display.useDisplay = false;
   
   // Reset controllers for a clean run
   leftController.reset();
   rightController.reset();
+  // Capture the pose origin; the filter keeps its learned biases.
+  kfStartS = kf.x[DiffDriveKalmanFilter::S];
+  kfStartTheta = kf.x[DiffDriveKalmanFilter::THETA];
+  kfX = 0.0f; kfY = 0.0f;
+  kfPrevS = kfStartS; kfPrevTheta = kfStartTheta;
+  // Make the first logged row use the new origin, before the next estimator tick.
+  pose[0] = 0.0f; pose[1] = 0.0f; pose[2] = 0.0f;
+  pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
+  poseVel[0] = 0.0f; poseVel[1] = 0.0f;
+  distA = 0.0f;
   return true;
 }
 
@@ -489,7 +540,7 @@ void sequenceTwoSteps()
     case 11: 
       if (time_sec > endTime)
       { 
-        desiredValue = 3;
+        desiredValue = 0;
         endTime = time_sec + 0.50;
         state = 12;
       }
@@ -497,7 +548,7 @@ void sequenceTwoSteps()
     case 12: 
       if (time_sec > endTime)
       { 
-        desiredValue = 6;
+        desiredValue = 3;
         endTime = time_sec + 0.5;
         state = 100;
       }
@@ -616,6 +667,131 @@ void controlUpdate()
   motor.motorVoltage[1] =  computedControl[1];
 }
 
+/**
+- Read one AS5X47 compensated angle in motor-shaft radians.
+- Returns false when the SPI frame is flagged, so a failed transfer cannot
+  turn into a fake angle step (a zero word would look like a jump).
+- ANGLE_COMPSATED (0x3FFF) is the same register AS5X47::readAngle() uses. */
+bool readWheelAngle(AS5X47 &sensor, float &angleRad)
+{
+  ReadDataFrame frame = sensor.readRegister(ANGLE_COMPSATED);
+  if (frame.values.ef or frame.values.pard)
+    return false;
+  Angle angle;
+  angle.raw = frame.values.data;
+  angleRad = angle.values.cordicang * (2.0f * PI / 16384.0f);
+  return true;
+}
+
+/**
+- AS5X47 wheel speed, 1 kHz reads over a 10 ms window.
+- Both absolute angles are read every tick and their unwrapped differences
+  accumulated. Every KF_WHEEL_WINDOW the accumulators are converted to wheel
+  speed and fed to the filter as v and omega.
+- The sensors sit on the motor shafts, so wheel angle = sensor angle / gear.
+- AS5X47::readVel() is deliberately not used: its 24.141 deg/s LSB is
+  unusable at the robot's low speeds. */
+void wheelOdometryUpdate()
+{
+  float angleLeft = 0.0f, angleRight = 0.0f;
+  if (!readWheelAngle(as5x47Left, angleLeft) or
+      !readWheelAngle(as5x47Right, angleRight))
+    return;
+  angleLeft *= AS5X47_LEFT_DIR;
+  angleRight *= AS5X47_RIGHT_DIR;
+
+  uint32_t nowUs = micros();
+  if (!wheelOdoInit)
+  { // seed the previous angles; the first window has no usable delta yet
+    wheelOdoPrevAngle[0] = angleLeft;
+    wheelOdoPrevAngle[1] = angleRight;
+    wheelOdoAccum[0] = 0.0f;
+    wheelOdoAccum[1] = 0.0f;
+    wheelOdoStartUs = nowUs;
+    wheelOdoInit = true;
+    return;
+  }
+
+  wheelOdoAccum[0] += wrapAngle(angleLeft - wheelOdoPrevAngle[0]);
+  wheelOdoAccum[1] += wrapAngle(angleRight - wheelOdoPrevAngle[1]);
+  wheelOdoPrevAngle[0] = angleLeft;
+  wheelOdoPrevAngle[1] = angleRight;
+
+  float window = (nowUs - wheelOdoStartUs) * 1e-6f;
+  if (window < KF_WHEEL_WINDOW)
+    return;
+
+  float wheelAngleLeft = wheelOdoAccum[0] / gear;
+  float wheelAngleRight = wheelOdoAccum[1] / gear;
+  float vLeft = wheelRadius * wheelAngleLeft / window;
+  float vRight = wheelRadius * wheelAngleRight / window;
+  kf.updateWheelV(0.5f * (vLeft + vRight), window);
+  kf.updateWheelOmega((vRight - vLeft) / wheelBase, window);
+
+  wheelOdoAccum[0] = 0.0f;
+  wheelOdoAccum[1] = 0.0f;
+  wheelOdoStartUs = nowUs;
+}
+
+/**
+- Kalman filter update, 1 kHz */
+void estimatorUpdate()
+{
+  uint32_t nowUs = micros();
+  float dt = (nowUs - kfLastUs) * 1e-6f;
+  kfLastUs = nowUs;
+  if (dt <= 0.0f || dt > 0.020f)
+  {
+    kfPrevS = kf.x[DiffDriveKalmanFilter::S];
+    kfPrevTheta = kf.x[DiffDriveKalmanFilter::THETA];
+    return;
+  }
+  float aRaw = imuForwardAccelSign * imu2.acc[2] * gravity;
+  if (!kfAccelCalDone && imu2.accelFresh)
+  {
+    kfAccelCalCnt++;
+    kfAccelBias += (aRaw - kfAccelBias) / kfAccelCalCnt;
+    if (kfAccelCalCnt >= 2000) kfAccelCalDone = true;
+  }
+  kf.predict(kfAccelCalDone ? aRaw - kfAccelBias : 0.0f, dt);
+  if (imu2.gyroFresh && imu2.gyroOffsetDone)
+    kf.updateGyro(imuYawRateSign * imu2.gyro[0] * gyroToRad);
+  // Wheel speed now comes from the AS5X47 absolute angles only. The stock
+  // quadrature encoders remain in use by controlUpdate() but not here.
+  wheelOdometryUpdate();
+  if (imu2.magFresh && imu2.magHeadingValid)
+  {
+    if (!kfHeadingInit)
+    {
+      float delta = imu2.magHeading - kf.x[DiffDriveKalmanFilter::THETA];
+      kf.x[DiffDriveKalmanFilter::THETA] = imu2.magHeading;
+      kf.x[DiffDriveKalmanFilter::BM] = 0.0f;
+      if (state > 0) kfStartTheta += delta;
+      kfPrevTheta += delta;
+      kfHeadingInit = true;
+    }
+    else
+      kf.updateMag(imu2.magHeading);
+  }
+  float s = kf.x[DiffDriveKalmanFilter::S];
+  float theta = kf.x[DiffDriveKalmanFilter::THETA];
+  float ds = s - kfPrevS;
+  float headingRel = theta - kfStartTheta;
+  float headingRelPrev = kfPrevTheta - kfStartTheta;
+  float mid = 0.5f * (headingRel + headingRelPrev);
+  kfX += ds * cosf(mid);
+  kfY += ds * sinf(mid);
+  kfPrevS = s;
+  kfPrevTheta = theta;
+  pose[0] = kfX;
+  pose[1] = kfY;
+  pose[2] = headingRel;
+  pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
+  poseVel[0] = kf.x[DiffDriveKalmanFilter::V];
+  poseVel[1] = kf.x[DiffDriveKalmanFilter::OMEGA];
+  distA = s - kfStartS;
+}
+
 void updateLog()
 { 
   if (state > 0 and logsCnt >= logsMax)
@@ -669,6 +845,8 @@ void setup()
   encoder.setup(); 
   encoder.pulsPerRev = 48;
   imu2.setup(); 
+  kf.reset(0.0f);
+  kfLastUs = micros();
   motor.setPWMfrq(0x13000); 
   usb.setup();
   display.useDisplay = true;
@@ -686,7 +864,9 @@ void loop ( void )
       isSampleTime = false;
       imu2.tick();
       encoder.tick();
-      forwardThreeSeconds();
+      estimatorUpdate();
+      sequenceTwoSteps();
+      //forwardThreeSeconds();
       if (state > 0)
       { 
         controlUpdate();

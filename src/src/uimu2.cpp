@@ -21,6 +21,7 @@
   * THE SOFTWARE. */
  
 #include "uimu2.h"
+#include <math.h>
 #include "ueeconfig.h"
 #include "uencoder.h"
 #include "urobot.h"
@@ -40,12 +41,15 @@ void UImu2::initMpu()
 {
   #if defined(REGBOT_HW4)
   Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_INT, I2C_RATE_1000 );
+  i2cClock = 1000000;
   #else
     #if defined(REGBOT_HW41) || defined(REGBOT_HW63_35)
     Wire.begin();
     Wire.setClock(1000000);
+    i2cClock = 1000000;
     #else
     Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_16_17, I2C_PULLUP_EXT, I2C_RATE_1000 );
+    i2cClock = 1000000;
     #endif
   #endif
   /* Initialize and configure IMU */
@@ -66,6 +70,35 @@ void UImu2::initMpu()
     //
     mpu.beginAccel(ACC_FULL_SCALE_4_G);
     mpu.beginGyro(GYRO_FULL_SCALE_1000_DPS);
+    // MPU9250_asukiaaa does not expose the digital low-pass filter, so write
+    // it directly. CONFIG (0x1A) DLPF_CFG=2 -> 92 Hz gyro bandwidth;
+    // ACCEL_CONFIG2 (0x1D) =2 -> 94 Hz accel bandwidth. These are the
+    // settings behind the datasheet noise figures used by the Kalman filter
+    // (0.1 deg/s gyro RMS, 300 ug/sqrt(Hz) accel density).
+    Wire.beginTransmission(ADDRESS_MPU);
+    Wire.write(0x1A);
+    Wire.write(0x02);
+    Wire.endTransmission();
+    Wire.beginTransmission(ADDRESS_MPU);
+    Wire.write(0x1D);
+    Wire.write(0x02);
+    Wire.endTransmission();
+    // AK8963 magnetometer has a lower I2C clock limit than the MPU
+    Wire.setClock(400000);
+    mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
+    // check AK8963 presence: WHO_AM_I (register 0x00) is 0x48
+    magAvailable = false;
+    Wire.beginTransmission(0x0C);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) == 0 and
+        Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1 and
+        Wire.read() == 0x48)
+      magAvailable = true;
+    Wire.setClock(i2cClock);
+    if (magAvailable)
+      usb.send("%% magnetometer AK8963 ready\r\n");
+    else
+      usb.send("%% magnetometer AK8963 not found\r\n");
   }
 }
 
@@ -73,7 +106,15 @@ void UImu2::initMpu()
 bool UImu2::decode(const char* cmd)
 {
   bool found = true;
-  if (strncmp(cmd, "gyroc", 5) == 0)
+  if (strncmp(cmd, "magc", 4) == 0)
+  {
+    startMagCalibration();
+  }
+  else if (strncmp(cmd, "mag ", 4) == 0)
+  {
+    useMag = strtol(&cmd[4], NULL, 10) != 0;
+  }
+  else if (strncmp(cmd, "gyroc", 5) == 0)
   {
     gyroOffsetDone = false;
   }
@@ -89,11 +130,31 @@ void UImu2::sendHelp()
   usb.send("%% IMU -------\r\n");
   snprintf(reply, MRL, "%% -- \tgyroc \tStart gyro calibration (finished=%d)\r\n", gyroOffsetDone);
   usb.send(reply);
+  snprintf(reply, MRL, "%% -- \tmagc \tStart magnetometer offset calibration\r\n");
+  usb.send(reply);
+  snprintf(reply, MRL, "%% -- \tmag <0|1> \tUse magnetometer heading (is=%d)\r\n", useMag);
+  usb.send(reply);
+}
+
+void UImu2::startMagCalibration()
+{ // clear old offsets and start new min/max accumulation
+  useMag = true;
+  mpu.magXOffset = 0;
+  mpu.magYOffset = 0;
+  mpu.magZOffset = 0;
+  for (int i = 0; i < 3; i++)
+  {
+    magMin[i] = INFINITY;
+    magMax[i] = -INFINITY;
+  }
+  magCalStart = millis();
+  magCalActive = true;
+  usb.send("%% Rotate the robot 360 degrees by hand for 8 s (motors off)\r\n");
 }
 
 void UImu2::tick()
 { // read data - first time will fail
-  accelFresh = gyroFresh = false;
+  accelFresh = gyroFresh = magFresh = false;
   // INT_STATUS bit 0 distinguishes new sensor samples from repeated register reads.
   bool dataReady = false;
   Wire.beginTransmission(ADDRESS_MPU);
@@ -187,6 +248,50 @@ void UImu2::tick()
         imuAvailable--;
         if (imuAvailable == 0)
           usb.send("%% message failed to read from MPU9250 10 times in a row, stopped trying\r\n");
+      }
+      // Magnetometer (AK8963) - update every 10th tick (100 Hz)
+      // IMU frame: X down, Y right, Z backwards (forward = -Z, CCW yaw = -X)
+      if (!useMag)
+        magHeadingValid = false;
+      else if (magAvailable and (tickCnt % 10) == 0)
+      { // AK8963 supports max 400 kHz I2C clock
+        Wire.setClock(400000);
+        uint8_t magRetval = mpu.magUpdate();
+        Wire.setClock(i2cClock);
+        // HOFL (bit 3 in ST2) set means magnetic sensor overflow
+        if (magRetval == 0 and (mpu.magBuff[6] & 0x08) == 0)
+        {
+          mag[0] = mpu.magX();
+          mag[1] = mpu.magY();
+          mag[2] = mpu.magZ();
+          magHeading = atan2f(mag[1], -mag[2]);
+          magTimestampUs = micros();
+          magFresh = true;
+          magHeadingValid = true;
+          if (magCalActive)
+          { // accumulate raw range while the robot is rotated
+            for (int i = 0; i < 3; i++)
+            {
+              if (mag[i] < magMin[i])
+                magMin[i] = mag[i];
+              if (mag[i] > magMax[i])
+                magMax[i] = mag[i];
+            }
+            if (millis() - magCalStart >= 8000)
+            { // hard-iron offset is the center of the measured range
+              mpu.magXOffset = (int16_t)((magMin[0] + magMax[0]) / 2);
+              mpu.magYOffset = (int16_t)((magMin[1] + magMax[1]) / 2);
+              mpu.magZOffset = (int16_t)((magMin[2] + magMax[2]) / 2);
+              magCalActive = false;
+              const int MSL = 150;
+              char s[MSL];
+              snprintf(s, MSL, "%% mag offsets x=%g y=%g z=%g\r\n",
+                       (float)mpu.magXOffset, (float)mpu.magYOffset, (float)mpu.magZOffset);
+              usb.send(s);
+              usb.send("%% Reboot to restart the filter from the calibrated heading\r\n");
+            }
+          }
+        }
       }
     }
     { //  complementary tilt filter only

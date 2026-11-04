@@ -74,6 +74,21 @@ public:
    * Newest accelerometer values
    * in G, e.g. units of 9.82 m/s^2 */
   float acc[3] = {0}; // in G
+  /**
+   * Newest magnetometer (AK8963) values
+   * as adjusted counts (0.15 uT per LSB) */
+  bool magAvailable = false, magFresh = false, magHeadingValid = false;
+  float mag[3] = {0};
+  /**
+   * Magnetic heading in radians, atan2(magY, -magZ) */
+  float magHeading = 0.0f;
+  uint32_t magTimestampUs = 0;
+  /**
+   * Use magnetometer for heading (command: mag 0/1) */
+  bool useMag = true;
+  /**
+   * Start magnetometer offset calibration */
+  void startMagCalibration();
 
 public:
   /** internal filter values */
@@ -105,6 +120,13 @@ private:
   MPU9250_asukiaaa mpu{ADDRESS_MPU};
   /// last read time (in us) from IMU
   uint32_t lastRead = 0;
+  /// configured MPU I2C clock (AK8963 is limited to 400 kHz)
+  uint32_t i2cClock = 100000;
+  /// magnetometer calibration state
+  bool magCalActive = false;
+  uint32_t magCalStart = 0;
+  float magMin[3] = {0};
+  float magMax[3] = {0};
   ///
   uint32_t tickCnt = 0;
   /** debug counter of interrups
