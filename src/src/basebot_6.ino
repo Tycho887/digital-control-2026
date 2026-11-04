@@ -244,6 +244,10 @@ class HeadingController {
     float e1 = 0.0f; 
     float u1 = 0.0f;
 
+    float alpha = 0.05f; 
+    float u_head = 0.0f; //Smoothing applyed later
+
+
     float compute(float ref, float heading) {
         float error = ref - heading;
     
@@ -252,11 +256,12 @@ class HeadingController {
 
         float kph_out = Kph * error;
 
-        float u_head = (b0 * kph_out) + (b1 * e1) - (a1 * u1);
+        float u_head_raw = (b0 * kph_out) + (b1 * e1) - (a1 * u1);
 
         e1 = kph_out;
-        u1 = u_head;
+        u1 = u_head_raw;
 
+        u_head = (alpha * u_head_raw) + ((1.0f - alpha) * u_head);
         return u_head;
     }
 };
