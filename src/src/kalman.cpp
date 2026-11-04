@@ -201,18 +201,20 @@ void DiffDriveKalmanFilter::updateAngle(const float *H, float z, float R)
   updateScalar(H, zAdj, R);
 }
 
-// AS5X47 speed noise: the angle difference over one window has RMS noise
-// sigma_angle, and the sensor sits on the motor shaft (wheel = angle / gear).
+// AS5X47 speed noise. Each angle sample has RMS noise sigma_angle, so the
+// endpoint difference over one window has sqrt(2)*sigma_angle. The sensor
+// sits on the motor shaft (wheel = angle / gear).
 float DiffDriveKalmanFilter::rWheelV(float window) const
 {
-  const float sigma = KF_WHEEL_RADIUS * KF_AS5X47_SIGMA_ANGLE /
+  const float sigma = sqrtf(2.0f) * KF_WHEEL_RADIUS * KF_AS5X47_SIGMA_ANGLE /
                       (KF_AS5X47_GEAR * window);
   return sigma * sigma;
 }
 
 float DiffDriveKalmanFilter::rWheelOmega(float window) const
 {
-  const float sigma = 2.0f * KF_WHEEL_RADIUS * KF_AS5X47_SIGMA_ANGLE /
+  const float sigma = sqrtf(2.0f) * 2.0f * KF_WHEEL_RADIUS *
+                      KF_AS5X47_SIGMA_ANGLE /
                       (KF_WHEEL_BASE * KF_AS5X47_GEAR * window);
   return sigma * sigma;
 }

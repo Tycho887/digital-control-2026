@@ -72,8 +72,8 @@ values, not datasheet numbers.
 | Parameter | Symbol in code | Formula | 1-σ value | `R` (variance) | Units of `R` | Source |
 |-----------|----------------|---------|-----------|----------------|--------------|--------|
 | Gyro | `R_gyro` | `(0.1·π/180)²` | `1.745e-3` rad/s | `3.046e-6` | (rad/s)² | MPU-9250 Table 1, total RMS noise 0.1 °/s at DLPFCFG=2 (92 Hz) |
-| AS5X47 linear velocity | `R_wheel_v` | `(r·σ_angle/(gear·T))²` | `3.89e-4` m/s | `1.52e-7` | (m/s)² | AS5047P/AS5147 RMS angle noise 0.068° (1σ, NOISESET=0), T = 10 ms |
-| AS5X47 turn rate | `R_wheel_omega` | `(2·r·σ_angle/(b·gear·T))²` | `5.56e-3` rad/s | `3.10e-5` | (rad/s)² | same, plus wheelbase `b` |
+| AS5X47 linear velocity | `R_wheel_v` | `(√2·r·σ_angle/(gear·T))²` | `5.51e-4` m/s | `3.03e-7` | (m/s)² | AS5047P/AS5147 RMS angle noise 0.068° (1σ, NOISESET=0), endpoint difference over T = 10 ms |
+| AS5X47 turn rate | `R_wheel_omega` | `(√2·2·r·σ_angle/(b·gear·T))²` | `7.87e-3` rad/s | `6.19e-5` | (rad/s)² | same, plus wheelbase `b` |
 | Magnetometer | `R_mag` | engineering estimate `(0.01)²` | `1.0e-2` rad | `1.0e-4` | rad² | no RMS figure in the MPU-9250 datasheet; quantisation floor in §4.4 |
 
 Constants: wheel radius `r = 0.0315 m`, wheelbase `b = 0.14 m`, reduction
@@ -127,8 +127,9 @@ datasheet-derived; an Allan-variance analysis is the proper source.
   temperature), ±1.2° (magnet displaced over temperature). INL is
   **systematic**, not white noise: it belongs in the angle scale/offset
   uncertainty, not in `R`. Squared, ±0.8° would be `1.95e-4 rad²`, about
-  1300× `R_wheel_v`, so folding it into `R` would make the wheel updates
-  useless.
+  640× `R_wheel_v`, so folding it into `R` would make the wheel updates
+  useless. The endpoint difference of two angle readings has `√2` times the
+  per-sample RMS, which is why the formulas above carry the `√2`.
 - **Magnetometer, `0.01 rad`:** no RMS noise figure exists in the MPU-9250
   datasheet. Only sensitivity is given: `0.6 µT/LSB` (14-bit) and
   `0.15 µT/LSB` (16-bit AK8963 mode, which the firmware uses). At a 17 µT
@@ -157,11 +158,13 @@ its slow drift cancel. `v_L`, `v_R` take the sign convention of the motor
 direction; the left sensor is inverted relative to the right, matching the PI
 controller's `vLeft = −motorVelocity[0]·r/gear` convention.
 
-Substituting `σ_angle` for the angle difference gives the `R` values in §4.1:
+Each angle reading has RMS noise `σ_angle`; the endpoint difference therefore
+has `√2·σ_angle`. Substituting that into the velocity equations gives the `R`
+values in §4.1:
 
 ```
-σ_v  = r·σ_angle / (gear·T)        = 0.0315·1.187e-3 / (9.6·0.01) = 3.89e-4 m/s
-σ_ω  = 2·r·σ_angle / (b·gear·T)    = 2·0.0315·1.187e-3 / (0.14·9.6·0.01) = 5.56e-3 rad/s
+σ_v  = √2·r·σ_angle / (gear·T)      = 1.414·0.0315·1.187e-3 / (9.6·0.01) = 5.51e-4 m/s
+σ_ω  = √2·2·r·σ_angle / (b·gear·T)  = 1.414·2·0.0315·1.187e-3 / (0.14·9.6·0.01) = 7.87e-3 rad/s
 ```
 
 **Why not `readVel()`.** The AS5X47 velocity register (`ANGLE_VEL`, 0x3FFC)
@@ -190,8 +193,8 @@ before the update.
 |--------|---------|-----|-----|
 | Gyro | `[0, 0, 0, 1, 0, 1, 0]` | `ω + b_g` | `3.046e-6` (rad/s)² |
 | Magnetometer | `[0, 1, 0, 0, 0, 0, 1]` | `θ + b_m` (wrapped) | `1.0e-4` rad² |
-| AS5X47 linear velocity | `[0, 0, 1, 0, 0, 0, 0]` | `v` | `1.52e-7` (m/s)² |
-| AS5X47 turn rate | `[0, 0, 0, 1, 0, 0, 0]` | `ω` | `3.10e-5` (rad/s)² |
+| AS5X47 linear velocity | `[0, 0, 1, 0, 0, 0, 0]` | `v` | `3.03e-7` (m/s)² |
+| AS5X47 turn rate | `[0, 0, 0, 1, 0, 0, 0]` | `ω` | `6.19e-5` (rad/s)² |
 | Accelerometer | — | — | control input `u = a_meas`, folded into `Q` |
 
 Update order per cycle: `predict(a, dt)` → `updateGyro` (whenever a fresh
@@ -262,17 +265,20 @@ the operating temperature range.
   mounted directly on a wheel, set `gear = 1` in one place; `R_wheel_v` and
   `R_wheel_omega` then follow from the same formulas.
 - **Constants.** `gear` (9.6), `wheelRadius` (0.0315 m) and `wheelBase`
-  (0.14 m) live in `basebot_6.ino`; the filter computes the two wheel `R`
-  values from `KF_AS5X47_SIGMA_ANGLE` and the actual update window, so a
-  different `T` rescales them automatically (`R ∝ 1/T²`).
+  (0.14 m) also exist in `basebot_6.ino`; the filter mirrors them as
+  `KF_AS5X47_GEAR`, `KF_WHEEL_RADIUS` and `KF_WHEEL_BASE` in `kalman.h`, so
+  keep the two sets in sync. The filter computes the two wheel `R` values from
+  `KF_AS5X47_SIGMA_ANGLE` and the actual update window, so a different `T`
+  rescales them automatically (`R ∝ 1/T²`).
 - **Encoder path.** `uencoder` still runs and still drives the wheel-speed PI
   loop; it must not be re-added to the estimator.
 - **Precision / Python parity.** C++ uses `float` (24-bit mantissa, ~7 decimal
   digits); the Python reference uses `float64`. Bit-exact equality is not
-  expected. Compare states and `P` diagonals with a tolerance
-  (`rtol ≈ 1e-4`, plus an absolute floor for near-zero states such as `s` at
-  the start), and compare `magRejected` flags exactly. Larger divergence
-  points to a real algorithm difference, not rounding.
+  expected. Compare states and `P` diagonals with a tolerance (`rtol ≈ 1e-4`,
+  `rtol ≈ 1e-3` for the nearly unobservable `θ`/`b_m` pair, plus an absolute
+  floor for near-zero states such as `s` at the start), and compare
+  `magRejected` flags exactly. Larger divergence points to a real algorithm
+  difference, not rounding.
 - **Covariance hygiene.** `P` is symmetrised after every predict/update, and
   the state is checked for finiteness (`healthy`); a non-finite state stops
   updates rather than propagating NaNs.

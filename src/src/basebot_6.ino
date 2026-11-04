@@ -75,8 +75,17 @@ const uint8_t AS5X47_RIGHT_CS = 25;
 // mirrored. The left sign matches the quadrature encoder convention below.
 const float AS5X47_LEFT_DIR = -1.0f;
 const float AS5X47_RIGHT_DIR = 1.0f;
-AS5X47 as5x47Left(AS5X47_LEFT_CS);
-AS5X47 as5x47Right(AS5X47_RIGHT_CS);
+// Constructed on first use so SPI.begin() runs after the Teensy core init().
+AS5X47 &leftWheelSensor()
+{
+  static AS5X47 sensor(AS5X47_LEFT_CS);
+  return sensor;
+}
+AS5X47 &rightWheelSensor()
+{
+  static AS5X47 sensor(AS5X47_RIGHT_CS);
+  return sensor;
+}
 // 10 ms angle-differencing state, in motor-shaft radians
 bool wheelOdoInit = false;
 float wheelOdoPrevAngle[2] = {0.0f, 0.0f};
@@ -694,8 +703,8 @@ bool readWheelAngle(AS5X47 &sensor, float &angleRad)
 void wheelOdometryUpdate()
 {
   float angleLeft = 0.0f, angleRight = 0.0f;
-  if (!readWheelAngle(as5x47Left, angleLeft) or
-      !readWheelAngle(as5x47Right, angleRight))
+  if (!readWheelAngle(leftWheelSensor(), angleLeft) or
+      !readWheelAngle(rightWheelSensor(), angleRight))
     return;
   angleLeft *= AS5X47_LEFT_DIR;
   angleRight *= AS5X47_RIGHT_DIR;
@@ -845,6 +854,10 @@ void setup()
   encoder.setup(); 
   encoder.pulsPerRev = 48;
   imu2.setup(); 
+  // Construct the AS5X47 sensors after the core init(), so SPI.begin() does
+  // not run from a global constructor or inside the first control tick.
+  (void)leftWheelSensor();
+  (void)rightWheelSensor();
   kf.reset(0.0f);
   kfLastUs = micros();
   motor.setPWMfrq(0x13000); 

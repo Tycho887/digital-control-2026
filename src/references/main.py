@@ -148,13 +148,15 @@ class DiffDriveKF:
     def update_wheel_v(self, z, window=WHEEL_WINDOW):
         H = np.zeros(N)
         H[V] = 1.0
-        r = WHEEL_RADIUS * SIGMA_ANGLE / (WHEEL_GEAR * float(window))
+        # The endpoint angle difference has sqrt(2) times the per-sample noise.
+        r = math.sqrt(2.0) * WHEEL_RADIUS * SIGMA_ANGLE / (
+            WHEEL_GEAR * float(window))
         self._update_scalar(H, z, r * r)
 
     def update_wheel_omega(self, z, window=WHEEL_WINDOW):
         H = np.zeros(N)
         H[OMEGA] = 1.0
-        r = 2.0 * WHEEL_RADIUS * SIGMA_ANGLE / (
+        r = math.sqrt(2.0) * 2.0 * WHEEL_RADIUS * SIGMA_ANGLE / (
             WHEEL_BASE * WHEEL_GEAR * float(window))
         self._update_scalar(H, z, r * r)
 
