@@ -141,7 +141,7 @@ class AlphaBetaFilter {
 };
 
 AlphaBetaFilter leftVelFilter (0.5f, 0.1f, sampleTimeUs * 1e-6f);
-AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
+AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f); // 0.8f, 0.2f
 
 struct PID_Coefficients 
 {
@@ -235,7 +235,33 @@ float WheelController::ComputePID(float err)
     return u;
 }
 
+class HeadingController {
+  public:
+ float b0 = 0.9780f;
+    float b1 = -0.9731f;
+    float a1 = -0.9512f;
+    float Kph = 1.5f;
+    float e1 = 0.0f; 
+    float u1 = 0.0f;
 
+    float compute(float ref, float heading) {
+        float error = ref - heading;
+    
+        while (error > PI) error -= 2.0f * PI;
+        while (error < -PI) error += 2.0f * PI;
+
+        float kph_out = Kph * error;
+
+        float u_head = (b0 * kph_out) + (b1 * e1) - (a1 * u1);
+
+        e1 = kph_out;
+        u1 = u_head;
+
+        return u_head;
+    }
+};
+
+HeadingController headingCtrl;
 // Instantiate controller coefficients and controller objects globally
 // Update to these PI parameters for left: u[k] = 0.273519*e[k] + -0.267766*e[k-1] + 0.000000*e[k-2] - (-1.000000*u[k-1] + 0.000000*u[k-2])
 PID_Coefficients left_wheel_coeffs  = {0.273519f, -0.267766f, 0.0f, -1.000000f, 0.0f};
@@ -535,7 +561,7 @@ void forwardThreeSeconds()
     case 10:
       if (time_sec > endTime)
       {
-        desiredValue = 0.5f;       // 2 cm/s (0.02 m/s) forward
+        desiredValue = 0.02f;       // 2 cm/s (0.02 m/s) forward
         endTime = time_sec + 3.00f; // Hold for 3 seconds
         state = 100;
       }
@@ -579,19 +605,41 @@ struct Trajectory {
 // Here we used the v = (x_L + x_R) * 0.5, h' = (x_L - x_R) / B
 // Putting this in matrix form and inverting, gives the system below.
 
-float left_wheel_rad_p_s(float velocity, float turn_rate) {
+
+/* float left_wheel_rad_p_s(float velocity, float turn_rate) {
   return velocity - 0.5 * wheelBase * turn_rate;
 }
 float right_wheel_rad_p_s(float velocity, float turn_rate) {
   return velocity + 0.5 * wheelBase * turn_rate;
+} */
+// Conversion factor from robot linear velocity (m/s) to motor shaft speed (rad/s)
+// gear = 9.6, wheelRadius = 0.0315 m  ==> ratio ≈ 304.76 rad/m
+
+const float m_s_to_motor_rad_s = gear / wheelRadius;
+
+float left_wheel_rad_p_s(float linear_vel_m_s, float turn_rate_rad_s) 
+{
+  float v_left_m_s = linear_vel_m_s - (0.5f * wheelBase * turn_rate_rad_s);
+
+  return v_left_m_s * m_s_to_motor_rad_s;
 }
+
+float right_wheel_rad_p_s(float linear_vel_m_s, float turn_rate_rad_s) 
+{
+  float v_right_m_s = linear_vel_m_s + (0.5f * wheelBase * turn_rate_rad_s);
+
+  return v_right_m_s * m_s_to_motor_rad_s;
+}
+
 /**
 - make the control */
 void controlUpdate()
 {
-  float velRef = desiredValue * (gear / wheelRadius);
-  float left_wheel_setpoint = left_wheel_rad_p_s(velRef, 0.0f);
-  float right_wheel_setpoint = right_wheel_rad_p_s(velRef, 0.0f);
+  float u_head = headingCtrl.compute(desiredHeading, pose[2]);
+
+  //float velRef = desiredValue * (gear / wheelRadius);
+  float left_wheel_setpoint = left_wheel_rad_p_s(desiredValue, u_head);
+  float right_wheel_setpoint = right_wheel_rad_p_s(desiredValue, u_head);
 
   // Feed encoder counts (with sign convention: forward positive on both sides)
   float leftCounts  = -encoder.encoder[0];
@@ -609,8 +657,10 @@ void controlUpdate()
   float errorLeft  = left_wheel_setpoint - velLeftMeas;
   float errorRight = right_wheel_setpoint - velRightMeas;
 
-  computedControl[0] = leftController.ComputePID(errorLeft);
-  computedControl[1] = rightController.ComputePID(errorRight);
+ 
+
+  computedControl[0] = leftController.ComputeCCDE(errorLeft); // computedControl[0] = leftController.ComputePID(errorLeft);
+  computedControl[1] = rightController.ComputeCCDE(errorRight); // computedControl[1] = rightController.ComputePID(errorRight);
 
   motor.motorVoltage[0] = -computedControl[0];
   motor.motorVoltage[1] =  computedControl[1];
@@ -686,6 +736,7 @@ void loop ( void )
       isSampleTime = false;
       imu2.tick();
       encoder.tick();
+      // forwardThreeSeconds();
       forwardThreeSeconds();
       if (state > 0)
       { 
