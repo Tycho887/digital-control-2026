@@ -1,7 +1,75 @@
 # Sensor-Fused Kalman Filter Design
 
 Differential-drive robot: linear velocity / angular velocity / distance / heading estimation
-Hardware: MPU-9250 (IMU) + A/B quadrature encoders (48 edges/rev), optional AK8963 magnetometer
+Hardware: MPU-9250 (IMU with AK8963 magnetometer) + two AS5047P/AS5147 absolute magnetic angle sensors on the motor shafts (SPI). The stock 48-edge quadrature encoders still drive the wheel-speed PI loop, but the Kalman filter does not use them.
+
+---
+
+## Implementation status
+
+The firmware implements the 7-state variant in `src/src/kalman.h` and
+`src/src/kalman.cpp`, running at 1 kHz. It differs from the original design
+below in these ways:
+
+- **Sensor set:** MPU-9250 accelerometer/gyro/magnetometer and two
+  AS5047P/AS5147 absolute angles read over SPI. The stock quadrature encoders
+  are not filter measurements.
+- **Extra magnetometer bias state:** the state is
+  `[s, θ, v, ω, b_a, b_g, b_m]`; `b_m` absorbs the magnetometer heading offset.
+- **Scalar updates:** each measurement is a separate scalar update with a 1×7
+  `H` row, so there is no 3×3 innovation inverse.
+- **No wheel position measurements:** the AS5X47 angles are differenced over
+  10 ms to give instantaneous `v` and `ω`; wheel-derived distance `s` and
+  heading `θ` are not used. `s` and `θ` are integrated, and the magnetometer
+  anchors heading.
+- **Datasheet noise:** gyro `0.1 °/s` RMS at DLPF 92 Hz, accelerometer
+  `300 µg/√Hz` over the 94 Hz DLPF band, and AS5X47 `0.068°` RMS angle noise.
+  The DLPF is configured to 92/94 Hz in `uimu2.cpp`.
+- **Accelerometer as input:** forward acceleration enters the predict step as
+  the control input; its noise is folded into `Q`.
+- **Magnetometer enabled by default:** the heading update is innovation-gated
+  and runs unless disabled with `mag 0`.
+- **Calibration capture:** `cal mag`, `cal noise` and `cal track` record raw
+  sensors, controller signals and filter innovations into a compact buffer;
+  `src/scripts/analyze_calibration.py` checks the magnetometer axis, sensor
+  noise and PI tracking.
+
+Sections 1–7 and the appendix below describe the original quadrature-encoder
+design and are retained as background.
+
+## Calibration Procedure and Acceptance Checks
+
+The firmware assumptions under test are: IMU X is the vertical/down axis,
+forward is `-acc[2]`, CCW yaw is `-gyro[0]`, and magnetometer heading is
+`atan2(mag[1], -mag[2])`. `cal mag` (motors off, 200 Hz for 15 s) asks for a
+360° hand rotation. The analyzer reports the accelerometer gravity axis, the
+field component with the smallest rotation variation, and the slope/RMSE of
+each candidate heading pair against gyro-integrated yaw. Acceptance:
+
+- The gravity axis and the smallest-variation field axis agree (expected X).
+- The firmware heading slope is within about ±0.25 of +1 with RMSE below about
+  0.2 rad. A slope near -1 means the sign is reversed; a different best pair
+  means the axis mapping is wrong.
+
+`cal noise` (motors off, 1 kHz for 3 s) measures per-sample 1-sigma for gyro X
+(assumed 0.1 °/s), accel Z (0.0285 m/s²), AS5X47 angle (0.068°), 10 ms wheel
+velocity (5.51e-4 m/s) and turn rate (7.87e-3 rad/s), and mag heading
+(0.01 rad). A measured/assumed ratio between roughly 0.5 and 2 is treated as
+plausible. The same capture reports mean normalized innovation squared
+`y²/S` per update; NIS ≈ 1 is consistent, NIS ≫ 1 means `R` is too small or
+`P` too confident. These are seeds for a retune, not an automatic R change.
+
+`cal track` runs the week07-tuned PI on the quadrature encoders at 500 Hz.
+It reports rise time, overshoot, settling time, steady-state/RMS error and
+3 V saturation for the PI feedback, AS5X47 velocity and KF velocity. The
+AS5X47/KF columns are an independent check on the encoder feedback; the
+current 3 V limit is deliberately conservative, so saturation is reported
+rather than hidden.
+
+Magnetometer bring-up is checked with both the AK8963 WHO_AM_I register and a
+delayed data read (ST1 DRDY, ST2 HOFL). `cal retrymag` repeats that probe. A
+`NaN` mag heading in a standard log should be diagnosed this way before the
+axis result is interpreted.
 
 ---
 
