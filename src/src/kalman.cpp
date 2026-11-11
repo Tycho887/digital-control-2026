@@ -59,6 +59,12 @@ DiffDriveKalmanFilter::DiffDriveKalmanFilter()
     x[i] = 0.0f;
     B[i] = 0.0f;
   }
+  for (int i = 0; i < M_COUNT; ++i)
+  {
+    lastInnovation[i] = 0.0f;
+    lastInnovationVar[i] = 0.0f;
+    lastInnovationValid[i] = false;
+  }
   for (int i = 0; i < KF_N * KF_N; ++i)
   {
     P[i] = 0.0f;
@@ -88,6 +94,12 @@ void DiffDriveKalmanFilter::reset(float heading0)
   x[THETA] = heading0;
   for (int i = 0; i < KF_N * KF_N; ++i)
     P[i] = P0[i];
+  for (int i = 0; i < M_COUNT; ++i)
+  {
+    lastInnovation[i] = 0.0f;
+    lastInnovationVar[i] = 0.0f;
+    lastInnovationValid[i] = false;
+  }
   healthy = true;
   magRejected = false;
 }
@@ -146,8 +158,11 @@ bool DiffDriveKalmanFilter::predict(float aForward, float dt)
   return true;
 }
 
-void DiffDriveKalmanFilter::updateScalar(const float *H, float z, float R)
+void DiffDriveKalmanFilter::updateScalar(const float *H, float z, float R, int index)
 {
+  if (index >= 0 && index < M_COUNT)
+    lastInnovationValid[index] = false;
+
   float PHt[KF_N];
   for (int i = 0; i < KF_N; ++i)
   {
@@ -167,6 +182,13 @@ void DiffDriveKalmanFilter::updateScalar(const float *H, float z, float R)
   float innovation = z;
   for (int i = 0; i < KF_N; ++i)
     innovation -= H[i] * x[i];
+
+  if (index >= 0 && index < M_COUNT)
+  {
+    lastInnovation[index] = innovation;
+    lastInnovationVar[index] = S;
+    lastInnovationValid[index] = true;
+  }
 
   float K[KF_N];
   for (int i = 0; i < KF_N; ++i)
@@ -192,13 +214,13 @@ void DiffDriveKalmanFilter::updateScalar(const float *H, float z, float R)
     healthy = false;
 }
 
-void DiffDriveKalmanFilter::updateAngle(const float *H, float z, float R)
+void DiffDriveKalmanFilter::updateAngle(const float *H, float z, float R, int index)
 {
   float Hx = 0.0f;
   for (int i = 0; i < KF_N; ++i)
     Hx += H[i] * x[i];
   float zAdj = Hx + wrapAngle(z - Hx);
-  updateScalar(H, zAdj, R);
+  updateScalar(H, zAdj, R, index);
 }
 
 // AS5X47 speed noise. Each angle sample has RMS noise sigma_angle, so the
@@ -222,19 +244,19 @@ float DiffDriveKalmanFilter::rWheelOmega(float window) const
 void DiffDriveKalmanFilter::updateGyro(float z)
 {
   const float H[KF_N] = {0, 0, 0, 1, 0, 1, 0};
-  updateScalar(H, z, R_gyro);
+  updateScalar(H, z, R_gyro, M_GYRO);
 }
 
 void DiffDriveKalmanFilter::updateWheelV(float z, float window)
 {
   const float H[KF_N] = {0, 0, 1, 0, 0, 0, 0};
-  updateScalar(H, z, rWheelV(window));
+  updateScalar(H, z, rWheelV(window), M_WHEEL_V);
 }
 
 void DiffDriveKalmanFilter::updateWheelOmega(float z, float window)
 {
   const float H[KF_N] = {0, 0, 0, 1, 0, 0, 0};
-  updateScalar(H, z, rWheelOmega(window));
+  updateScalar(H, z, rWheelOmega(window), M_WHEEL_OMEGA);
 }
 
 void DiffDriveKalmanFilter::updateMag(float z)
@@ -261,10 +283,13 @@ void DiffDriveKalmanFilter::updateMag(float z)
   if (y * y > 9.0f * S)
   {
     magRejected = true;
+    lastInnovation[M_MAG] = y;
+    lastInnovationVar[M_MAG] = S;
+    lastInnovationValid[M_MAG] = false;
     return;
   }
   magRejected = false;
-  updateAngle(H, z, R_mag);
+  updateAngle(H, z, R_mag, M_MAG);
 }
 
 void DiffDriveKalmanFilter::symmetrize()

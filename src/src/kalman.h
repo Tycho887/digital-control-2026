@@ -31,11 +31,20 @@ class DiffDriveKalmanFilter
 {
 public:
   enum StateIndex { S = 0, THETA = 1, V = 2, OMEGA = 3, BA = 4, BG = 5, BM = 6 };
+  enum MeasurementIndex { M_GYRO = 0, M_WHEEL_V = 1, M_WHEEL_OMEGA = 2, M_MAG = 3, M_COUNT = 4 };
 
   float x[KF_N];
   float P[KF_N * KF_N];
   bool healthy = true;
   bool magRejected = false;
+  /**
+   * Last scalar innovation y = z - H*x and its variance S = H*P*H' + R,
+   * per measurement type. A rejected or failed update leaves the previous
+   * values and clears lastInnovationValid.
+   */
+  float lastInnovation[M_COUNT];
+  float lastInnovationVar[M_COUNT];
+  bool lastInnovationValid[M_COUNT];
 
   DiffDriveKalmanFilter();
   void reset(float heading0 = 0.0f);
@@ -62,8 +71,8 @@ private:
   float B[KF_N];
   float R_gyro, R_mag;
   float P0[KF_N * KF_N];
-  void updateScalar(const float *H, float z, float R);
-  void updateAngle(const float *H, float z, float R);
+  void updateScalar(const float *H, float z, float R, int index = -1);
+  void updateAngle(const float *H, float z, float R, int index = -1);
   void symmetrize();
   bool finiteState() const;
 };

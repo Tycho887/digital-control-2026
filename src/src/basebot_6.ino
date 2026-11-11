@@ -28,6 +28,7 @@ void printLog();
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <IntervalTimer.h>
 // Support functions
@@ -52,8 +53,13 @@ float distA = 0; // trip distance
 float pose[4];
 float poseVel[2];
 // Kalman filter estimator state
-const float imuForwardAccelSign = -1.0f;  // forward = -IMU Z
-const float imuYawRateSign = -1.0f;       // CCW yaw = -IMU X
+// IMU mounting: X down (vertical), Y right, Z backwards. A mounting change
+// must update these axis/sign choices together with the magnetometer mapping
+// in uimu2.cpp.
+const int imuForwardAxis = 2;             // forward = -IMU Z
+const float imuForwardAccelSign = -1.0f;
+const int imuYawAxis = 0;                  // CCW yaw = -IMU X
+const float imuYawRateSign = -1.0f;
 const float gravity = 9.80665f;
 const float gyroToRad = PI / 180.0f;
 float kfAccelBias = 0.0f;
@@ -91,6 +97,12 @@ bool wheelOdoInit = false;
 float wheelOdoPrevAngle[2] = {0.0f, 0.0f};
 float wheelOdoAccum[2] = {0.0f, 0.0f};
 uint32_t wheelOdoStartUs = 0;
+// Latest AS5X47 values, exposed for the calibration capture.
+bool as5Valid = false;
+bool as5Fresh = false;
+float as5AngleLast[2] = {0.0f, 0.0f}; // rad, after direction sign
+float as5VelLast[2] = {0.0f, 0.0f};   // wheel m/s, forward-positive
+float as5Window = 0.0f;               // s
 
 // ////////////////////////////////////////
 // define a structure for log elements
@@ -120,6 +132,63 @@ typedef struct
 
 } LogData;
 
+// Calibration capture. The row is smaller than LogData, so it reuses the
+// same buffer at a higher sample count. Standard and calibration captures
+// are mutually exclusive.
+enum CalMode : uint8_t
+{
+  CAL_NONE = 0,
+  CAL_MAG = 1,
+  CAL_NOISE = 2,
+  CAL_TRACK = 3,
+};
+
+enum CalFlag : uint16_t
+{
+  CAL_ACCEL_FRESH = 1 << 0,
+  CAL_GYRO_FRESH = 1 << 1,
+  CAL_MAG_FRESH = 1 << 2,
+  CAL_MAG_VALID = 1 << 3,
+  CAL_MAG_AVAILABLE = 1 << 4,
+  CAL_AS5_VALID = 1 << 5,
+  CAL_AS5_FRESH = 1 << 6,
+  CAL_KF_HEALTHY = 1 << 7,
+};
+
+enum KfUpdateFlag : uint16_t
+{
+  CAL_KF_GYRO = 1 << 0,
+  CAL_KF_WHEEL_V = 1 << 1,
+  CAL_KF_WHEEL_OMEGA = 1 << 2,
+  CAL_KF_MAG = 1 << 3,
+  CAL_KF_MAG_REJECTED = 1 << 4,
+};
+
+typedef struct
+{
+  float time;
+  uint16_t mode;
+  uint16_t flags;
+  uint16_t kfMask;
+  uint16_t pad;
+  float setpoint[2];       // motor rad/s
+  float feedback[2];       // PI feedback, motor rad/s
+  float motorVolt[2];      // V request, forward-positive
+  float motorVel[2];       // encoder motor rad/s, forward-positive
+  float gyro[3];           // deg/s, offset-corrected
+  float acc[3];            // g
+  float mag[3];            // adjusted counts (0.15 uT/LSB)
+  float as5Angle[2];       // rad, after direction sign
+  float as5Vel[2];         // wheel m/s, forward-positive
+  float wheelWindow;       // s
+  float magHeading;        // rad, NaN if unavailable
+  float kfV;
+  float kfOmega;
+  float kfTheta;
+  float kfInnov[DiffDriveKalmanFilter::M_COUNT];
+  float kfInnovVar[DiffDriveKalmanFilter::M_COUNT];
+} CalData;
+
 // The active sequenceTwoSteps run lasts 1.8 s. A row is now 260 bytes after
 // adding the controller setpoints and Kalman state/covariance, so the buffer
 // covers about 1.9 s at 1 kHz. For the 3.6 s forwardThreeSeconds run set
@@ -132,6 +201,10 @@ static_assert(logDivider >= 1, "logDivider must be at least 1");
 static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
               "Log buffer must cover the complete sequence plus margin");
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
+CalData * calLogs = (CalData*)logs;
+const int calMax = (logsMax * sizeof(LogData)) / sizeof(CalData);
+static_assert(calMax >= 3000,
+              "Calibration buffer must hold the 6 s track capture at 500 Hz");
 const float currentScale = 0.0045; // A/count; requires hardware calibration
 const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
 uint32_t captureStartUs = 0;
@@ -139,6 +212,20 @@ int logsCnt = 0; // next log entry to use / i.e. number of used log entries
 uint32_t logTickCnt = 0; // control ticks since start, for logDivider
 bool logPending = false; // preserve a completed capture until USB is connected
 bool logTruncated = false;
+
+// Calibration experiment state.
+CalMode calMode = CAL_NONE;
+int calState = 0;        // 0 idle, 1 running
+bool calArmed = false;   // track experiment waiting for the start button
+bool calPending = false; // completed capture waiting for USB
+bool calTruncated = false;
+uint32_t calStartUs = 0;
+float calEndTime = 0.0f;
+int calCnt = 0;
+int calDivider = 1;
+int calTickCnt = 0;
+int calTrackIndex = 0;
+float calTrackStepEnd = 0.0f;
 
 // State is also used to prevent a USB log request from blocking control.
 int state = 0;
@@ -193,6 +280,10 @@ class AlphaBetaFilter {
 AlphaBetaFilter leftVelFilter (0.5f, 0.1f, sampleTimeUs * 1e-6f);
 AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
 
+// Actuator limit for the wheel-speed PI. The week07 tuning used 9 V; 3 V is
+// retained here for safety, and the tracking experiment reports saturation.
+const float controlVoltageLimit = 3.0f;
+
 struct PID_Coefficients 
 {
   float b0;
@@ -209,7 +300,6 @@ class WheelController {
     float e1 = 0.0f, e2 = 0.0f;
     float error = 0.0f;
     float ComputeCCDE(float error);
-    float ComputePID(float error);
     void reset() {
       u1 = 0.0f;
       u2 = 0.0f;
@@ -233,9 +323,10 @@ float WheelController::ComputeCCDE(float err)
     e2 = e1;
     e1 = error;
     
-    // Saturation 
-    if (u > 3.0f) u = 3.0f;
-    else if (u < -3.0f) u = -3.0f;
+    // Saturation. The incremental form stores the clamped output, so the
+    // next update starts from the limited value and does not wind up.
+    if (u > controlVoltageLimit) u = controlVoltageLimit;
+    else if (u < -controlVoltageLimit) u = -controlVoltageLimit;
 
     u2 = u1;
     u1 = u;
@@ -243,51 +334,9 @@ float WheelController::ComputeCCDE(float err)
     return u;
 }
 
-float WheelController::ComputePID(float err)
-{
-    // ---- Tunable parameters ----
-    // Ts comes from the global sampleTimeUs so this stays correct
-    // whatever sample time you experiment with.
-    const float Ts   = sampleTimeUs * 1e-6f;   // seconds
-    const float Kp   = 0.10f;                  // V per rad/s of error
-    const float Ki   = 1.0f;                   // V per (rad/s · s) of error
-    const float uMax = 3.0f;
-
-    // ---- PI update ----
-    // u[k] = Kp*e[k] + I[k]
-    // I[k] = I[k-1] + Ki * Ts * e[k]     (with anti-windup below)
-    //
-    // Pure P  : leave Ki = 0.0f   (u2 stays at 0, u = Kp*err)
-    // Pure I  : leave Kp = 0.0f   (u2 is the only state)
-    // PI      : both non-zero     (recommended)
-
-    error = err;
-
-    // Integrate the error
-    u2 += Ki * Ts * err;
-
-    // Compute unsaturated output
-    float u = Kp * err + u2;
-
-    // Saturate and back-calculate the integrator (anti-windup).
-    // Setting u2 = u - Kp*err makes the very next call start from a
-    // state that produces exactly the saturated output, so the
-    // integrator does not "wind up" while clamped.
-    if (u > uMax) {
-        u  = uMax;
-        u2 = u - Kp * err;
-    } else if (u < -uMax) {
-        u  = -uMax;
-        u2 = u - Kp * err;
-    }
-
-    u1 = u;   // kept for continuity with the rest of your code
-    return u;
-}
-
-
-// Instantiate controller coefficients and controller objects globally
-// Update to these PI parameters for left: u[k] = 0.273519*e[k] + -0.267766*e[k-1] + 0.000000*e[k-2] - (-1.000000*u[k-1] + 0.000000*u[k-2])
+// Week07-tuned PI difference equations, valid for Ts = 1 ms:
+//   u[k] = u[k-1] + b0*e[k] + b1*e[k-1]
+// with Kp = -b1 and Ki = (b0 + b1)/Ts.
 PID_Coefficients left_wheel_coeffs  = {0.273519f, -0.267766f, 0.0f, -1.000000f, 0.0f};
 PID_Coefficients right_wheel_coeffs = {0.275100f, -0.271207f, 0.0f, -1.000000f, 0.0f};
 
@@ -296,6 +345,8 @@ WheelController rightController(right_wheel_coeffs);
 
 float computedControl[2] = {0.0f, 0.0f};
 float controlSetpoint[2] = {0.0f, 0.0f};
+float controlFeedback[2] = {0.0f, 0.0f}; // PI feedback, forward-positive motor rad/s
+uint16_t kfUpdateMask = 0;               // KF updates applied on the current tick
 
 void printLogValue(float value)
 {
@@ -427,12 +478,25 @@ bool start()
     usb.send("% Log buffer allocation failed; run disabled.\n");
     return false;
   }
+  if (calState > 0)
+  {
+    usb.send("% Calibration capture active; run disabled.\n");
+    return false;
+  }
   logPending = false;
   logTruncated = false;
+  // The standard log shares the buffer with calibration captures.
+  calPending = false;
+  calArmed = false;
+  calMode = CAL_NONE;
   logsCnt = 0;
   logTickCnt = 0;
   controlSetpoint[0] = 0.0f;
   controlSetpoint[1] = 0.0f;
+  controlFeedback[0] = 0.0f;
+  controlFeedback[1] = 0.0f;
+  computedControl[0] = 0.0f;
+  computedControl[1] = 0.0f;
   captureStartUs = micros();
   motor.setPWMfrq(80000);
   time_sec = 0;
@@ -444,9 +508,12 @@ bool start()
   wheelOdoAccum[1] = 0.0f;
   display.useDisplay = false;
   
-  // Reset controllers for a clean run
+  // Reset controllers and velocity filters for a clean run. Without the
+  // filter resets, the first samples inherit the previous run's velocity.
   leftController.reset();
   rightController.reset();
+  leftVelFilter.reset();
+  rightVelFilter.reset();
   // Capture the pose origin; the filter keeps its learned biases.
   kfStartS = kf.x[DiffDriveKalmanFilter::S];
   kfStartTheta = kf.x[DiffDriveKalmanFilter::THETA];
@@ -570,7 +637,7 @@ void sequenceTwoSteps()
     case 10: 
       if (time_sec > endTime)
       { 
-        desiredValue = 1.5;  
+        desiredValue = 0.05f;  
         endTime = time_sec + 0.48 ; 
         state = 11;
       }
@@ -586,7 +653,7 @@ void sequenceTwoSteps()
     case 12: 
       if (time_sec > endTime)
       { 
-        desiredValue = 3;
+        desiredValue = 0.10f;
         endTime = time_sec + 0.5;
         state = 100;
       }
@@ -665,24 +732,16 @@ struct Trajectory {
   float turn_rate;
 };
 
-// Here we used the v = (x_L + x_R) * 0.5, h' = (x_L - x_R) / B
-// Putting this in matrix form and inverting, gives the system below.
-
-float left_wheel_rad_p_s(float velocity, float turn_rate) {
-  return velocity - 0.5 * wheelBase * turn_rate;
-}
-float right_wheel_rad_p_s(float velocity, float turn_rate) {
-  return velocity + 0.5 * wheelBase * turn_rate;
-}
 /**
-- make the control */
-void controlUpdate()
+- Wheel-speed PI on the quadrature encoders.
+- Setpoints are motor-shaft rad/s, forward-positive. The alpha-beta filtered
+  encoder velocity is recorded as controlFeedback so the tracking experiment
+  can compare the controller's own signal with AS5X47/KF velocity.
+ */
+void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
 {
-  float velRef = desiredValue * (gear / wheelRadius);
-  float left_wheel_setpoint = left_wheel_rad_p_s(velRef, 0.0f);
-  float right_wheel_setpoint = right_wheel_rad_p_s(velRef, 0.0f);
-  controlSetpoint[0] = left_wheel_setpoint;
-  controlSetpoint[1] = right_wheel_setpoint;
+  controlSetpoint[0] = leftSetpoint;
+  controlSetpoint[1] = rightSetpoint;
 
   // Feed encoder counts (with sign convention: forward positive on both sides)
   float leftCounts  = -encoder.encoder[0];
@@ -694,17 +753,22 @@ void controlUpdate()
 
   // Convert counts/s to motor-shaft rad/s
   const float countsToRad = 2.0f * PI / encoder.pulsPerRev;
-  float velLeftMeas  = leftCountsPerSec  * countsToRad;
-  float velRightMeas = rightCountsPerSec * countsToRad;
+  controlFeedback[0] = leftCountsPerSec  * countsToRad;
+  controlFeedback[1] = rightCountsPerSec * countsToRad;
 
-  float errorLeft  = left_wheel_setpoint - velLeftMeas;
-  float errorRight = right_wheel_setpoint - velRightMeas;
-
-  computedControl[0] = leftController.ComputePID(errorLeft);
-  computedControl[1] = rightController.ComputePID(errorRight);
+  computedControl[0] = leftController.ComputeCCDE(leftSetpoint - controlFeedback[0]);
+  computedControl[1] = rightController.ComputeCCDE(rightSetpoint - controlFeedback[1]);
 
   motor.motorVoltage[0] = -computedControl[0];
   motor.motorVoltage[1] =  computedControl[1];
+}
+
+/**
+- Convert the sequence's linear speed in m/s to motor rad/s and run the PI. */
+void controlUpdate()
+{
+  float velRef = desiredValue * (gear / wheelRadius);
+  wheelSpeedControl(velRef, velRef);
 }
 
 /**
@@ -733,12 +797,19 @@ bool readWheelAngle(AS5X47 &sensor, float &angleRad)
   unusable at the robot's low speeds. */
 void wheelOdometryUpdate()
 {
+  as5Fresh = false;
   float angleLeft = 0.0f, angleRight = 0.0f;
   if (!readWheelAngle(leftWheelSensor(), angleLeft) or
       !readWheelAngle(rightWheelSensor(), angleRight))
+  {
+    as5Valid = false;
     return;
+  }
   angleLeft *= AS5X47_LEFT_DIR;
   angleRight *= AS5X47_RIGHT_DIR;
+  as5Valid = true;
+  as5AngleLast[0] = angleLeft;
+  as5AngleLast[1] = angleRight;
 
   uint32_t nowUs = micros();
   if (!wheelOdoInit)
@@ -767,6 +838,15 @@ void wheelOdometryUpdate()
   float vRight = wheelRadius * wheelAngleRight / window;
   kf.updateWheelV(0.5f * (vLeft + vRight), window);
   kf.updateWheelOmega((vRight - vLeft) / wheelBase, window);
+  if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_WHEEL_V])
+    kfUpdateMask |= CAL_KF_WHEEL_V;
+  if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_WHEEL_OMEGA])
+    kfUpdateMask |= CAL_KF_WHEEL_OMEGA;
+
+  as5VelLast[0] = vLeft;
+  as5VelLast[1] = vRight;
+  as5Window = window;
+  as5Fresh = true;
 
   wheelOdoAccum[0] = 0.0f;
   wheelOdoAccum[1] = 0.0f;
@@ -780,13 +860,14 @@ void estimatorUpdate()
   uint32_t nowUs = micros();
   float dt = (nowUs - kfLastUs) * 1e-6f;
   kfLastUs = nowUs;
+  kfUpdateMask = 0;
   if (dt <= 0.0f || dt > 0.020f)
   {
     kfPrevS = kf.x[DiffDriveKalmanFilter::S];
     kfPrevTheta = kf.x[DiffDriveKalmanFilter::THETA];
     return;
   }
-  float aRaw = imuForwardAccelSign * imu2.acc[2] * gravity;
+  float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
   if (!kfAccelCalDone && imu2.accelFresh)
   {
     kfAccelCalCnt++;
@@ -795,7 +876,11 @@ void estimatorUpdate()
   }
   kf.predict(kfAccelCalDone ? aRaw - kfAccelBias : 0.0f, dt);
   if (imu2.gyroFresh && imu2.gyroOffsetDone)
-    kf.updateGyro(imuYawRateSign * imu2.gyro[0] * gyroToRad);
+  {
+    kf.updateGyro(imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad);
+    if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_GYRO])
+      kfUpdateMask |= CAL_KF_GYRO;
+  }
   // Wheel speed now comes from the AS5X47 absolute angles only. The stock
   // quadrature encoders remain in use by controlUpdate() but not here.
   wheelOdometryUpdate();
@@ -811,7 +896,13 @@ void estimatorUpdate()
       kfHeadingInit = true;
     }
     else
+    {
       kf.updateMag(imu2.magHeading);
+      if (kf.magRejected)
+        kfUpdateMask |= CAL_KF_MAG_REJECTED;
+      else if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_MAG])
+        kfUpdateMask |= CAL_KF_MAG;
+    }
   }
   float s = kf.x[DiffDriveKalmanFilter::S];
   float theta = kf.x[DiffDriveKalmanFilter::THETA];
@@ -886,6 +977,316 @@ void updateLog()
   }
 }
 
+// ////////////////////////////////////////
+// Calibration experiments
+
+const float calTrackSpeed[] = {
+  0.0f, 0.05f, 0.10f, 0.15f, 0.0f, -0.05f, -0.10f, -0.15f, 0.0f
+};
+const float calTrackDuration[] = {
+  0.3f, 0.8f, 0.8f, 0.8f, 0.5f, 0.8f, 0.8f, 0.8f, 0.4f
+};
+const int calTrackSteps = sizeof(calTrackSpeed) / sizeof(calTrackSpeed[0]);
+
+const char * calModeName(CalMode mode)
+{
+  switch (mode)
+  {
+    case CAL_MAG: return "mag";
+    case CAL_NOISE: return "noise";
+    case CAL_TRACK: return "track";
+    default: return "none";
+  }
+}
+
+void resetWheelControl()
+{
+  leftController.reset();
+  rightController.reset();
+  leftVelFilter.reset();
+  rightVelFilter.reset();
+  controlSetpoint[0] = controlSetpoint[1] = 0.0f;
+  controlFeedback[0] = controlFeedback[1] = 0.0f;
+  computedControl[0] = computedControl[1] = 0.0f;
+}
+
+bool calStart(CalMode mode)
+{
+  if (logs == nullptr or calLogs == nullptr)
+  {
+    usb.send("% Calibration buffer unavailable.\r\n");
+    return false;
+  }
+  if (state > 0)
+  {
+    usb.send("% Standard run active; calibration disabled.\r\n");
+    return false;
+  }
+  if (calState > 0)
+  {
+    usb.send("% Calibration capture already active.\r\n");
+    return false;
+  }
+  logPending = false;
+  calPending = false;
+  calTruncated = false;
+  calMode = mode;
+  calCnt = 0;
+  calTickCnt = 0;
+  calStartUs = micros();
+  calDivider = (mode == CAL_MAG) ? 5 : (mode == CAL_NOISE) ? 1 : 2;
+  motor.motorVoltage[0] = 0.0f;
+  motor.motorVoltage[1] = 0.0f;
+  motor.tick();
+  resetWheelControl();
+
+  if (mode == CAL_TRACK)
+  {
+    calState = 0;
+    calArmed = true;
+    usb.send("% cal track armed: clear the floor, then press start\r\n");
+    return true;
+  }
+  calArmed = false;
+  calState = 1;
+  calEndTime = time_sec + ((mode == CAL_MAG) ? 15.0f : 3.0f);
+  if (mode == CAL_MAG)
+    usb.send("% cal mag: motors off. Rotate 360 deg by hand and back within 15 s.\r\n");
+  else
+    usb.send("% cal noise: motors off. Keep the robot still for 3 s.\r\n");
+  return true;
+}
+
+void calBeginTrack()
+{
+  calArmed = false;
+  calState = 1;
+  calMode = CAL_TRACK;
+  calCnt = 0;
+  calTickCnt = 0;
+  calDivider = 2;
+  calStartUs = micros();
+  calTrackIndex = 0;
+  calTrackStepEnd = time_sec + calTrackDuration[0];
+  motor.setPWMfrq(80000);
+  float total = 0.0f;
+  for (int i = 0; i < calTrackSteps; i++)
+    total += calTrackDuration[i];
+  calEndTime = time_sec + total;
+  resetWheelControl();
+  usb.send("% cal track started\r\n");
+}
+
+void calFinish()
+{
+  calState = 0;
+  calArmed = false;
+  motor.motorVoltage[0] = 0.0f;
+  motor.motorVoltage[1] = 0.0f;
+  motor.tick();
+  resetWheelControl();
+  calPending = true;
+}
+
+void calStop()
+{
+  calArmed = false;
+  if (calState > 0)
+  {
+    calState = 0;
+    calPending = (calCnt > 0);
+  }
+  motor.motorVoltage[0] = 0.0f;
+  motor.motorVoltage[1] = 0.0f;
+  motor.tick();
+  resetWheelControl();
+  if (calPending)
+    usb.send("% cal stopped; capture pending\r\n");
+  else
+    usb.send("% cal stopped\r\n");
+}
+
+void calTick()
+{
+  if (calMode == CAL_TRACK)
+  {
+    if (time_sec >= calTrackStepEnd)
+    {
+      calTrackIndex++;
+      if (calTrackIndex >= calTrackSteps)
+      {
+        calFinish();
+        return;
+      }
+      calTrackStepEnd += calTrackDuration[calTrackIndex];
+    }
+    float motorSp = calTrackSpeed[calTrackIndex] * (gear / wheelRadius);
+    wheelSpeedControl(motorSp, motorSp);
+  }
+  else
+  {
+    // Sensor-only experiments keep the motors off.
+    motor.motorVoltage[0] = 0.0f;
+    motor.motorVoltage[1] = 0.0f;
+    controlSetpoint[0] = controlSetpoint[1] = 0.0f;
+  }
+
+  if (time_sec > calEndTime)
+    calFinish();
+}
+
+void updateCalLog()
+{
+  if (calLogs == nullptr or calState == 0)
+    return;
+  if (calCnt >= calMax)
+  {
+    calTruncated = true;
+    return;
+  }
+  CalData &d = calLogs[calCnt];
+  d.time = time_sec;
+  d.mode = (uint16_t)calMode;
+  uint16_t flags = 0;
+  if (imu2.accelFresh) flags |= CAL_ACCEL_FRESH;
+  if (imu2.gyroFresh) flags |= CAL_GYRO_FRESH;
+  if (imu2.magFresh) flags |= CAL_MAG_FRESH;
+  if (imu2.magHeadingValid) flags |= CAL_MAG_VALID;
+  if (imu2.magAvailable) flags |= CAL_MAG_AVAILABLE;
+  if (as5Valid) flags |= CAL_AS5_VALID;
+  if (as5Fresh) flags |= CAL_AS5_FRESH;
+  if (kf.healthy) flags |= CAL_KF_HEALTHY;
+  d.flags = flags;
+  d.kfMask = kfUpdateMask;
+  d.pad = 0;
+
+  for (int k = 0; k < 2; k++)
+  {
+    d.setpoint[k] = controlSetpoint[k];
+    d.feedback[k] = controlFeedback[k];
+    d.motorVolt[k] = (k == 0) ? -motor.motorVoltage[0] : motor.motorVoltage[1];
+    d.motorVel[k] = (k == 0) ? -encoder.motorVelocity[0] : encoder.motorVelocity[1];
+    d.as5Angle[k] = as5AngleLast[k];
+    d.as5Vel[k] = as5VelLast[k];
+  }
+  for (int k = 0; k < 3; k++)
+  {
+    d.gyro[k] = imu2.gyro[k];
+    d.acc[k] = imu2.acc[k];
+    d.mag[k] = imu2.mag[k];
+  }
+  d.wheelWindow = as5Window;
+  d.magHeading = imu2.magHeadingValid ? imu2.magHeading : NAN;
+  d.kfV = kf.x[DiffDriveKalmanFilter::V];
+  d.kfOmega = kf.x[DiffDriveKalmanFilter::OMEGA];
+  d.kfTheta = kf.x[DiffDriveKalmanFilter::THETA];
+  for (int i = 0; i < DiffDriveKalmanFilter::M_COUNT; i++)
+  {
+    d.kfInnov[i] = kf.lastInnovation[i];
+    d.kfInnovVar[i] = kf.lastInnovationVar[i];
+  }
+  calCnt++;
+}
+
+void printCalLog()
+{
+  if (calState > 0)
+  {
+    usb.send("% Calibration capture in progress; request log after it finishes.\r\n");
+    return;
+  }
+  if (!Serial)
+    return;
+  if (calLogs == nullptr)
+  {
+    Serial.println("% Calibration buffer allocation failed.");
+    return;
+  }
+  calPending = false;
+  Serial.print("% CAL ");
+  Serial.println(calModeName(calMode));
+  Serial.print("% max cal samples ");
+  Serial.print(calMax);
+  Serial.print(" each sized ");
+  Serial.print(sizeof(CalData));
+  Serial.println(" bytes");
+  if (calTruncated)
+    Serial.println("% WARNING: cal buffer filled; final samples are missing.");
+  Serial.println("% 1 time (s)");
+  Serial.println("% 2 mode (1 mag, 2 noise, 3 track)");
+  Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy)");
+  Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bit3 mag, bit4 mag rejected)");
+  Serial.println("% 5-6 setpoint (left,right) (motor rad/s)");
+  Serial.println("% 7-8 PI feedback (left,right) (motor rad/s)");
+  Serial.println("% 9-10 motor voltage request (left,right) (V, forward-positive)");
+  Serial.println("% 11-12 encoder motor velocity (left,right) (rad/s, forward-positive)");
+  Serial.println("% 13-15 gyro raw (x,y,z) (deg/s, offset-corrected)");
+  Serial.println("% 16-18 accel raw (x,y,z) (g)");
+  Serial.println("% 19-21 mag raw (x,y,z) (adjusted counts, 0.15 uT/LSB)");
+  Serial.println("% 22-23 AS5X47 angle (left,right) (rad, after direction sign)");
+  Serial.println("% 24-25 AS5X47 wheel velocity (left,right) (m/s, forward-positive)");
+  Serial.println("% 26 wheel window (s)");
+  Serial.println("% 27 mag heading (rad, NaN if unavailable)");
+  Serial.println("% 28-30 KF v, omega, theta (m/s, rad/s, rad)");
+  Serial.println("% 31-34 KF innovation y (gyro, wheel v, wheel omega, mag)");
+  Serial.println("% 35-38 KF innovation variance S for the same four updates");
+
+  for (int i = 0; i < calCnt; i++)
+  {
+    CalData &d = calLogs[i];
+    Serial.print(d.time, 4);
+    Serial.print(" "); Serial.print(d.mode);
+    Serial.print(" "); Serial.print(d.flags);
+    Serial.print(" "); Serial.print(d.kfMask);
+    for (int k = 0; k < 2; k++) printLogValue(d.setpoint[k]);
+    for (int k = 0; k < 2; k++) printLogValue(d.feedback[k]);
+    for (int k = 0; k < 2; k++) printLogValue(d.motorVolt[k]);
+    for (int k = 0; k < 2; k++) printLogValue(d.motorVel[k]);
+    for (int k = 0; k < 3; k++) printLogValue(d.gyro[k]);
+    for (int k = 0; k < 3; k++) printLogValue(d.acc[k]);
+    for (int k = 0; k < 3; k++) printLogValue(d.mag[k]);
+    for (int k = 0; k < 2; k++) printLogValue(d.as5Angle[k]);
+    for (int k = 0; k < 2; k++) printLogValue(d.as5Vel[k]);
+    printLogValue(d.wheelWindow);
+    printLogValue(d.magHeading);
+    printLogValue(d.kfV);
+    printLogValue(d.kfOmega);
+    printLogValue(d.kfTheta);
+    for (int i2 = 0; i2 < DiffDriveKalmanFilter::M_COUNT; i2++)
+      printLogValue(d.kfInnov[i2]);
+    for (int i2 = 0; i2 < DiffDriveKalmanFilter::M_COUNT; i2++)
+      printLogValue(d.kfInnovVar[i2]);
+    Serial.println("");
+  }
+  Serial.print("% sent ");
+  Serial.print(calCnt);
+  Serial.println(" cal lines");
+}
+
+bool decodeExperiment(const char *buf)
+{
+  if (strncmp(buf, "cal", 3) != 0)
+    return false;
+  const char *p = buf + 3;
+  while (*p == ' ')
+    p++;
+  if (strncmp(p, "mag", 3) == 0)
+    calStart(CAL_MAG);
+  else if (strncmp(p, "noise", 5) == 0)
+    calStart(CAL_NOISE);
+  else if (strncmp(p, "track", 5) == 0)
+    calStart(CAL_TRACK);
+  else if (strncmp(p, "stop", 4) == 0)
+    calStop();
+  else if (strncmp(p, "log", 3) == 0)
+    printCalLog();
+  else if (strncmp(p, "retrymag", 8) == 0)
+    imu2.retryMag();
+  else
+    usb.send("% cal commands: mag | noise | track | stop | log | retrymag\r\n");
+  return true;
+}
+
 void setup()   
 { 
   Serial.begin(12000000);
@@ -919,21 +1320,39 @@ void loop ( void )
       imu2.tick();
       encoder.tick();
       estimatorUpdate();
-      sequenceTwoSteps();
-      //forwardThreeSeconds();
-      if (state > 0)
-      { 
-        controlUpdate();
+      if (calState > 0)
+      {
+        calTick();
+      }
+      else if (calArmed and
+               (digitalReadFast(PIN_START_BUTTON) or robot.missionStart))
+      {
+        calBeginTrack();
+        calTick();
+      }
+      else
+      {
+        sequenceTwoSteps();
+        //forwardThreeSeconds();
+        if (state > 0)
+        {
+          controlUpdate();
+        }
       }
       motor.tick();
       if (logTickCnt % logDivider == 0)
         updateLog();
       logTickCnt++;
+      if (calState > 0 and calTickCnt % calDivider == 0)
+        updateCalLog();
+      calTickCnt++;
       robot.tick();   
       display.tick(); 
     }
     usb.tick(); 
     if (logPending and state == 0 and Serial)
       printLog();
+    if (calPending and calState == 0 and Serial)
+      printCalLog();
   }
 }

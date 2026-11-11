@@ -26,6 +26,15 @@
 #include "uencoder.h"
 #include "urobot.h"
 
+namespace {
+// IMU mounting: X down (vertical), Y right, Z backwards. Keep these
+// together with the gyro/accelerometer axis choices in basebot_6.ino so a
+// mounting change is made in one place.
+constexpr int MAG_H1_AXIS = 1;      // right
+constexpr int MAG_H2_AXIS = 2;      // backwards
+constexpr float MAG_H1_SIGN = 1.0f;
+constexpr float MAG_H2_SIGN = -1.0f;
+}
 
 UImu2 imu2;
 
@@ -86,19 +95,42 @@ void UImu2::initMpu()
     // AK8963 magnetometer has a lower I2C clock limit than the MPU
     Wire.setClock(400000);
     mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
-    // check AK8963 presence: WHO_AM_I (register 0x00) is 0x48
-    magAvailable = false;
+    delay(20);
+    // Check AK8963 presence: WHO_AM_I (register 0x00) is 0x48. The same
+    // bytes also expose whether a data-ready sample can be read, which is
+    // what the filter actually needs.
+    uint8_t who = 0;
     Wire.beginTransmission(0x0C);
     Wire.write(0x00);
     if (Wire.endTransmission(false) == 0 and
-        Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1 and
-        Wire.read() == 0x48)
-      magAvailable = true;
+        Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1)
+      who = Wire.read();
+    uint8_t magRet = 1;
+    uint8_t st1 = 0;
+    uint8_t st2 = 0;
+    // A continuous-mode sample may not be ready on the first read; retry a
+    // few times before declaring the sensor unusable.
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+      magRet = mpu.magUpdate();
+      st1 = mpu.magBuff[0];
+      st2 = mpu.magBuff[6];
+      if (magRet == 0 and (st1 & 0x01) and
+          !(st1 & 0x08) and !(st2 & 0x08))
+        break;
+      delay(10);
+    }
+    magAvailable = (magRet == 0) and (st1 & 0x01) and
+                   !(st1 & 0x08) and !(st2 & 0x08);
+    magFresh = false;
+    magHeadingValid = false;
     Wire.setClock(i2cClock);
-    if (magAvailable)
-      usb.send("%% magnetometer AK8963 ready\r\n");
-    else
-      usb.send("%% magnetometer AK8963 not found\r\n");
+    const int MSL = 180;
+    char s[MSL];
+    snprintf(s, MSL,
+             "%% magnetometer AK8963 %s (who=0x%02X, ret=%u, st1=0x%02X, st2=0x%02X)\r\n",
+             magAvailable ? "ready" : "not usable", who, magRet, st1, st2);
+    usb.send(s);
   }
 }
 
@@ -150,6 +182,47 @@ void UImu2::startMagCalibration()
   magCalStart = millis();
   magCalActive = true;
   usb.send("%% Rotate the robot 360 degrees by hand for 8 s (motors off)\r\n");
+}
+
+bool UImu2::retryMag()
+{
+  Wire.setClock(400000);
+  mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
+  delay(20);
+  uint8_t who = 0;
+  Wire.beginTransmission(0x0C);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) == 0 and
+      Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1)
+    who = Wire.read();
+  uint8_t magRet = mpu.magUpdate();
+  uint8_t st1 = mpu.magBuff[0];
+  uint8_t st2 = mpu.magBuff[6];
+  Wire.setClock(i2cClock);
+  magAvailable = (magRet == 0) and (st1 & 0x01) and
+                 !(st1 & 0x08) and !(st2 & 0x08);
+  magHeadingValid = false;
+  magFresh = false;
+  if (magAvailable)
+  {
+    mag[0] = mpu.magX();
+    mag[1] = mpu.magY();
+    mag[2] = mpu.magZ();
+    magHeading = atan2f(MAG_H1_SIGN * mag[MAG_H1_AXIS],
+                        MAG_H2_SIGN * mag[MAG_H2_AXIS]);
+    magTimestampUs = micros();
+    magFresh = true;
+    magHeadingValid = true;
+  }
+  const int MSL = 220;
+  char s[MSL];
+  snprintf(s, MSL,
+           "%% mag retry: who=0x%02X available=%d ret=%u st1=0x%02X "
+           "st2=0x%02X raw=%g %g %g heading=%g\r\n",
+           who, magAvailable, magRet, st1, st2,
+           mag[0], mag[1], mag[2], magHeading);
+  usb.send(s);
+  return magAvailable;
 }
 
 void UImu2::tick()
@@ -258,13 +331,19 @@ void UImu2::tick()
         Wire.setClock(400000);
         uint8_t magRetval = mpu.magUpdate();
         Wire.setClock(i2cClock);
-        // HOFL (bit 3 in ST2) set means magnetic sensor overflow
-        if (magRetval == 0 and (mpu.magBuff[6] & 0x08) == 0)
+        // ST1: DRDY bit 0, DOR bit 1, HOFL bit 3. ST2 bit 3 is also HOFL.
+        // Require a fresh sample and reject magnetic overflow; accept DOR
+        // because the latest sample is still a valid measurement.
+        uint8_t st1 = mpu.magBuff[0];
+        uint8_t st2 = mpu.magBuff[6];
+        if (magRetval == 0 and (st1 & 0x01) and
+            !(st1 & 0x08) and !(st2 & 0x08))
         {
           mag[0] = mpu.magX();
           mag[1] = mpu.magY();
           mag[2] = mpu.magZ();
-          magHeading = atan2f(mag[1], -mag[2]);
+          magHeading = atan2f(MAG_H1_SIGN * mag[MAG_H1_AXIS],
+                              MAG_H2_SIGN * mag[MAG_H2_AXIS]);
           magTimestampUs = micros();
           magFresh = true;
           magHeadingValid = true;

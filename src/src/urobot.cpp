@@ -130,8 +130,9 @@ void URobot::tick()
   tickCnt++;
 }
 
-// printLog is called from here, but is defined in 'basebot_6.cpp'
+// printLog and the calibration command parser are defined in 'basebot_6.ino'
 void printLog();
+bool decodeExperiment(const char * buf);
 
 void doReboot()
 { // disconnect USB - to inform PC/Raspberry of the reboot
@@ -202,6 +203,7 @@ bool URobot::decode(const char* buf)
   //   else if (eeConfig.decode(buf)) {}
   else if (motor.decode(buf)) {}
   else if (imu2.decode(buf)) {}
+  else if (decodeExperiment(buf)) {}
   else if (encoder.decode(buf)) {}
   else if (usb.decode(buf)) {}
   else if (eeConfig.decode(buf)) {}
@@ -235,6 +237,8 @@ void URobot::sendHelp()
   snprintf(reply, MRL, "%% -- \treboot \tReboot Teensy\r\n");
   usb.send(reply);
   snprintf(reply, MRL, "%% -- \tlog \tPrint log\r\n");
+  usb.send(reply);
+  snprintf(reply, MRL, "%% -- \tcal mag|noise|track|stop|log|retrymag \tCalibration experiments\r\n");
   usb.send(reply);
   snprintf(reply, MRL, "%% -- \thelp \tSend on-line help\r\n");
   usb.send(reply);

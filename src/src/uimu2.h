@@ -89,6 +89,10 @@ public:
   /**
    * Start magnetometer offset calibration */
   void startMagCalibration();
+  /**
+   * Re-run AK8963 bring-up and report WHO_AM_I, ST1 and ST2.
+   * Returns true when a data-ready, non-overflow sample was read. */
+  bool retryMag();
 
 public:
   /** internal filter values */

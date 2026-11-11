@@ -108,6 +108,62 @@ heading. Mag offsets are RAM-only and printed after calibration; reboot after
 calibrating so the filter starts from the calibrated heading. The `LogData`
 row is 260 bytes and the 495 kB buffer holds 1903 samples.
 
+The wheel-speed PI now uses the week07-tuned difference equations in
+`left_wheel_coeffs` / `right_wheel_coeffs` (`Kp ~= 0.27`, `Ki ~= 3.9-5.8` at
+1 ms), with a named 3 V actuator limit. `sequenceTwoSteps` commands 0.05 and
+0.10 m/s; the older 1.5/3 m/s commands were far beyond what the 3 V limit can
+reach.
+
+## Calibration experiments
+
+Three USB-triggered experiments share a compact raw capture and the same
+495 kB buffer. A standard run and a calibration capture are mutually
+exclusive: starting one discards an unread capture from the other.
+
+| Command | Motors | Capture | Procedure |
+| --- | --- | --- | --- |
+| `cal mag` | off | 200 Hz, 15 s | Rotate the robot 360 degrees by hand and back. |
+| `cal noise` | off | 1 kHz, 3 s | Hold the robot still. |
+| `cal track` | PI | 500 Hz, 6 s | Clear the floor, then press the start button (or send `start`). |
+| `cal stop` | off | - | Stop now and keep the samples captured so far. |
+| `cal log` | off | - | Re-send a completed calibration capture. |
+| `cal retrymag` | off | - | Re-run AK8963 bring-up and print WHO_AM_I, ST1, ST2 and raw values. |
+
+`cal mag` and `cal noise` start immediately and print their instructions.
+`cal track` arms first; it runs the step schedule 0, +0.05, +0.10, +0.15,
+0, -0.05, -0.10, -0.15, 0 m/s with 0.3-0.8 s segments. The firmware sends a
+completed capture automatically when the monitor is connected; `cal log`
+repeats it while the robot stays powered.
+
+The capture header is `% CAL <mode>` followed by 38 columns: time, mode,
+sensor-fresh flags, KF-update mask, setpoints, PI feedback, motor voltage and
+encoder velocity, raw gyro/accel/mag, AS5X47 angle and velocity, wheel window,
+mag heading, KF `v/omega/theta`, and the last innovation `y` and `S` for the
+gyro, wheel-v, wheel-omega and mag updates. `gyro` is deg/s, `acc` is g, and
+`mag` is in the library's adjusted counts (0.15 uT/LSB).
+
+Analyze the newest capture with:
+
+```sh
+python3 src/scripts/analyze_calibration.py
+python3 src/scripts/analyze_calibration.py src/logs/device-monitor-YYMMDD-HHMMSS.log
+```
+
+The script auto-detects the mode. `mag` reports the accelerometer gravity axis,
+the field axis with the smallest rotation variation, and the best heading
+pair/sign against gyro-integrated yaw (including the firmware's current
+`atan2(Y, -Z)`). `noise` reports measured 1-sigma values against the filter's
+assumed values and the mean normalized innovation squared (NIS) per update.
+`track` reports rise time, overshoot, settling time, steady-state and RMS
+error, and 3 V saturation for the PI feedback, AS5X47 velocity and KF velocity.
+Pass `--outdir DIR` to save PNGs instead of opening windows, or `--no-plots`
+for the table only.
+
+If column 29 of a standard log is `NaN` throughout, run `cal retrymag` and
+check the printed ST1/ST2 values. `cal mag` also reports whether the
+magnetometer was available, so an axis check is not confused with a missing
+sensor.
+
 For manual builds and uploads, use PlatformIO:
 
 ```sh
