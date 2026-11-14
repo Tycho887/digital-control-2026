@@ -16,6 +16,10 @@ The Basebot log header documents the format-4 columns:
 
 The static estimator does not propagate a covariance, so there is no
 covariance plot. With no argument the newest log in ../logs is used.
+
+During a run the firmware also emits 20 Hz `% live ...` rows. They are
+comments, so `np.loadtxt(comments="%")` ignores them; only the completed
+format-4 block is analyzed.
 """
 
 import argparse

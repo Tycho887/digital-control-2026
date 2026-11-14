@@ -81,6 +81,9 @@ parameters, geometry, log divider, and whether KF feedback was enabled.
 
 The main loop currently selects `closedLoopTrajectory()`. Place the robot
 upright with clear floor space, keep the monitor open, and press start once.
+The run starts on a new button press and the button must be released before
+another run; the input uses the internal pull-down, so a held or floating
+start input cannot restart the sequence after the log is sent.
 The 7.6 s run has a 0.2 s stationary baseline, 4.0 s at 0.20 m/s forward,
 3.0 s at +30 degrees/s (CCW), and 0.4 s settling. The heading reference
 advances during the turn so the heading controller does not oppose it. The
@@ -94,14 +97,22 @@ the six-second schedule below and sends one `% CAL upside` capture instead of
 the standard format-4 header. Older experiments remain available by commenting
 the selected call and uncommenting `sequenceTwoSteps()`, `yawRateStep()`, or
 `forwardThreeSeconds()`.
-The firmware applies zero PWM before printing the completed log. It waits
-for a connected USB serial monitor before automatically sending a completed
-capture, so opening the monitor after the run can still retrieve the output.
-Wait for `% sent ... log lines` before closing the
-monitor with Ctrl+C. Output is saved to `logs/device-monitor-YYMMDD-HHMMSS.log`.
-If a run finished before the monitor opened, a pending capture is sent when
-the monitor connects. `log` can optionally repeat a transfer while the robot
-remains powered; rebooting or starting another run replaces the samples.
+The firmware applies zero PWM before printing the completed log. During a
+standard run it also streams a 20 Hz status line, prefixed `% live ...`. The
+live rows are comments for the format-4 analyzer, but they show time, state,
+estimator `v`/`omega`, heading, outer-loop commands, wheel setpoints and the
+heading/yaw errors in the monitor. They are written only when the USB transmit
+buffer has room, so a missing or stalled monitor cannot stall the 1 kHz loop.
+
+The full 250 Hz capture is sent when a DTR-asserting monitor is connected.
+Wait for `% sent ... log lines` before closing the monitor. If no monitor is
+connected at the end of the run, the capture is retained and a new start is
+refused until the log is retrieved. `log` forces a transfer (and also works
+when the monitor does not assert DTR); `log clear` discards the capture
+deliberately. `status` prints the run state, sample count, pending flags,
+USB/DTR state and free heap. Rebooting or power-cycling still clears RAM, so
+retrieve the capture or rely on the live rows before resetting.
+
 Requests during a run are rejected so serial printing cannot stall motor
 control. A buffer allocation failure prevents starting a run; if a future
 sequence exceeds capacity, its log includes a warning about missing samples.
@@ -158,6 +169,10 @@ the other.
 | `cal stream [Hz]` | off | 50-500 Hz, 20 min | Keep the robot still; end with `cal stop`. No RAM buffer. |
 | `cal stop` | off | - | Stop now and keep the samples captured so far. |
 | `cal log` | off | - | Re-send a completed calibration capture. |
+| `cal clear` | off | - | Discard a completed calibration capture. |
+| `status` | off | - | Print run state, sample/pending flags, USB/DTR and free heap. |
+| `log` | off | - | Re-send the standard format-4 capture (forces the transfer). |
+| `log clear` | off | - | Discard the pending standard capture. |
 | `cal retrymag` | off | - | Probe the AK8963 and print WHO_AM_I, bypass, CNTL1, ST1/ST2 and raw values. |
 
 `cal mag` and `cal noise` start immediately and print their instructions.
@@ -165,7 +180,8 @@ the other.
 0, +0.05, +0.10, +0.15,
 0, -0.05, -0.10, -0.15, 0 m/s with 0.3-0.8 s segments. The firmware sends a
 completed capture automatically when the monitor is connected; `cal log`
-repeats it while the robot stays powered.
+repeats it while the robot stays powered. A pending capture is retained until
+it is sent or discarded with `cal clear`, and a new run is refused meanwhile.
 
 `cal stream` is unbuffered: it prints one row per divider at 50-500 Hz for up
 to 20 minutes and stops with `cal stop`, or automatically when a run or a

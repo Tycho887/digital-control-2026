@@ -24,7 +24,9 @@
 - ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN 
 - THE SOFTWARE. */
 
-void printLog();
+void printLog(bool manual = false);
+void clearLog();
+void printStatus();
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -42,6 +44,13 @@ void printLog();
 #include "kalman.h"
 #include "pid.h"
 #include "trajectory.h"
+
+// Linker heap bounds, used by the status command.
+extern "C"
+{
+extern char *__brkval;
+extern char _heap_end;
+}
 
 /**
 - Global variables */
@@ -270,6 +279,12 @@ int logsCnt = 0; // next log entry to use / i.e. number of used log entries
 uint32_t logTickCnt = 0; // control ticks since start, for logDivider
 bool logPending = false; // preserve a completed capture until USB is connected
 bool logTruncated = false;
+uint32_t lastStartRefusalMs = 0;
+// Low-rate live telemetry, written only when the USB TX buffer has room.
+bool liveLogEnabled = false;
+uint32_t liveLogTickCnt = 0;
+bool liveLogHeaderSent = false;
+const uint32_t liveLogDivider = 50; // 20 Hz at the 1 kHz control rate
 
 // Calibration experiment state.
 CalMode calMode = CAL_NONE;
@@ -468,14 +483,19 @@ void printPidHeader(const char *name, const PID_Coefficients &c, float limit)
   Serial.println();
 }
 
-void printLog()
+void printLog(bool manual)
 {
   if (state > 0)
   {
     usb.send("% Log capture in progress; request log after the run finishes.\n");
     return;
   }
-  if (!Serial)
+  if (manual)
+  {
+    if (!usb.usbIsUp)
+      return;
+  }
+  else if (!Serial)
     return;
   streamActive = false;
   if (logs == nullptr)
@@ -483,7 +503,6 @@ void printLog()
     Serial.println("% Log buffer allocation failed; run disabled.");
     return;
   }
-  logPending = false;
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
@@ -617,6 +636,39 @@ void printLog()
   Serial.print("% sent ");
   Serial.print(logsCnt);
   Serial.println(" log lines");
+  logPending = false;
+  display.setLine("");
+}
+
+void clearLog()
+{
+  if (state > 0)
+  {
+    usb.send("% log clear refused: run active\r\n");
+    return;
+  }
+  logPending = false;
+  logsCnt = 0;
+  logTruncated = false;
+  display.setLine("");
+  usb.send("% log capture cleared\r\n");
+}
+
+void printStatus()
+{
+  char msg[256];
+  unsigned long heapFree = 0;
+  if (__brkval != nullptr)
+    heapFree = (unsigned long)((char *)&_heap_end - __brkval);
+  int n = snprintf(msg, sizeof(msg),
+      "%% status state=%d calState=%d logs=%d/%d logPending=%d calPending=%d "
+      "usb=%d dtr=%d heap=%lu truncated=%d live=%d\r\n",
+      state, calState, logsCnt, logsMax,
+      logPending ? 1 : 0, calPending ? 1 : 0,
+      usb.usbIsUp ? 1 : 0, Serial ? 1 : 0, heapFree,
+      logTruncated ? 1 : 0, liveLogEnabled ? 1 : 0);
+  if (n > 0)
+    usb.send(msg);
 }
 
 /**
@@ -646,14 +698,35 @@ bool start()
     usb.send("% Calibration capture active; run disabled.\n");
     return false;
   }
-  logPending = false;
+  if (logPending)
+  {
+    uint32_t now = millis();
+    if (usb.usbIsUp and now - lastStartRefusalMs > 500)
+    {
+      usb.send("% start blocked: previous log pending; open the monitor, send 'log' or 'log clear'\r\n");
+      lastStartRefusalMs = now;
+    }
+    return false;
+  }
+  if (calPending)
+  {
+    uint32_t now = millis();
+    if (usb.usbIsUp and now - lastStartRefusalMs > 500)
+    {
+      usb.send("% start blocked: calibration capture pending; send 'cal log' or 'cal clear'\r\n");
+      lastStartRefusalMs = now;
+    }
+    return false;
+  }
   logTruncated = false;
   // The standard log shares the buffer with calibration captures.
-  calPending = false;
   calArmed = false;
   calMode = CAL_NONE;
   logsCnt = 0;
   logTickCnt = 0;
+  liveLogEnabled = true;
+  liveLogTickCnt = 0;
+  liveLogHeaderSent = false;
   controlSetpoint[0] = 0.0f;
   controlSetpoint[1] = 0.0f;
   controlFeedback[0] = 0.0f;
@@ -726,8 +799,20 @@ void finished()
   motor.tick();
   motor.setPWMfrq(80000);
   display.useDisplay = true;
+  liveLogEnabled = false;
   state = 0;
-  logPending = true;
+  logPending = logsCnt > 0;
+  if (logPending)
+  {
+    display.setLine("log pending");
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "%% run complete: %d samples pending; open the monitor or send 'log'\r\n",
+             logsCnt);
+    usb.send(msg);
+  }
+  else
+    display.setLine("");
 }
 
 /**
@@ -941,10 +1026,16 @@ void forwardThreeSeconds()
 
 void closedLoopTrajectory()
 {
+  // Require a new press for each run. A held or floating start input must not
+  // restart the sequence immediately after the log has been sent.
+  static bool startButtonLatched = false;
+  const bool button = digitalReadFast(PIN_START_BUTTON);
+  const bool newPress = button and !startButtonLatched;
+  startButtonLatched = button;
+
   if (state == 0)
   {
-    bool button = digitalReadFast(PIN_START_BUTTON);
-    if (button or robot.missionStart)
+    if (newPress or robot.missionStart)
     {
       if (!start()) return;
       state = 10;
@@ -1339,6 +1430,39 @@ void updateLog()
   }
 }
 
+// Low-rate telemetry for the monitor. It is deliberately a comment line, so
+// the format-4 analyzer ignores it, and it never blocks the control loop: the
+// row is dropped when the USB transmit buffer does not have room.
+void sendLiveLog()
+{
+  if (!usb.usbIsUp)
+    return;
+  char buf[192];
+  int n = snprintf(buf, sizeof(buf),
+      "%% live %.4f %d %.4f %.4f %.4f %.4f %.4f %.1f %.1f %.4f %.4f %u\r\n",
+      time_sec, state, estimator.v, estimator.omega, poseHeading,
+      controlVCommand, controlOmegaCommand,
+      controlSetpoint[0], controlSetpoint[1],
+      headingPid.lastError(), yawRatePid.lastError(),
+      (unsigned)kfUpdateMask);
+  if (n <= 0)
+    return;
+  if (n >= (int)sizeof(buf))
+    n = sizeof(buf) - 1;
+  const char *hdr =
+      "% live format 1: time state v omega heading vCmd omegaCmd "
+      "setL setR headingErr yawErr kfMask\r\n";
+  int hn = liveLogHeaderSent ? 0 : (int)strlen(hdr);
+  if (Serial.availableForWrite() < hn + n)
+    return;
+  if (hn > 0)
+  {
+    Serial.write(hdr, hn);
+    liveLogHeaderSent = true;
+  }
+  Serial.write(buf, n);
+}
+
 // ////////////////////////////////////////
 // Calibration experiments
 
@@ -1397,8 +1521,17 @@ bool calStart(CalMode mode)
     usb.send("% Calibration capture already active.\r\n");
     return false;
   }
-  logPending = false;
-  calPending = false;
+  if (logPending)
+  {
+    usb.send("% calibration blocked: standard log pending; send 'log' or 'log clear' first\r\n");
+    return false;
+  }
+  if (calPending)
+  {
+    usb.send("% calibration blocked: previous capture pending; send 'cal log' or 'cal clear' first\r\n");
+    return false;
+  }
+  liveLogEnabled = false;
   calTruncated = false;
   calMode = mode;
   calCnt = 0;
@@ -1659,21 +1792,25 @@ void printMagProbeSummary()
   Serial.print(s);
 }
 
-void printCalLog()
+void printCalLog(bool manual = false)
 {
   if (calState > 0)
   {
     usb.send("% Calibration capture in progress; request log after it finishes.\r\n");
     return;
   }
-  if (!Serial)
+  if (manual)
+  {
+    if (!usb.usbIsUp)
+      return;
+  }
+  else if (!Serial)
     return;
   if (calLogs == nullptr)
   {
     Serial.println("% Calibration buffer allocation failed.");
     return;
   }
-  calPending = false;
   streamActive = false;
   Serial.print("% CAL ");
   Serial.println(calModeName(calMode));
@@ -1778,6 +1915,24 @@ void printCalLog()
   Serial.print("% sent ");
   Serial.print(calCnt);
   Serial.println(" cal lines");
+  calPending = false;
+  display.setLine("");
+}
+
+void clearCalLog()
+{
+  if (calState > 0)
+  {
+    usb.send("% cal clear refused: capture active\r\n");
+    return;
+  }
+  calPending = false;
+  calCnt = 0;
+  calTruncated = false;
+  calMode = CAL_NONE;
+  calPhase = 0;
+  display.setLine("");
+  usb.send("% calibration capture cleared\r\n");
 }
 
 void streamHeader(int hz)
@@ -1906,12 +2061,16 @@ bool decodeExperiment(const char *buf)
   }
   else if (strncmp(p, "stop", 4) == 0)
     calStop();
+  else if (strncmp(p, "clear", 5) == 0)
+    clearCalLog();
+  else if (strncmp(p, "status", 6) == 0)
+    printStatus();
   else if (strncmp(p, "log", 3) == 0)
-    printCalLog();
+    printCalLog(true);
   else if (strncmp(p, "retrymag", 8) == 0)
     imu2.retryMag();
   else
-    usb.send("% cal commands: mag | noise | track | upside | stream [Hz] | stop | log | retrymag\r\n");
+    usb.send("% cal commands: mag | noise | track | upside | stream [Hz] | stop | clear | status | log | retrymag\r\n");
   return true;
 }
 
@@ -1978,6 +2137,9 @@ void loop ( void )
       if (logTickCnt % logDivider == 0)
         updateLog();
       logTickCnt++;
+      if (state > 0 and liveLogEnabled and
+          (liveLogTickCnt++ % liveLogDivider) == 0)
+        sendLiveLog();
       if (calState > 0 and calTickCnt % calDivider == 0)
         updateCalLog();
       calTickCnt++;

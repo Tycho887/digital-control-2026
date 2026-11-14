@@ -43,7 +43,7 @@ void URobot::setup()
 { // hold power on
   pinMode ( PIN_POWER_ROBOT, OUTPUT );
   powerOn();
-  pinMode ( PIN_START_BUTTON, INPUT );
+  pinMode ( PIN_START_BUTTON, INPUT_PULLDOWN );
   pinMode ( PIN_LED_STATUS, OUTPUT );
   eeConfig.eePromLoadStatus(false);
   display.setup();
@@ -130,8 +130,11 @@ void URobot::tick()
   tickCnt++;
 }
 
-// printLog and the calibration command parser are defined in 'basebot_6.ino'
-void printLog();
+// printLog, clearLog, printStatus and the calibration command parser are
+// defined in 'basebot_6.ino'
+void printLog(bool manual = false);
+void clearLog();
+void printStatus();
 bool decodeExperiment(const char * buf);
 
 void doReboot()
@@ -198,7 +201,17 @@ bool URobot::decode(const char* buf)
   }
   else if (strncmp(buf, "log", 3) == 0)
   {
-    printLog();
+    const char *arg = buf + 3;
+    while (*arg == ' ')
+      arg++;
+    if (strncmp(arg, "clear", 5) == 0)
+      clearLog();
+    else
+      printLog(true);
+  }
+  else if (strncmp(buf, "status", 6) == 0)
+  {
+    printStatus();
   }
   //   else if (eeConfig.decode(buf)) {}
   else if (motor.decode(buf)) {}
