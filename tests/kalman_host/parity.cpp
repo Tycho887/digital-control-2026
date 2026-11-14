@@ -1,5 +1,5 @@
-// CSV-in/CSV-out driver for the C++ Kalman filter, used by
-// tests/kalman_host/test_parity.py to compare against the Python reference.
+// CSV-in/CSV-out driver for the stationary estimator, used by
+// tests/kalman_host/test_parity.py to compare against the NumPy reference.
 //
 // Build:
 //   c++ -std=c++14 -O2 -Isrc/src tests/kalman_host/parity.cpp src/src/kalman.cpp \
@@ -8,9 +8,9 @@
 //   /tmp/kalman-parity input.csv output.csv
 //
 // Input header (one row per filter step):
-//   step,dt,a,gyro,wheel_v,wheel_omega,wheel_window,mag,use_gyro,use_wheel,use_mag
-// Output header (state, P diagonal, mag gate decision):
-//   step,x0,x1,x2,x3,x4,x5,x6,p0,p1,p2,p3,p4,p5,p6,magRejected
+//   step,dt,a,gyro,wheel_v,wheel_omega,mag,use_gyro,use_wheel,use_mag
+// Output header:
+//   step,v,b_a,theta,omega,b_g,innov_gyro,innov_wheel_v,innov_wheel_omega,innov_mag,healthy
 #include "kalman.h"
 
 #include <stdio.h>
@@ -39,11 +39,12 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  DiffDriveKalmanFilter f;
+  StaticDecoupledEstimator f;
   f.reset(0.0f);
 
   fprintf(out,
-          "step,x0,x1,x2,x3,x4,x5,x6,p0,p1,p2,p3,p4,p5,p6,magRejected\n");
+          "step,v,b_a,theta,omega,b_g,innov_gyro,innov_wheel_v,"
+          "innov_wheel_omega,innov_mag,healthy\n");
 
   char line[1024];
   int lineNo = 0;
@@ -59,14 +60,13 @@ int main(int argc, char **argv)
     int step = 0;
     int useGyro = 0, useWheel = 0, useMag = 0;
     double dt = 0.0, a = 0.0, gyro = 0.0;
-    double wheelV = 0.0, wheelOmega = 0.0, wheelWindow = 0.0, mag = 0.0;
-    int fields = sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d",
-                        &step, &dt, &a, &gyro,
-                        &wheelV, &wheelOmega, &wheelWindow, &mag,
+    double wheelV = 0.0, wheelOmega = 0.0, mag = 0.0;
+    int fields = sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d",
+                        &step, &dt, &a, &gyro, &wheelV, &wheelOmega, &mag,
                         &useGyro, &useWheel, &useMag);
-    if (fields != 11)
+    if (fields != 10)
     {
-      fprintf(stderr, "error: %s:%d: expected 11 fields, got %d\n",
+      fprintf(stderr, "error: %s:%d: expected 10 fields, got %d\n",
               argv[1], lineNo, fields);
       status = 1;
       break;
@@ -77,18 +77,20 @@ int main(int argc, char **argv)
       f.updateGyro((float)gyro);
     if (useWheel)
     {
-      f.updateWheelV((float)wheelV, (float)wheelWindow);
-      f.updateWheelOmega((float)wheelOmega, (float)wheelWindow);
+      f.updateWheelV((float)wheelV);
+      f.updateWheelOmega((float)wheelOmega);
     }
     if (useMag)
       f.updateMag((float)mag);
 
-    fprintf(out, "%d", step);
-    for (int i = 0; i < KF_N; ++i)
-      fprintf(out, ",%.9g", (double)f.x[i]);
-    for (int i = 0; i < KF_N; ++i)
-      fprintf(out, ",%.9g", (double)f.P[i * KF_N + i]);
-    fprintf(out, ",%d\n", f.magRejected ? 1 : 0);
+    fprintf(out, "%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d\n",
+            step, (double)f.v, (double)f.b_a, (double)f.theta,
+            (double)f.omega, (double)f.b_g,
+            (double)f.lastInnovation[KF_M_GYRO],
+            (double)f.lastInnovation[KF_M_WHEEL_V],
+            (double)f.lastInnovation[KF_M_WHEEL_OMEGA],
+            (double)f.lastInnovation[KF_M_MAG],
+            f.healthy ? 1 : 0);
   }
 
   if (ferror(in))

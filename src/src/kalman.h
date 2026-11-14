@@ -3,80 +3,94 @@
 
 #include <stdint.h>
 
-constexpr int KF_N = 7;
-
-// Robot geometry, used to turn AS5X47 angle differences into wheel speeds.
-constexpr float KF_WHEEL_RADIUS = 0.0315f;  // driven wheel radius (m)
-constexpr float KF_WHEEL_BASE = 0.14f;      // track width between wheels (m)
-constexpr float KF_AS5X47_GEAR = 9.6f;      // motor shaft : wheel reduction
-
-// AS5047P / AS5147 RMS output angle noise, 1 sigma with NOISESET=0: 0.068 deg.
-constexpr float KF_AS5X47_SIGMA_ANGLE = 0.068f * 3.14159265358979f / 180.0f;
-
-// Default angle-differencing window for the AS5X47 wheel speed updates (s).
-constexpr float KF_WHEEL_WINDOW = 0.010f;
-
-void matrixMultiply(float *C, const float *A, const float *B, int n);
-void matrixVectorMultiply(float *y, const float *A, const float *x, int n);
-void matrixTranspose(float *AT, const float *A, int n);
+// Fold an angle into (-pi, pi].
 float wrapAngle(float a);
 
+// AS5X47 angle-differencing window used for the wheel velocity updates (s).
+constexpr float KF_WHEEL_WINDOW = 0.010f;
+
+// Index into StaticDecoupledEstimator::lastInnovation[].
+enum KfMeasurement : uint8_t
+{
+  KF_M_GYRO = 0,
+  KF_M_WHEEL_V = 1,
+  KF_M_WHEEL_OMEGA = 2,
+  KF_M_MAG = 3,
+  KF_MEAS_COUNT = 4,
+};
+
+// Constant gains for the decoupled stationary filter. Each row maps one scalar
+// innovation into its state block. The values are the 10 ms wheel / 1 kHz gyro
+// bank; regenerate them from the stationary DARE when its parameters change.
+//
+// Wheel v update (100 Hz),   H = [1 0]     over [v, b_a]
+// Gyro update     (1 kHz),   H = [0 1 1]   over [theta, omega, b_g]
+// Wheel omega     (100 Hz),  H = [0 1 0]   over [theta, omega, b_g]
+// Magnetometer    (async),   H = [1 0 0]   over [theta, omega, b_g]
+namespace kf_gains
+{
+constexpr float K_WHEEL_V[2] = {0.18f, -0.35f};
+constexpr float K_GYRO[3] = {0.002f, 0.85f, 0.0005f};
+constexpr float K_WHEEL_OMEGA[3] = {0.01f, 0.12f, -0.04f};
+constexpr float K_MAG[3] = {0.05f, 0.0f, -0.002f};
+constexpr float MAG_GATE_RAD = 0.25f; // static outlier gate (~14 deg)
+} // namespace kf_gains
+
 /**
- * 7-state differential-drive filter.
- * State: [s, theta, v, omega, b_a, b_g, b_m]
- * Matrices are row-major and sized KF_N * KF_N.
+ * Stationary, decoupled estimator for a planar differential-drive robot.
+ *
+ * Translational state: [v, b_a]
+ * Rotational state:    [theta, omega, b_g]
+ *
+ * Position (s, x, y) is deliberately not a filter state. The firmware
+ * dead-reckons it from v and theta after each predict, so the filter remains
+ * time-invariant and its gains are constant.
+ *
+ * No covariance is propagated. Measurement noise is folded into the
+ * precomputed gains, and each update is a fixed linear correction.
+ *
  * No Arduino headers, so the module also builds on the host.
  */
-class DiffDriveKalmanFilter
+struct StaticDecoupledEstimator
 {
-public:
-  enum StateIndex { S = 0, THETA = 1, V = 2, OMEGA = 3, BA = 4, BG = 5, BM = 6 };
-  enum MeasurementIndex { M_GYRO = 0, M_WHEEL_V = 1, M_WHEEL_OMEGA = 2, M_MAG = 3, M_COUNT = 4 };
+  // Translational state.
+  float v = 0.0f;   // forward velocity (m/s)
+  float b_a = 0.0f; // accelerometer bias (m/s^2)
 
-  float x[KF_N];
-  float P[KF_N * KF_N];
+  // Rotational state.
+  float theta = 0.0f; // heading (rad)
+  float omega = 0.0f; // yaw rate (rad/s)
+  float b_g = 0.0f;   // gyro bias (rad/s)
+
+  // Last scalar innovation y = z - H*x per measurement type. Rejected or
+  // invalid updates leave the value and clear lastInnovationValid.
+  float lastInnovation[KF_MEAS_COUNT] = {};
+  bool lastInnovationValid[KF_MEAS_COUNT] = {};
   bool healthy = true;
-  bool magRejected = false;
-  /**
-   * Last scalar innovation y = z - H*x and its variance S = H*P*H' + R,
-   * per measurement type. A rejected or failed update leaves the previous
-   * values and clears lastInnovationValid.
-   */
-  float lastInnovation[M_COUNT];
-  float lastInnovationVar[M_COUNT];
-  bool lastInnovationValid[M_COUNT];
 
-  DiffDriveKalmanFilter();
   void reset(float heading0 = 0.0f);
+
+  // Propagate v and theta. The accelerometer reading is raw: b_a is
+  // subtracted here. Position integration happens outside the filter.
   bool predict(float aForward, float dt);
-  void updateGyro(float z);
-  void updateWheelV(float z, float window = KF_WHEEL_WINDOW);
-  void updateWheelOmega(float z, float window = KF_WHEEL_WINDOW);
-  void updateMag(float z);
 
-  // Measurement variances actually used by the updates.
-  float rGyro() const { return R_gyro; }
-  float rMag() const { return R_mag; }
-  float rWheelV(float window) const;
-  float rWheelOmega(float window) const;
+  // Measurements. Each returns false when the input is not finite or, for
+  // the magnetometer, when the innovation gate rejects the sample.
+  bool updateGyro(float gyroZ);
+  bool updateWheelV(float vMeas);
+  bool updateWheelOmega(float omegaMeas);
+  bool updateMag(float magHeading);
 
-  float distance() const { return x[S]; }
-  float heading() const { return x[THETA]; }
-  float velocity() const { return x[V]; }
-  float yawRate() const { return x[OMEGA]; }
+  float velocity() const { return v; }
+  float yawRate() const { return omega; }
+  float heading() const { return theta; }
+  float accelBias() const { return b_a; }
+  float gyroBias() const { return b_g; }
 
 private:
-  float F[KF_N * KF_N];
-  float Q[KF_N * KF_N];
-  float B[KF_N];
-  float R_gyro, R_mag;
-  float P0[KF_N * KF_N];
-  void updateScalar(const float *H, float z, float R, int index = -1);
-  void updateAngle(const float *H, float z, float R, int index = -1);
-  void symmetrize();
   bool finiteState() const;
 };
 
-extern DiffDriveKalmanFilter kf;
+extern StaticDecoupledEstimator estimator;
 
 #endif

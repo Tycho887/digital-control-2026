@@ -7,35 +7,41 @@ Hardware: MPU-9250 (IMU with AK8963 magnetometer) + two AS5047P/AS5147 absolute 
 
 ## Implementation status
 
-The firmware implements the 7-state variant in `src/src/kalman.h` and
-`src/src/kalman.cpp`, running at 1 kHz. It differs from the original design
-below in these ways:
+The firmware now implements the stationary decoupled estimator in
+`src/src/kalman.h` and `src/src/kalman.cpp`, running at 1 kHz
+(`KF_specification.md` is the current reference). It differs from the original
+covariance-propagating design below in these ways:
 
+- **State:** `[v, b_a, θ, ω, b_g]`. Position `s`, `x`, and `y` are not filter
+  states; they are dead-reckoned outside the filter from `v` and `θ`.
+- **Constant gains:** no covariance is propagated. The gain bank is grouped by
+  measurement and update rate: wheel `v` at 100 Hz, gyro at 1 kHz, wheel `ω`
+  at 100 Hz, and a gated magnetometer heading.
 - **Sensor set:** MPU-9250 accelerometer/gyro/magnetometer and two
   AS5047P/AS5147 absolute angles read over SPI. The stock quadrature encoders
   are not filter measurements.
-- **Extra magnetometer bias state:** the state is
-  `[s, θ, v, ω, b_a, b_g, b_m]`; `b_m` absorbs the magnetometer heading offset.
-- **Scalar updates:** each measurement is a separate scalar update with a 1×7
-  `H` row, so there is no 3×3 innovation inverse.
 - **No wheel position measurements:** the AS5X47 angles are differenced over
-  10 ms to give instantaneous `v` and `ω`; wheel-derived distance `s` and
-  heading `θ` are not used. `s` and `θ` are integrated, and the magnetometer
-  anchors heading.
+  10 ms to give instantaneous `v` and `ω`; wheel-derived distance and heading
+  are not used.
 - **Datasheet noise:** gyro `0.1 °/s` RMS at DLPF 92 Hz, accelerometer
   `300 µg/√Hz` over the 94 Hz DLPF band, and AS5X47 `0.068°` RMS angle noise.
   The DLPF is configured to 92/94 Hz in `uimu2.cpp`.
-- **Accelerometer as input:** forward acceleration enters the predict step as
-  the control input; its noise is folded into `Q`.
+- **Accelerometer as input:** forward acceleration enters the predict step;
+  its bias is estimated as `b_a`.
 - **Magnetometer enabled by default:** the heading update is innovation-gated
   and runs unless disabled with `mag 0`.
+- **Outer control:** `pid.h` provides one incremental PID class. Two instances
+  (`velocityPid`, `yawRatePid`) close the forward-velocity and yaw-rate loops
+  around the estimator; the outputs feed the existing wheel-speed PI.
 - **Calibration capture:** `cal mag`, `cal noise` and `cal track` record raw
-  sensors, controller signals and filter innovations into a compact buffer;
+  sensors, controller signals and estimator innovations into a compact buffer;
   `src/scripts/analyze_calibration.py` checks the magnetometer axis, sensor
-  noise and PI tracking.
+  noise and PI tracking. NIS is not available because the stationary gains do
+  not propagate an innovation variance.
 
-Sections 1–7 and the appendix below describe the original quadrature-encoder
-design and are retained as background.
+The older `week08/DARE.m` and `week08/static_kf.mat` are deprecated. Sections
+1–7 and the appendix below describe the original quadrature-encoder design and
+are retained as background.
 
 ## Calibration Procedure and Acceptance Checks
 

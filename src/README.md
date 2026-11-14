@@ -62,21 +62,21 @@ The Teensy has USB vendor/product ID `16C0:0483`.
 For diagnostics, `log` plus Enter requests the samples already held in RAM;
 it does not start the motors. Even with no samples, the robot prints a header
 and `% sent 0 log lines`. The current firmware prints
-`% 25-26 computed control signal (left,right) (V)` in the header; columns 27-28
-are the Kalman filter's linear and angular velocity (m/s, rad/s), column 29 is
-the magnetometer heading (rad), columns 30-31 are the wheel-speed controller
-setpoints (left, right, motor rad/s), columns 32-38 are the Kalman state
-`[s, theta, v, omega, b_a, b_g, b_m]`, and columns 39-66 are the lower triangle
-of the filter covariance `P`, stored row-major as
-`P00; P10 P11; P20 P21 P22; ...; P66`. Because `P` is symmetric, the lower
-triangle is the full matrix.
+`% log format 2` in the header and no longer logs a covariance.
+Columns 27-28 are the estimator's linear and angular velocity (m/s, rad/s),
+column 29 is the magnetometer heading (rad), columns 30-31 are the wheel-speed
+controller setpoints (left, right, motor rad/s), column 32 is the yaw-rate
+reference (rad/s), columns 33-37 are the estimator state
+`[v, omega, theta, b_a, b_g]`, column 38 is the forward-velocity error,
+column 39 is the yaw-rate error, and columns 40-41 are the outer-loop
+forward-velocity and yaw-rate commands.
 
 To capture a new run, keep the monitor open and press the robot's start button.
 The active `sequenceTwoSteps` run lasts about 1.8 seconds. The 495 kB buffer
-holds 1903 samples at 1 ms with the current 260-byte rows, covering about
-1.9 seconds. For the 3.6-second `forwardThreeSeconds` sequence, set
+holds about 3170 samples at 1 ms with the current ~156-byte rows, covering
+about 3.1 seconds. For the 3.6-second `forwardThreeSeconds` sequence, set
 `logDivider = 2` (500 Hz) and `logCoverageUs = 3700000` in `basebot_6.ino`; the
-buffer then covers about 3.8 seconds.
+buffer then covers about 6.3 seconds.
 The firmware applies zero PWM before printing the completed log. It waits
 for a connected USB serial monitor before automatically sending a completed
 capture, so opening the monitor after the run can still retrieve the output.
@@ -89,30 +89,33 @@ Requests during a run are rejected so serial printing cannot stall motor
 control. A buffer allocation failure prevents starting a run; if a future
 sequence exceeds capacity, its log includes a warning about missing samples.
 
-The pose and velocity columns come from the 7-state Kalman filter in
-`src/src/kalman.h` and `kalman.cpp`. It runs at 1 kHz and fuses forward
-acceleration (as a control input), gyro yaw rate, linear and angular velocity
-derived from the two AS5047P/AS5147 absolute-angle sensors over SPI (angle
-differences over a 10 ms window), and a gated magnetometer heading. The stock
-48-edge quadrature encoders no longer feed the filter: they now only provide
-feedback to the wheel-speed controller. Distance and heading are integrated
-from the filter's own velocity and turn rate, so wheel slip cannot inject an
-absolute pose error; the heading stays anchored by the gyro and magnetometer.
-Columns 11-14 report its x, y, heading and distance, columns 27-28 its linear
-and angular velocity, columns 32-38 its state and columns 39-66 its covariance,
-and column 29 the magnetometer heading, which prints
-`NaN` until the magnetometer has a valid fix. The IMU driver enables the
-AK8963; `magc` runs a hard-iron calibration (rotate the robot 360 degrees by
-hand for 8 seconds), and `mag 0` / `mag 1` disable or enable the magnetometer
-heading. Mag offsets are RAM-only and printed after calibration; reboot after
-calibrating so the filter starts from the calibrated heading. The `LogData`
-row is 260 bytes and the 495 kB buffer holds 1903 samples.
+The pose and velocity columns come from the stationary decoupled estimator in
+`src/src/kalman.h` and `kalman.cpp`. It runs at 1 kHz with state
+`[v, b_a, theta, omega, b_g]`: forward acceleration drives `v`, wheel `v`
+corrects `[v, b_a]`, and gyro / wheel `omega` / gated magnetometer heading
+correct `[theta, omega, b_g]`. The gains are constant; no covariance is
+propagated. Distance, `x`, and `y` are dead-reckoned outside the filter from
+`v` and `theta`, so wheel slip cannot inject an absolute pose error. The stock
+48-edge quadrature encoders still feed only the inner wheel-speed PI.
+Columns 11-14 report pose, columns 27-28 linear and angular velocity, column 29
+the magnetometer heading (`NaN` until a valid fix), and columns 33-37 the
+estimator state.
 
-The wheel-speed PI now uses the week07-tuned difference equations in
-`left_wheel_coeffs` / `right_wheel_coeffs` (`Kp ~= 0.27`, `Ki ~= 3.9-5.8` at
-1 ms), with a named 3 V actuator limit. `sequenceTwoSteps` commands 0.05 and
-0.10 m/s; the older 1.5/3 m/s commands were far beyond what the 3 V limit can
-reach.
+The IMU driver enables the AK8963; `magc` runs a hard-iron calibration (rotate
+the robot 360 degrees by hand for 8 seconds), and `mag 0` / `mag 1` disable or
+enable the magnetometer heading. Mag offsets are RAM-only and printed after
+calibration; reboot after calibrating so the estimator starts from the
+calibrated heading. The `LogData` row is about 156 bytes and the 495 kB buffer
+holds about 3170 samples.
+
+The outer control cascade adds a reusable incremental PID pair (`pid.h`):
+`velocityPid` on the estimator's forward velocity and `yawRatePid` on its yaw
+rate. The commands are converted with `polar2Cartesian` and passed to the
+week07-tuned wheel PI in `left_wheel_coeffs` / `right_wheel_coeffs`
+(`Kp ~= 0.27`, `Ki ~= 3.9-5.8` at 1 ms), with a named 3 V actuator limit. The
+outer coefficients are placeholders in `basebot_6.ino` and are meant to be
+replaced after tuning. `sequenceTwoSteps` commands 0.05 and 0.10 m/s; the older
+1.5/3 m/s commands were far beyond what the 3 V limit can reach.
 
 ## Calibration experiments
 
@@ -135,12 +138,14 @@ exclusive: starting one discards an unread capture from the other.
 completed capture automatically when the monitor is connected; `cal log`
 repeats it while the robot stays powered.
 
-The capture header is `% CAL <mode>` followed by 38 columns: time, mode,
-sensor-fresh flags, KF-update mask, setpoints, PI feedback, motor voltage and
-encoder velocity, raw gyro/accel/mag, AS5X47 angle and velocity, wheel window,
-mag heading, KF `v/omega/theta`, and the last innovation `y` and `S` for the
-gyro, wheel-v, wheel-omega and mag updates. `gyro` is deg/s, `acc` is g, and
-`mag` is in the library's adjusted counts (0.15 uT/LSB).
+The capture header is `% CAL <mode>` followed by 40 columns: time, mode,
+sensor-fresh flags, estimator-update mask, setpoints, PI feedback, motor
+voltage and encoder velocity, raw gyro/accel/mag, AS5X47 angle and velocity,
+wheel window, mag heading, estimator `v/omega/theta/b_a/b_g`, and the last
+innovation `y` plus a zero variance column for the gyro, wheel-v, wheel-omega
+and mag updates. `gyro` is deg/s, `acc` is g, and `mag` is in the library's
+adjusted counts (0.15 uT/LSB). The zero variance columns are intentional: the
+stationary filter does not propagate `S`.
 
 Analyze the newest capture with:
 
@@ -153,9 +158,10 @@ The script auto-detects the mode. `mag` reports the accelerometer gravity axis,
 the field axis with the smallest rotation variation, and the best heading
 pair/sign against gyro-integrated yaw (including the firmware's current
 `atan2(Y, -Z)`). `noise` reports measured 1-sigma values against the filter's
-assumed values and the mean normalized innovation squared (NIS) per update.
-`track` reports rise time, overshoot, settling time, steady-state and RMS
-error, and 3 V saturation for the PI feedback, AS5X47 velocity and KF velocity.
+assumed values; NIS is unavailable because the stationary gains do not
+propagate `S`. `track` reports rise time, overshoot, settling time,
+steady-state and RMS error, and 3 V saturation for the PI feedback, AS5X47
+velocity and estimator velocity.
 Pass `--outdir DIR` to save PNGs instead of opening windows, or `--no-plots`
 for the table only.
 

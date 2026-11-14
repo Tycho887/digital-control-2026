@@ -40,6 +40,7 @@ void printLog();
 #include "uencoder.h"
 #include "AS5X47.h"
 #include "kalman.h"
+#include "pid.h"
 
 /**
 - Global variables */
@@ -52,7 +53,7 @@ const float wheelBase = 0.14;
 float distA = 0; // trip distance
 float pose[4];
 float poseVel[2];
-// Kalman filter estimator state
+// Stationary estimator state
 // IMU mounting: X down (vertical), Y right, Z backwards. A mounting change
 // must update these axis/sign choices together with the magnetometer mapping
 // in uimu2.cpp.
@@ -66,11 +67,14 @@ float kfAccelBias = 0.0f;
 uint32_t kfAccelCalCnt = 0;
 bool kfAccelCalDone = false;
 bool kfHeadingInit = false;
-float kfStartS = 0.0f, kfStartTheta = 0.0f;
-float kfX = 0.0f, kfY = 0.0f;
-float kfPrevS = 0.0f, kfPrevTheta = 0.0f;
+float poseStartTheta = 0.0f;   // heading at start(), for run-relative pose
+float posePrevV = 0.0f;        // previous v for trapezoidal dead reckoning
+float posePrevThetaAbs = 0.0f; // previous absolute heading
 uint32_t kfLastUs = 0;
 bool velSaturated = false;
+// Outer-loop commands from the last control tick, for logging.
+float controlVCommand = 0.0f;     // m/s
+float controlOmegaCommand = 0.0f; // rad/s
 
 // Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
 // the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
@@ -110,8 +114,8 @@ typedef struct
 {
   float time;
   int state;
-  float desiredValue;
-  float desiredHeading;
+  float desiredValue;     // forward velocity reference (m/s)
+  float desiredYawRate;   // yaw-rate reference (rad/s)
   float motorVel[2];
   float motorVolt[2];
   int32_t encoder[2];
@@ -127,8 +131,11 @@ typedef struct
   float encoderDelay[2];
   float controlSignal[2]; // Computed PID control signals (left, right)
   float controlSetpoint[2]; // Wheel-speed reference (left, right) (motor rad/s)
-  float kfState[KF_N]; // [s, theta, v, omega, b_a, b_g, b_m]
-  float kfCov[KF_N * (KF_N + 1) / 2]; // lower triangle of P, row-major
+  float kfState[5];       // [v, omega, theta, b_a, b_g]
+  float vError;           // vRef - KF v (m/s)
+  float yawRateError;     // omegaRef - KF omega (rad/s)
+  float vCommand;         // outer-loop v command (m/s)
+  float yawRateCommand;   // outer-loop yaw-rate command (rad/s)
 
 } LogData;
 
@@ -185,14 +192,15 @@ typedef struct
   float kfV;
   float kfOmega;
   float kfTheta;
-  float kfInnov[DiffDriveKalmanFilter::M_COUNT];
-  float kfInnovVar[DiffDriveKalmanFilter::M_COUNT];
+  float kfBA;
+  float kfBG;
+  float kfInnov[KF_MEAS_COUNT];
+  float kfInnovVar[KF_MEAS_COUNT];
 } CalData;
 
-// The active sequenceTwoSteps run lasts 1.8 s. A row is now 260 bytes after
-// adding the controller setpoints and Kalman state/covariance, so the buffer
-// covers about 1.9 s at 1 kHz. For the 3.6 s forwardThreeSeconds run set
-// logDivider to 2 (500 Hz) and logCoverageUs to 3700000.
+// The active sequenceTwoSteps run lasts 1.8 s. A row is about 156 bytes, so
+// the buffer covers about 3.1 s at 1 kHz. For the 3.6 s forwardThreeSeconds
+// run set logDivider to 2 (500 Hz) and logCoverageUs to 3700000.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
 const int logDivider = 1; // log one row per N control ticks
@@ -230,8 +238,8 @@ float calTrackStepEnd = 0.0f;
 // State is also used to prevent a USB log request from blocking control.
 int state = 0;
 float endTime = 0;
-float desiredValue = 0;
-float desiredHeading = 0;
+float desiredValue = 0;    // forward velocity reference (m/s)
+float desiredYawRate = 0;  // yaw-rate reference (rad/s)
 
 // The abstract filter class is supposed to let us implement different filters.
 // The two main ones are low-pass filters for the wheel speed and a KF for the dead-reckoning.
@@ -311,103 +319,26 @@ AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
 // retained here for safety, and the tracking experiment reports saturation.
 const float controlVoltageLimit = 3.0f;
 
-struct PID_Coefficients 
-{
-  float b0;
-  float b1;
-  float b2;
-  float a1;
-  float a2;
-};
-
-class YawController {
-  public:
-    PID_Coefficients coeffs;
-    float u1 = 0.0f, u2 = 0.0f;
-    float e1 = 0.0f, e2 = 0.0f;
-    float error = 0.0f;
-    float ComputeCCDE(float error);
-    void reset() {
-      u1 = 0.0f;
-      u2 = 0.0f;
-      e1 = 0.0f;
-      e2 = 0.0f;
-      error = 0.0f;
-    }
-    YawController(PID_Coefficients x) {
-      coeffs = x;
-    }
-
-};
-
-class VelocityController {
-  public:
-    PID_Coefficients coeffs;
-    float u1 = 0.0f, u2 = 0.0f;
-    float e1 = 0.0f, e2 = 0.0f;
-    float error = 0.0f;
-    float ComputeCCDE(float error);
-    void reset() {
-      u1 = 0.0f;
-      u2 = 0.0f;
-      e1 = 0.0f;
-      e2 = 0.0f;
-      error = 0.0f;
-    }
-    VelocityController(PID_Coefficients x) {
-      coeffs = x;
-    }
-};
-
-class WheelController {
-  public: 
-    PID_Coefficients coeffs;
-    float u1 = 0.0f, u2 = 0.0f;
-    float e1 = 0.0f, e2 = 0.0f;
-    float error = 0.0f;
-    float ComputeCCDE(float error);
-    void reset() {
-      u1 = 0.0f;
-      u2 = 0.0f;
-      e1 = 0.0f;
-      e2 = 0.0f;
-      error = 0.0f;
-    }
-    WheelController(PID_Coefficients x) {
-      coeffs = x;
-    }
-
-};
-
-float WheelController::ComputeCCDE(float err)
-{
-    error = err;
-    // Difference equation execution
-    float u = (coeffs.b0 * error) + (coeffs.b1 * e1) + (coeffs.b2 * e2) - (coeffs.a1 * u1) - (coeffs.a2 * u2);
-
-    // State updates for next sample step
-    e2 = e1;
-    e1 = error;
-    
-    // Saturation. The incremental form stores the clamped output, so the
-    // next update starts from the limited value and does not wind up.
-    if (u > controlVoltageLimit) u = controlVoltageLimit;
-    else if (u < -controlVoltageLimit) u = -controlVoltageLimit;
-
-    u2 = u1;
-    u1 = u;
-
-    return u;
-}
-
-// Week07-tuned PI difference equations, valid for Ts = 1 ms:
+// Week07-tuned wheel PI difference equations, valid for Ts = 1 ms:
 //   u[k] = u[k-1] + b0*e[k] + b1*e[k-1]
 // with Kp = -b1 and Ki = (b0 + b1)/Ts.
 PID_Coefficients left_wheel_coeffs  = {0.273519f, -0.267766f, 0.0f, -1.000000f, 0.0f};
 PID_Coefficients right_wheel_coeffs = {0.275100f, -0.271207f, 0.0f, -1.000000f, 0.0f};
 
-WheelController leftController(left_wheel_coeffs);
-WheelController rightController(right_wheel_coeffs);
+PIDController leftController(left_wheel_coeffs, controlVoltageLimit);
+PIDController rightController(right_wheel_coeffs, controlVoltageLimit);
+
+// Outer-loop correction saturation limits.
+const float maxVelCorrection = 0.30f;     // m/s
+const float maxYawRateCorrection = 2.00f; // rad/s
+
+// Placeholder outer-loop PID coefficients (Ts = 1 ms). Replace these after
+// tuning against the inner wheel-speed loop.
+PID_Coefficients vel_pid_coeffs = {0.50f, -0.49f, 0.0f, -1.0f, 0.0f};
+PID_Coefficients yaw_pid_coeffs = {0.40f, -0.39f, 0.0f, -1.0f, 0.0f};
+
+PIDController velocityPid(vel_pid_coeffs, maxVelCorrection);
+PIDController yawRatePid(yaw_pid_coeffs, maxYawRateCorrection);
 
 float computedControl[2] = {0.0f, 0.0f};
 float controlSetpoint[2] = {0.0f, 0.0f};
@@ -439,6 +370,7 @@ void printLog()
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
+  Serial.println("% log format 2 (static estimator, no covariance)");
   Serial.print("% Sample time ");  Serial.print(sampleTimeUs);
   Serial.print(" us, Gear ");  Serial.print(gear);
   Serial.print(", Wheels ");  Serial.print(wheelRadius);
@@ -450,7 +382,7 @@ void printLog()
   // Columns
   Serial.println("% 1 time (sec)");
   Serial.println("% 2 state");
-  Serial.println("% 3   Desired value");
+  Serial.println("% 3   forward velocity reference (m/s)");
   Serial.println("% 4-5 motor voltage (left,right) (V)");
   Serial.println("% 6-7 Encoder count (left, right)");
   Serial.println("% 8-9 motor vel (left, right) (rad/s)");
@@ -464,14 +396,17 @@ void printLog()
   Serial.println("% 22 driver flags: bits 0/1 enable L/R, bits 2/3 sleeping L/R");
   Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
   Serial.println("% 25-26 computed control signal (left,right) (V)");
-  Serial.println("% 27-28 Kalman velocity and yaw rate (m/s, rad/s)");
+  Serial.println("% 27-28 estimator velocity and yaw rate (m/s, rad/s)");
   Serial.println("% 29 magnetometer heading (rad, NaN if unavailable)");
   Serial.println("% 30-31 controller setpoint (left,right) (motor rad/s)");
-  Serial.println("% 32-38 Kalman state [s, theta, v, omega, b_a, b_g, b_m]");
-  Serial.println("%       (m, rad, m/s, rad/s, m/s^2, rad/s, rad)");
-  Serial.println("% 39-66 Kalman covariance lower triangle, row-major:");
-  Serial.println("%       P00; P10 P11; P20 P21 P22; ...; P66");
-  Serial.println("%       P is symmetric, so the lower triangle is the full matrix.");
+  Serial.println("% 32 yaw-rate reference (rad/s)");
+  Serial.println("% 33-37 estimator state [v, omega, theta, b_a, b_g]");
+  Serial.println("%       (m/s, rad/s, rad, m/s^2, rad/s)");
+  Serial.println("% 38 forward-velocity error (m/s)");
+  Serial.println("% 39 yaw-rate error (rad/s)");
+  Serial.println("% 40 outer-loop forward-velocity command (m/s)");
+  Serial.println("% 41 outer-loop yaw-rate command (rad/s)");
+  Serial.println("% Static gains: no covariance is propagated or logged.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
   Serial.print(" offsets L/R "); Serial.print(currentOffset[0],6);
@@ -512,8 +447,12 @@ void printLog()
     Serial.print(" "); Serial.print(d->poseVel[1],4); // 28
     Serial.print(" "); Serial.print(d->pose[3],4); // 29
     for (int k = 0; k < 2; k++) printLogValue(d->controlSetpoint[k]); // 30-31
-    for (int k = 0; k < KF_N; k++) printLogValue(d->kfState[k]); // 32-38
-    for (int k = 0; k < KF_N * (KF_N + 1) / 2; k++) printLogValue(d->kfCov[k]); // 39-66
+    printLogValue(d->desiredYawRate); // 32
+    for (int k = 0; k < 5; k++) printLogValue(d->kfState[k]); // 33-37
+    printLogValue(d->vError); // 38
+    printLogValue(d->yawRateError); // 39
+    printLogValue(d->vCommand); // 40
+    printLogValue(d->yawRateCommand); // 41
     Serial.println("");
     d++;
   }
@@ -580,11 +519,15 @@ bool start()
   rightController.reset();
   leftVelFilter.reset();
   rightVelFilter.reset();
+  velocityPid.reset();
+  yawRatePid.reset();
+  controlVCommand = 0.0f;
+  controlOmegaCommand = 0.0f;
+  desiredYawRate = 0.0f;
   // Capture the pose origin; the filter keeps its learned biases.
-  kfStartS = kf.x[DiffDriveKalmanFilter::S];
-  kfStartTheta = kf.x[DiffDriveKalmanFilter::THETA];
-  kfX = 0.0f; kfY = 0.0f;
-  kfPrevS = kfStartS; kfPrevTheta = kfStartTheta;
+  poseStartTheta = estimator.theta;
+  posePrevV = estimator.v;
+  posePrevThetaAbs = estimator.theta;
   // Make the first logged row use the new origin, before the next estimator tick.
   pose[0] = 0.0f; pose[1] = 0.0f; pose[2] = 0.0f;
   pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
@@ -597,6 +540,7 @@ void stop(float after)
 { 
   state = 2;
   desiredValue = 0;
+  desiredYawRate = 0;
   endTime = time_sec + after;
 }
 
@@ -775,34 +719,11 @@ void forwardThreeSeconds()
   }
 }
 
-struct TrajectoryPoint 
-{
-  float time; 
-  float yaw_rate; 
-  float velocity;   
-};
-
-struct MotorCoefficients 
-{
-  float L;
-  float R;
-  float Kt;
-  float Kb;
-  float J;
-  float D;
-};
-
-struct Trajectory {
-  float timestamp;
-  float velocity;
-  float turn_rate;
-};
-
 /**
 - Wheel-speed PI on the quadrature encoders.
 - Setpoints are motor-shaft rad/s, forward-positive. The alpha-beta filtered
   encoder velocity is recorded as controlFeedback so the tracking experiment
-  can compare the controller's own signal with AS5X47/KF velocity.
+  can compare the controller's own signal with AS5X47/estimator velocity.
  */
 void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
 {
@@ -830,11 +751,32 @@ void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
 }
 
 /**
-- Convert the sequence's linear speed in m/s to motor rad/s and run the PI. */
+ * Cascaded outer loop: feedforward + velocity/yaw-rate PID -> inner wheel PI.
+ * vRef is forward speed in m/s; omegaRef is yaw rate in rad/s. */
+void trackingControlUpdate(float vRef, float omegaRef)
+{
+  desiredValue = vRef;
+  desiredYawRate = omegaRef;
+
+  // Outer-loop PID feedback on the static estimator.
+  const float vError = vRef - estimator.v;
+  const float omegaError = omegaRef - estimator.omega;
+  const float vCmd = vRef + velocityPid.ComputeCCDE(vError);
+  const float omegaCmd = omegaRef + yawRatePid.ComputeCCDE(omegaError);
+
+  controlVCommand = vCmd;
+  controlOmegaCommand = omegaCmd;
+
+  // Convert polar (v, omega) to left/right wheel linear speeds (m/s),
+  // then scale to motor-shaft rad/s for the 1 kHz inner wheel PI.
+  WheelSpeeds ws = polar2Cartesian(vCmd, omegaCmd);
+  const float mpsToMotorRadSec = gear / wheelRadius;
+  wheelSpeedControl(ws.left * mpsToMotorRadSec, ws.right * mpsToMotorRadSec);
+}
+
 void controlUpdate()
 {
-  float velRef = desiredValue * (gear / wheelRadius);
-  wheelSpeedControl(velRef, velRef);
+  trackingControlUpdate(desiredValue, desiredYawRate);
 }
 
 /**
@@ -902,11 +844,11 @@ void wheelOdometryUpdate()
   float wheelAngleRight = wheelOdoAccum[1] / gear;
   float vLeft = wheelRadius * wheelAngleLeft / window;
   float vRight = wheelRadius * wheelAngleRight / window;
-  kf.updateWheelV(0.5f * (vLeft + vRight), window);
-  kf.updateWheelOmega((vRight - vLeft) / wheelBase, window);
-  if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_WHEEL_V])
+  estimator.updateWheelV(0.5f * (vLeft + vRight));
+  estimator.updateWheelOmega((vRight - vLeft) / wheelBase);
+  if (estimator.lastInnovationValid[KF_M_WHEEL_V])
     kfUpdateMask |= CAL_KF_WHEEL_V;
-  if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_WHEEL_OMEGA])
+  if (estimator.lastInnovationValid[KF_M_WHEEL_OMEGA])
     kfUpdateMask |= CAL_KF_WHEEL_OMEGA;
 
   as5VelLast[0] = vLeft;
@@ -920,7 +862,7 @@ void wheelOdometryUpdate()
 }
 
 /**
-- Kalman filter update, 1 kHz */
+- Stationary estimator update, 1 kHz */
 void estimatorUpdate()
 {
   uint32_t nowUs = micros();
@@ -929,8 +871,8 @@ void estimatorUpdate()
   kfUpdateMask = 0;
   if (dt <= 0.0f || dt > 0.020f)
   {
-    kfPrevS = kf.x[DiffDriveKalmanFilter::S];
-    kfPrevTheta = kf.x[DiffDriveKalmanFilter::THETA];
+    posePrevV = estimator.v;
+    posePrevThetaAbs = estimator.theta;
     return;
   }
   float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
@@ -940,11 +882,13 @@ void estimatorUpdate()
     kfAccelBias += (aRaw - kfAccelBias) / kfAccelCalCnt;
     if (kfAccelCalCnt >= 2000) kfAccelCalDone = true;
   }
-  kf.predict(kfAccelCalDone ? aRaw - kfAccelBias : 0.0f, dt);
+  // The startup average removes the bulk of the accelerometer offset; the
+  // filter's b_a tracks the residual.
+  estimator.predict(kfAccelCalDone ? aRaw - kfAccelBias : 0.0f, dt);
   if (imu2.gyroFresh && imu2.gyroOffsetDone)
   {
-    kf.updateGyro(imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad);
-    if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_GYRO])
+    estimator.updateGyro(imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad);
+    if (estimator.lastInnovationValid[KF_M_GYRO])
       kfUpdateMask |= CAL_KF_GYRO;
   }
   // Wheel speed now comes from the AS5X47 absolute angles only. The stock
@@ -954,39 +898,37 @@ void estimatorUpdate()
   {
     if (!kfHeadingInit)
     {
-      float delta = imu2.magHeading - kf.x[DiffDriveKalmanFilter::THETA];
-      kf.x[DiffDriveKalmanFilter::THETA] = imu2.magHeading;
-      kf.x[DiffDriveKalmanFilter::BM] = 0.0f;
-      if (state > 0) kfStartTheta += delta;
-      kfPrevTheta += delta;
+      float delta = wrapAngle(imu2.magHeading - estimator.theta);
+      estimator.theta = wrapAngle(imu2.magHeading);
+      if (state > 0) poseStartTheta += delta;
+      posePrevThetaAbs += delta;
       kfHeadingInit = true;
     }
     else
     {
-      kf.updateMag(imu2.magHeading);
-      if (kf.magRejected)
-        kfUpdateMask |= CAL_KF_MAG_REJECTED;
-      else if (kf.lastInnovationValid[DiffDriveKalmanFilter::M_MAG])
+      estimator.updateMag(imu2.magHeading);
+      if (estimator.lastInnovationValid[KF_M_MAG])
         kfUpdateMask |= CAL_KF_MAG;
+      else
+        kfUpdateMask |= CAL_KF_MAG_REJECTED;
     }
   }
-  float s = kf.x[DiffDriveKalmanFilter::S];
-  float theta = kf.x[DiffDriveKalmanFilter::THETA];
-  float ds = s - kfPrevS;
-  float headingRel = theta - kfStartTheta;
-  float headingRelPrev = kfPrevTheta - kfStartTheta;
-  float mid = 0.5f * (headingRel + headingRelPrev);
-  kfX += ds * cosf(mid);
-  kfY += ds * sinf(mid);
-  kfPrevS = s;
-  kfPrevTheta = theta;
-  pose[0] = kfX;
-  pose[1] = kfY;
-  pose[2] = headingRel;
+
+  // External dead reckoning: position is deliberately outside the filter.
+  const float vNow = estimator.v;
+  const float thetaNow = estimator.theta;
+  const float ds = 0.5f * (posePrevV + vNow) * dt;
+  const float dtheta = wrapAngle(thetaNow - posePrevThetaAbs);
+  const float thetaMid = wrapAngle(posePrevThetaAbs + 0.5f * dtheta);
+  pose[0] += ds * cosf(thetaMid);
+  pose[1] += ds * sinf(thetaMid);
+  distA += ds;
+  pose[2] = wrapAngle(thetaNow - poseStartTheta);
   pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
-  poseVel[0] = kf.x[DiffDriveKalmanFilter::V];
-  poseVel[1] = kf.x[DiffDriveKalmanFilter::OMEGA];
-  distA = s - kfStartS;
+  poseVel[0] = vNow;
+  poseVel[1] = estimator.omega;
+  posePrevV = vNow;
+  posePrevThetaAbs = thetaNow;
 }
 
 void updateLog()
@@ -1010,7 +952,7 @@ void updateLog()
     logs[logsCnt].pose[2] = pose[2];
     logs[logsCnt].pose[3] = pose[3];
     logs[logsCnt].distA = distA;
-    logs[logsCnt].desiredHeading = desiredHeading;
+    logs[logsCnt].desiredYawRate = desiredYawRate;
     logs[logsCnt].captureUs = micros() - captureStartUs;
     logs[logsCnt].currentADC[0] = analogRead(A1);
     logs[logsCnt].currentADC[1] = analogRead(A0);
@@ -1031,13 +973,15 @@ void updateLog()
 
     logs[logsCnt].controlSetpoint[0] = controlSetpoint[0];
     logs[logsCnt].controlSetpoint[1] = controlSetpoint[1];
-    for (int k = 0; k < KF_N; k++)
-      logs[logsCnt].kfState[k] = kf.x[k];
-    // P is symmetric; store the lower triangle row by row.
-    int covIndex = 0;
-    for (int i = 0; i < KF_N; i++)
-      for (int j = 0; j <= i; j++)
-        logs[logsCnt].kfCov[covIndex++] = kf.P[i * KF_N + j];
+    logs[logsCnt].kfState[0] = estimator.v;
+    logs[logsCnt].kfState[1] = estimator.omega;
+    logs[logsCnt].kfState[2] = estimator.theta;
+    logs[logsCnt].kfState[3] = estimator.b_a;
+    logs[logsCnt].kfState[4] = estimator.b_g;
+    logs[logsCnt].vError = desiredValue - estimator.v;
+    logs[logsCnt].yawRateError = desiredYawRate - estimator.omega;
+    logs[logsCnt].vCommand = controlVCommand;
+    logs[logsCnt].yawRateCommand = controlOmegaCommand;
 
     logsCnt++;
   }
@@ -1221,7 +1165,7 @@ void updateCalLog()
   if (imu2.magAvailable) flags |= CAL_MAG_AVAILABLE;
   if (as5Valid) flags |= CAL_AS5_VALID;
   if (as5Fresh) flags |= CAL_AS5_FRESH;
-  if (kf.healthy) flags |= CAL_KF_HEALTHY;
+  if (estimator.healthy) flags |= CAL_KF_HEALTHY;
   d.flags = flags;
   d.kfMask = kfUpdateMask;
   d.pad = 0;
@@ -1243,13 +1187,16 @@ void updateCalLog()
   }
   d.wheelWindow = as5Window;
   d.magHeading = imu2.magHeadingValid ? imu2.magHeading : NAN;
-  d.kfV = kf.x[DiffDriveKalmanFilter::V];
-  d.kfOmega = kf.x[DiffDriveKalmanFilter::OMEGA];
-  d.kfTheta = kf.x[DiffDriveKalmanFilter::THETA];
-  for (int i = 0; i < DiffDriveKalmanFilter::M_COUNT; i++)
+  d.kfV = estimator.v;
+  d.kfOmega = estimator.omega;
+  d.kfTheta = estimator.theta;
+  d.kfBA = estimator.b_a;
+  d.kfBG = estimator.b_g;
+  for (int i = 0; i < KF_MEAS_COUNT; i++)
   {
-    d.kfInnov[i] = kf.lastInnovation[i];
-    d.kfInnovVar[i] = kf.lastInnovationVar[i];
+    d.kfInnov[i] = estimator.lastInnovation[i];
+    // Static gains do not propagate P, so there is no innovation variance S.
+    d.kfInnovVar[i] = 0.0f;
   }
   calCnt++;
 }
@@ -1293,9 +1240,10 @@ void printCalLog()
   Serial.println("% 24-25 AS5X47 wheel velocity (left,right) (m/s, forward-positive)");
   Serial.println("% 26 wheel window (s)");
   Serial.println("% 27 mag heading (rad, NaN if unavailable)");
-  Serial.println("% 28-30 KF v, omega, theta (m/s, rad/s, rad)");
-  Serial.println("% 31-34 KF innovation y (gyro, wheel v, wheel omega, mag)");
-  Serial.println("% 35-38 KF innovation variance S for the same four updates");
+  Serial.println("% 28-30 estimator v, omega, theta (m/s, rad/s, rad)");
+  Serial.println("% 31-32 estimator b_a, b_g (m/s^2, rad/s)");
+  Serial.println("% 33-36 estimator innovation y (gyro, wheel v, wheel omega, mag)");
+  Serial.println("% 37-40 innovation variance S (0: static gains do not propagate P)");
 
   for (int i = 0; i < calCnt; i++)
   {
@@ -1318,9 +1266,11 @@ void printCalLog()
     printLogValue(d.kfV);
     printLogValue(d.kfOmega);
     printLogValue(d.kfTheta);
-    for (int i2 = 0; i2 < DiffDriveKalmanFilter::M_COUNT; i2++)
+    printLogValue(d.kfBA);
+    printLogValue(d.kfBG);
+    for (int i2 = 0; i2 < KF_MEAS_COUNT; i2++)
       printLogValue(d.kfInnov[i2]);
-    for (int i2 = 0; i2 < DiffDriveKalmanFilter::M_COUNT; i2++)
+    for (int i2 = 0; i2 < KF_MEAS_COUNT; i2++)
       printLogValue(d.kfInnovVar[i2]);
     Serial.println("");
   }
@@ -1366,7 +1316,10 @@ void setup()
   // not run from a global constructor or inside the first control tick.
   (void)leftWheelSensor();
   (void)rightWheelSensor();
-  kf.reset(0.0f);
+  estimator.reset(0.0f);
+  poseStartTheta = estimator.theta;
+  posePrevV = estimator.v;
+  posePrevThetaAbs = estimator.theta;
   kfLastUs = micros();
   motor.setPWMfrq(0x13000); 
   usb.setup();
