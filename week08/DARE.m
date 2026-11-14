@@ -1,4 +1,9 @@
 %% ========================================================================
+%  DEPRECATED - retained for reference only.
+%  The firmware now uses the stationary decoupled gain bank in
+%  src/src/kalman.h; this script describes the older 4-state model.
+%  ========================================================================
+%% ========================================================================
 %  STATIC KALMAN FILTER - IMU + wheel-encoder fusion (planar diff. drive)
 %  ----------------------------------------------------------------------
 %  Solves the stationary (predictor) DARE for the constant gain K_inf.

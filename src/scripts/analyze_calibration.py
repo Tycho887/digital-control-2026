@@ -48,9 +48,11 @@ COL_MAGHEADING = 26
 COL_KFV = 27
 COL_KFOMEGA = 28
 COL_KFTHETA = 29
-COL_KFINNOV = 30
-COL_KFINNOVVAR = 34
-N_COLUMNS = 38
+COL_KFBA = 30
+COL_KFBG = 31
+COL_KFINNOV = 32
+COL_KFINNOVVAR = 36
+N_COLUMNS = 40
 
 FLAG_ACCEL_FRESH = 1 << 0
 FLAG_GYRO_FRESH = 1 << 1
@@ -67,7 +69,7 @@ KF_WHEEL_OMEGA = 1 << 2
 KF_MAG = 1 << 3
 KF_MAG_REJECTED = 1 << 4
 
-STATE_NAMES = ["s", "theta", "v", "omega", "b_a", "b_g", "b_m"]
+STATE_NAMES = ["v", "omega", "theta", "b_a", "b_g"]
 
 
 def latest_log(directory):
@@ -410,9 +412,13 @@ def analyze_noise(t, data, outdir=None, show=False):
         print("%-14s %6d %10.3f %10.3f %10.3f %10.3f" %
               (label, row["n"], row["mean"], row["median"],
                row["p95"], row["frac_gt_3.84"]))
-    print("NIS ~ 1 is consistent; mean >> 1 means R too small or P too "
-          "confident. The wheel v/omega rows share angle noise, so treat "
-          "those two as approximate.")
+    if nis_rows:
+        print("NIS ~ 1 is consistent; mean >> 1 means R too small or P too "
+              "confident. The wheel v/omega rows share angle noise, so treat "
+              "those two as approximate.")
+    else:
+        print("NIS unavailable: the stationary filter uses constant gains "
+              "and does not propagate an innovation variance S.")
 
     if outdir is not None or show:
         import matplotlib.pyplot as plt

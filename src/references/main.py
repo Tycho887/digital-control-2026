@@ -1,15 +1,14 @@
-"""NumPy reference implementation of the 7-state differential-drive filter.
+"""Deprecated NumPy reference for the old 7-state differential-drive filter.
 
 State: x = [s, theta, v, omega, b_a, b_g, b_m]
 
-Sensors: MPU-9250 accelerometer / gyroscope / magnetometer and two AS5X47
-absolute angle sensors.  The AS5X47 angles are differenced over a 10 ms window
-to give instantaneous forward velocity and yaw rate; no wheel-derived distance
-or heading is used.
+The firmware now uses the stationary decoupled estimator in
+``src/src/kalman.{h,cpp}``: state [v, b_a, theta, omega, b_g], constant gains,
+and no covariance propagation.  The matching reference and parity check live
+in ``tests/kalman_host/verify_gains.py`` and
+``tests/kalman_host/test_parity.py``.
 
-This file is both a library (``DiffDriveKF``) and a headless demo.  Constants
-and update order mirror ``src/src/kalman.{h,cpp}`` so ``tests/kalman_host/
-test_parity.py`` can compare the two implementations step by step.
+This file is retained as the historical 7-state reference and demo.
 """
 
 import math
