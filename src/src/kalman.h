@@ -20,8 +20,10 @@ enum KfMeasurement : uint8_t
 };
 
 // Constant gains for the decoupled stationary filter. Each row maps one scalar
-// innovation into its state block. The values are the 10 ms wheel / 1 kHz gyro
-// bank; regenerate them from the stationary DARE when its parameters change.
+// innovation into its state block. The values are the 10 ms wheel / 1 kHz
+// gyro / 10 Hz magnetometer bank; the firmware throttles the 100 Hz AK8963
+// samples to 10 Hz before calling updateMag(). Regenerate them from the
+// stationary DARE when its parameters change.
 //
 // Wheel v update (100 Hz),   H = [1 0]     over [v, b_a]
 // Gyro update     (1 kHz),   H = [0 1 1]   over [theta, omega, b_g]

@@ -45,6 +45,8 @@ void printLog();
 /**
 - Global variables */
 const uint32_t sampleTimeUs = 1000; // desired sample time in us
+static_assert(sampleTimeUs == 1000,
+              "controller coefficients assume a 1 ms sample time");
 // Robot configuration
 const float gear = 9.6;
 const float wheelRadius = 0.0315; // (m)
@@ -71,7 +73,7 @@ float poseStartTheta = 0.0f;   // heading at start(), for run-relative pose
 float posePrevV = 0.0f;        // previous v for trapezoidal dead reckoning
 float posePrevThetaAbs = 0.0f; // previous absolute heading
 uint32_t kfLastUs = 0;
-bool velSaturated = false;
+uint32_t magLastUs = 0; // last magnetometer update consumed by the estimator
 // Outer-loop commands from the last control tick, for logging.
 float controlVCommand = 0.0f;     // m/s
 float controlOmegaCommand = 0.0f; // rad/s
@@ -101,6 +103,16 @@ bool wheelOdoInit = false;
 float wheelOdoPrevAngle[2] = {0.0f, 0.0f};
 float wheelOdoAccum[2] = {0.0f, 0.0f};
 uint32_t wheelOdoStartUs = 0;
+// A blocked main loop can stretch the angle window; reject such a window
+// instead of converting it into a bogus velocity.
+const float maxWheelWindow = 0.030f; // s
+// Encoder fallback window, used while the AS5X47 reads are invalid.
+bool wheelEncoderInit = false;
+uint32_t wheelEncoderStartUs = 0;
+// A working sensor must report motion when the encoders do. These thresholds
+// catch a dead SPI bus that returns a valid all-zero angle frame.
+const float as5StallSpeed = 0.002f; // m/s
+const float encoderMotion = 5.0f;   // motor rad/s
 // Latest AS5X47 values, exposed for the calibration capture.
 bool as5Valid = false;
 bool as5Fresh = false;
@@ -169,6 +181,7 @@ enum KfUpdateFlag : uint16_t
   CAL_KF_WHEEL_OMEGA = 1 << 2,
   CAL_KF_MAG = 1 << 3,
   CAL_KF_MAG_REJECTED = 1 << 4,
+  CAL_KF_WHEEL_ENCODER = 1 << 5,
 };
 
 typedef struct
@@ -240,6 +253,7 @@ int state = 0;
 float endTime = 0;
 float desiredValue = 0;    // forward velocity reference (m/s)
 float desiredYawRate = 0;  // yaw-rate reference (rad/s)
+float desiredHeading = 0;  // heading reference (rad)
 
 // The abstract filter class is supposed to let us implement different filters.
 // The two main ones are low-pass filters for the wheel speed and a KF for the dead-reckoning.
@@ -315,30 +329,78 @@ class AlphaBetaFilter {
 AlphaBetaFilter leftVelFilter (0.5f, 0.1f, sampleTimeUs * 1e-6f);
 AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
 
-// Actuator limit for the wheel-speed PI. The week07 tuning used 9 V; 3 V is
-// retained here for safety, and the tracking experiment reports saturation.
+// Actuator limit for the wheel-speed PI. The Simulink reference uses 9 V;
+// 3 V is retained here for safety, and the tracking experiment reports
+// saturation.
 const float controlVoltageLimit = 3.0f;
 
-// Week07-tuned wheel PI difference equations, valid for Ts = 1 ms:
-//   u[k] = u[k-1] + b0*e[k] + b1*e[k-1]
-// with Kp = -b1 and Ki = (b0 + b1)/Ts.
-PID_Coefficients left_wheel_coeffs  = {0.273519f, -0.267766f, 0.0f, -1.000000f, 0.0f};
-PID_Coefficients right_wheel_coeffs = {0.275100f, -0.271207f, 0.0f, -1.000000f, 0.0f};
+// Week10 Tustin difference equations from Motor_model_param.m (Ts = 1 ms):
+//   u[k] = b0*e[k] + b1*e[k-1] + b2*e[k-2] - a1*u[k-1] - a2*u[k-2]
+// The per-wheel velocity PI is the forward-rate controller, acting on
+// motor-shaft speed as in the colleague's Simulink model.
+PID_Coefficients left_wheel_coeffs  = {0.05005f, -0.04995f, 0.0f, -1.0f, 0.0f};
+PID_Coefficients right_wheel_coeffs = {0.04005f, -0.03995f, 0.0f, -1.0f, 0.0f};
 
 PIDController leftController(left_wheel_coeffs, controlVoltageLimit);
 PIDController rightController(right_wheel_coeffs, controlVoltageLimit);
 
-// Outer-loop correction saturation limits.
-const float maxVelCorrection = 0.30f;     // m/s
-const float maxYawRateCorrection = 2.00f; // rad/s
+// Turn-rate PI, Kpt = 5 and taui_t = 0.2 s.
+PID_Coefficients yaw_pid_coeffs = {5.0125f, -4.9875f, 0.0f, -1.0f, 0.0f};
 
-// Placeholder outer-loop PID coefficients (Ts = 1 ms). Replace these after
-// tuning against the inner wheel-speed loop.
-PID_Coefficients vel_pid_coeffs = {0.50f, -0.49f, 0.0f, -1.0f, 0.0f};
-PID_Coefficients yaw_pid_coeffs = {0.40f, -0.39f, 0.0f, -1.0f, 0.0f};
+// Heading lead-lag from heading_conversion.m. The coefficients already include
+// Kph = 2.5, so the wrapped heading error is applied directly.
+PID_Coefficients heading_coeffs =
+    {4.996878901f, -4.990636704f, 0.0f, -0.997503121f, 0.0f};
 
-PIDController velocityPid(vel_pid_coeffs, maxVelCorrection);
-PIDController yawRatePid(yaw_pid_coeffs, maxYawRateCorrection);
+// First-order reference limiters from the week10 Simulink model. The
+// saturation acts on the rate, so Lim_V* bound acceleration (m/s^2) and
+// Lim_T* bound angular acceleration (rad/s^2).
+const float KpLV = 25.0f;
+const float KpLT = 25.0f;
+const float Lim_VU = 0.5f;
+const float Lim_VL = -0.5f;
+const float Lim_TU = 0.7f;
+const float Lim_TL = -0.7f;
+
+/**
+ * Reference limiter as in the Simulink acc_limit_turn blocks:
+ *   u[k] = u[k-1] + Ts * sat(Kp * (ref - u[k-1]), lower, upper)
+ * A step reference therefore becomes a bounded ramp followed by a
+ * first-order approach. */
+class ReferenceLimiter
+{
+public:
+  ReferenceLimiter(float gain_, float rateLower_, float rateUpper_)
+      : Kp(gain_), rateLower(rateLower_), rateUpper(rateUpper_) {}
+
+  void reset(float value = 0.0f) { y = value; }
+
+  float update(float ref)
+  {
+    float rate = Kp * (ref - y);
+    if (rate > rateUpper)
+      rate = rateUpper;
+    else if (rate < rateLower)
+      rate = rateLower;
+    y += rate * sampleTimeUs * 1e-6f;
+    return y;
+  }
+
+private:
+  float Kp;
+  float rateLower;
+  float rateUpper;
+  float y = 0.0f;
+};
+
+ReferenceLimiter velLimiter(KpLV, Lim_VL, Lim_VU);
+ReferenceLimiter turnLimiter(KpLT, Lim_TL, Lim_TU);
+
+// The heading and yaw-rate corrections are bounded at the turn-reference
+// limit, so the total turn command is the reference plus at most twice that
+// limit.
+PIDController headingPid(heading_coeffs, Lim_TU);
+PIDController yawRatePid(yaw_pid_coeffs, Lim_TU);
 
 float computedControl[2] = {0.0f, 0.0f};
 float controlSetpoint[2] = {0.0f, 0.0f};
@@ -507,10 +569,11 @@ bool start()
   time_sec = 0;
   encoder.encoder[0] = 0; 
   encoder.encoder[1] = 0; 
-  // Restart the wheel-speed window so the run begins from a clean seed.
+  // Restart the wheel-speed windows so the run begins from a clean seed.
   wheelOdoInit = false;
   wheelOdoAccum[0] = 0.0f;
   wheelOdoAccum[1] = 0.0f;
+  wheelEncoderInit = false;
   display.useDisplay = false;
   
   // Reset controllers and velocity filters for a clean run. Without the
@@ -519,12 +582,22 @@ bool start()
   rightController.reset();
   leftVelFilter.reset();
   rightVelFilter.reset();
-  velocityPid.reset();
+  headingPid.reset();
   yawRatePid.reset();
+  velLimiter.reset();
+  turnLimiter.reset();
   controlVCommand = 0.0f;
   controlOmegaCommand = 0.0f;
   desiredYawRate = 0.0f;
-  // Capture the pose origin; the filter keeps its learned biases.
+  // A run starts with clean motion states and a clean residual accelerometer
+  // bias. The stationary startup average (kfAccelBias) is measured at
+  // power-on and kept so the offset is not re-learned as b_a. The learned
+  // heading and gyro bias stay.
+  estimator.v = 0.0f;
+  estimator.omega = 0.0f;
+  estimator.b_a = 0.0f;
+  // Capture the pose origin and hold the current heading.
+  desiredHeading = estimator.theta;
   poseStartTheta = estimator.theta;
   posePrevV = estimator.v;
   posePrevThetaAbs = estimator.theta;
@@ -682,6 +755,53 @@ void sequenceTwoSteps()
 }
 
 /**
+- Yaw-rate step: 0.05 m/s forward, then a 0.2 rad/s turn for 0.5 s.
+- Not the default sequence; call it from loop() to exercise the turn-rate
+  and heading loops. */
+void yawRateStep()
+{
+  bool button;
+  switch (state)
+  {
+    case 0:
+      button = digitalReadFast(PIN_START_BUTTON);
+      if (button or robot.missionStart)
+      {
+        if (!start()) break;
+        desiredValue = 0.05f;
+        desiredYawRate = 0.0f;
+        endTime = time_sec + 0.5f; // settle the forward loop first
+        state = 10;
+      }
+      break;
+    case 10:
+      if (time_sec > endTime)
+      {
+        desiredYawRate = 0.2f;
+        endTime = time_sec + 0.5f; // 0.5 s yaw-rate step
+        state = 11;
+      }
+      break;
+    case 11:
+      // Move the heading reference with the commanded turn so the heading
+      // loop does not oppose the yaw-rate step.
+      desiredHeading = wrapAngle(desiredHeading +
+                                 desiredYawRate * sampleTimeUs * 1e-6f);
+      if (time_sec > endTime)
+      {
+        desiredValue = 0;
+        desiredYawRate = 0;
+        stop(0.3f);
+      }
+      break;
+    default:
+      if (time_sec > endTime)
+        finished();
+      break;
+  }
+}
+
+/**
 - Forward at 0.1 cm/s (0.001 m/s) for 3.0 seconds */
 void forwardThreeSeconds()
 {
@@ -751,18 +871,24 @@ void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
 }
 
 /**
- * Cascaded outer loop: feedforward + velocity/yaw-rate PID -> inner wheel PI.
- * vRef is forward speed in m/s; omegaRef is yaw rate in rad/s. */
-void trackingControlUpdate(float vRef, float omegaRef)
+ * Week10 reference-limited cascade:
+ *   vCmd     = velLimiter(vRef)
+ *   omegaRef = turnLimiter(desiredYawRate + heading PID(wrapped heading error))
+ *   omegaCmd = omegaRef + yaw-rate PID(omegaRef - estimator.omega)
+ * The per-wheel PI is the forward-rate controller, so vCmd stays vRef
+ * (after the velocity limiter). headingRef is in rad; vRef and omegaRef in
+ * m/s and rad/s. */
+void trackingControlUpdate(float vRef, float omegaRef, float headingRef)
 {
   desiredValue = vRef;
   desiredYawRate = omegaRef;
 
-  // Outer-loop PID feedback on the static estimator.
-  const float vError = vRef - estimator.v;
-  const float omegaError = omegaRef - estimator.omega;
-  const float vCmd = vRef + velocityPid.ComputeCCDE(vError);
-  const float omegaCmd = omegaRef + yawRatePid.ComputeCCDE(omegaError);
+  const float vCmd = velLimiter.update(vRef);
+  const float headingCorrection =
+      headingPid.ComputeCCDE(wrapAngle(headingRef - estimator.theta));
+  const float omegaRefLimited = turnLimiter.update(omegaRef + headingCorrection);
+  const float omegaCmd =
+      omegaRefLimited + yawRatePid.ComputeCCDE(omegaRefLimited - estimator.omega);
 
   controlVCommand = vCmd;
   controlOmegaCommand = omegaCmd;
@@ -776,18 +902,24 @@ void trackingControlUpdate(float vRef, float omegaRef)
 
 void controlUpdate()
 {
-  trackingControlUpdate(desiredValue, desiredYawRate);
+  trackingControlUpdate(desiredValue, desiredYawRate, desiredHeading);
 }
 
 /**
 - Read one AS5X47 compensated angle in motor-shaft radians.
-- Returns false when the SPI frame is flagged, so a failed transfer cannot
-  turn into a fake angle step (a zero word would look like a jump).
+- Returns false when the command frame was flagged (`ef`) or the read frame
+  fails its even-parity check. `pard` is the frame parity bit, not an error
+  flag, so it must be verified rather than treated as a failure.
+- A dead SPI bus returns an all-zero word with valid parity; the caller also
+  compares the resulting speed against the quadrature encoders so a stuck bus
+  cannot silently feed zero velocity to the filter.
 - ANGLE_COMPSATED (0x3FFF) is the same register AS5X47::readAngle() uses. */
 bool readWheelAngle(AS5X47 &sensor, float &angleRad)
 {
   ReadDataFrame frame = sensor.readRegister(ANGLE_COMPSATED);
-  if (frame.values.ef or frame.values.pard)
+  if (frame.values.ef)
+    return false;
+  if (__builtin_parity(frame.raw) != 0)
     return false;
   Angle angle;
   angle.raw = frame.values.data;
@@ -796,30 +928,71 @@ bool readWheelAngle(AS5X47 &sensor, float &angleRad)
 }
 
 /**
+- Feed one wheel-velocity pair (m/s, forward-positive) to the estimator. */
+void applyWheelMeasurements(float vLeft, float vRight)
+{
+  estimator.updateWheelV(0.5f * (vLeft + vRight));
+  estimator.updateWheelOmega((vRight - vLeft) / wheelBase);
+  if (estimator.lastInnovationValid[KF_M_WHEEL_V])
+    kfUpdateMask |= CAL_KF_WHEEL_V;
+  if (estimator.lastInnovationValid[KF_M_WHEEL_OMEGA])
+    kfUpdateMask |= CAL_KF_WHEEL_OMEGA;
+}
+
+/**
 - AS5X47 wheel speed, 1 kHz reads over a 10 ms window.
 - Both absolute angles are read every tick and their unwrapped differences
   accumulated. Every KF_WHEEL_WINDOW the accumulators are converted to wheel
-  speed and fed to the filter as v and omega.
+  speed and fed to the filter as v and omega. Windows stretched beyond
+  30 ms by a blocked loop are discarded.
+- When the AS5X47 read is invalid, the smoothed quadrature controlFeedback
+  (motor rad/s) provides v and omega at the same 10 ms rate, flagged with
+  CAL_KF_WHEEL_ENCODER in the calibration mask.
 - The sensors sit on the motor shafts, so wheel angle = sensor angle / gear.
 - AS5X47::readVel() is deliberately not used: its 24.141 deg/s LSB is
   unusable at the robot's low speeds. */
 void wheelOdometryUpdate()
 {
   as5Fresh = false;
+  const uint32_t nowUs = micros();
+  // controlFeedback is only refreshed while a wheel-speed loop runs.
+  const bool wheelLoopActive =
+      state > 0 or (calState > 0 and calMode == CAL_TRACK);
   float angleLeft = 0.0f, angleRight = 0.0f;
   if (!readWheelAngle(leftWheelSensor(), angleLeft) or
       !readWheelAngle(rightWheelSensor(), angleRight))
   {
     as5Valid = false;
+    if (!wheelLoopActive)
+    {
+      wheelEncoderInit = false;
+      return;
+    }
+    if (!wheelEncoderInit)
+    {
+      wheelEncoderStartUs = nowUs;
+      wheelEncoderInit = true;
+      return;
+    }
+    float window = (nowUs - wheelEncoderStartUs) * 1e-6f;
+    if (window < KF_WHEEL_WINDOW)
+      return;
+    wheelEncoderStartUs = nowUs;
+    if (window > maxWheelWindow)
+      return;
+    float vLeft = controlFeedback[0] * wheelRadius / gear;
+    float vRight = controlFeedback[1] * wheelRadius / gear;
+    applyWheelMeasurements(vLeft, vRight);
+    kfUpdateMask |= CAL_KF_WHEEL_ENCODER;
     return;
   }
+  wheelEncoderInit = false;
   angleLeft *= AS5X47_LEFT_DIR;
   angleRight *= AS5X47_RIGHT_DIR;
   as5Valid = true;
   as5AngleLast[0] = angleLeft;
   as5AngleLast[1] = angleRight;
 
-  uint32_t nowUs = micros();
   if (!wheelOdoInit)
   { // seed the previous angles; the first window has no usable delta yet
     wheelOdoPrevAngle[0] = angleLeft;
@@ -837,6 +1010,13 @@ void wheelOdometryUpdate()
   wheelOdoPrevAngle[1] = angleRight;
 
   float window = (nowUs - wheelOdoStartUs) * 1e-6f;
+  if (window > maxWheelWindow)
+  { // a blocked loop makes the averaged window unusable; restart it
+    wheelOdoAccum[0] = 0.0f;
+    wheelOdoAccum[1] = 0.0f;
+    wheelOdoStartUs = nowUs;
+    return;
+  }
   if (window < KF_WHEEL_WINDOW)
     return;
 
@@ -844,12 +1024,26 @@ void wheelOdometryUpdate()
   float wheelAngleRight = wheelOdoAccum[1] / gear;
   float vLeft = wheelRadius * wheelAngleLeft / window;
   float vRight = wheelRadius * wheelAngleRight / window;
-  estimator.updateWheelV(0.5f * (vLeft + vRight));
-  estimator.updateWheelOmega((vRight - vLeft) / wheelBase);
-  if (estimator.lastInnovationValid[KF_M_WHEEL_V])
-    kfUpdateMask |= CAL_KF_WHEEL_V;
-  if (estimator.lastInnovationValid[KF_M_WHEEL_OMEGA])
-    kfUpdateMask |= CAL_KF_WHEEL_OMEGA;
+
+  // A dead SPI bus returns a valid all-zero frame: the angle never changes,
+  // so the AS5X47 speed is zero while the encoders show motion. Fall back to
+  // the encoder velocity instead of feeding the filter a silent zero.
+  const bool as5Stalled =
+      (fabsf(vLeft) < as5StallSpeed and fabsf(controlFeedback[0]) > encoderMotion) or
+      (fabsf(vRight) < as5StallSpeed and fabsf(controlFeedback[1]) > encoderMotion);
+  if (wheelLoopActive and as5Stalled)
+  {
+    as5Valid = false;
+    applyWheelMeasurements(controlFeedback[0] * wheelRadius / gear,
+                           controlFeedback[1] * wheelRadius / gear);
+    kfUpdateMask |= CAL_KF_WHEEL_ENCODER;
+    wheelOdoAccum[0] = 0.0f;
+    wheelOdoAccum[1] = 0.0f;
+    wheelOdoStartUs = nowUs;
+    return;
+  }
+
+  applyWheelMeasurements(vLeft, vRight);
 
   as5VelLast[0] = vLeft;
   as5VelLast[1] = vRight;
@@ -876,7 +1070,13 @@ void estimatorUpdate()
     return;
   }
   float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
-  if (!kfAccelCalDone && imu2.accelFresh)
+  // Average every fresh IMU read at power-on. The driver's data-ready flag can
+  // stay false even while accelUpdate() returns new samples, so use the
+  // timestamp rather than imu2.accelFresh.
+  static uint32_t lastAccelUs = 0;
+  const bool accelNew = imu2.accelTimestampUs != lastAccelUs;
+  lastAccelUs = imu2.accelTimestampUs;
+  if (!kfAccelCalDone && accelNew)
   {
     kfAccelCalCnt++;
     kfAccelBias += (aRaw - kfAccelBias) / kfAccelCalCnt;
@@ -891,16 +1091,21 @@ void estimatorUpdate()
     if (estimator.lastInnovationValid[KF_M_GYRO])
       kfUpdateMask |= CAL_KF_GYRO;
   }
-  // Wheel speed now comes from the AS5X47 absolute angles only. The stock
-  // quadrature encoders remain in use by controlUpdate() but not here.
+  // Wheel speed comes from the AS5X47 absolute angles; the smoothed
+  // quadrature feedback is the flagged fallback when the read fails.
   wheelOdometryUpdate();
-  if (imu2.magFresh && imu2.magHeadingValid)
+  // The static gain bank assumes a 10 Hz magnetometer update; uimu2.cpp
+  // samples it at 100 Hz, so consume one sample per 100 ms here.
+  const uint32_t magPeriodUs = 100000;
+  if (imu2.magFresh and imu2.magHeadingValid and
+      (nowUs - magLastUs) >= magPeriodUs)
   {
     if (!kfHeadingInit)
     {
       float delta = wrapAngle(imu2.magHeading - estimator.theta);
       estimator.theta = wrapAngle(imu2.magHeading);
       if (state > 0) poseStartTheta += delta;
+      desiredHeading = wrapAngle(desiredHeading + delta);
       posePrevThetaAbs += delta;
       kfHeadingInit = true;
     }
@@ -912,6 +1117,7 @@ void estimatorUpdate()
       else
         kfUpdateMask |= CAL_KF_MAG_REJECTED;
     }
+    magLastUs = nowUs;
   }
 
   // External dead reckoning: position is deliberately outside the filter.
@@ -1228,7 +1434,7 @@ void printCalLog()
   Serial.println("% 1 time (s)");
   Serial.println("% 2 mode (1 mag, 2 noise, 3 track)");
   Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy)");
-  Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bit3 mag, bit4 mag rejected)");
+  Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bit3 mag, bit4 mag rejected, bit5 wheel v/omega from encoder fallback)");
   Serial.println("% 5-6 setpoint (left,right) (motor rad/s)");
   Serial.println("% 7-8 PI feedback (left,right) (motor rad/s)");
   Serial.println("% 9-10 motor voltage request (left,right) (V, forward-positive)");
@@ -1352,6 +1558,7 @@ void loop ( void )
       else
       {
         sequenceTwoSteps();
+        //yawRateStep();
         //forwardThreeSeconds();
         if (state > 0)
         {
