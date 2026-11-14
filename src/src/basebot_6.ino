@@ -776,7 +776,32 @@ void trackingControlUpdate(float vRef, float omegaRef)
 
 void controlUpdate()
 {
-  trackingControlUpdate(desiredValue, desiredYawRate);
+  void controlUpdate()
+{
+  const float maxLinearStep = 0.5f * 0.001f; 
+  const float maxTurnStep   = 0.5f * 0.001f;
+
+  static float currentVel = 0.0f;
+  static float currentTurn = 0.0f;
+
+  if (desiredValue > currentVel + maxLinearStep) {
+    currentVel += maxLinearStep;
+  } else if (desiredValue < currentVel - maxLinearStep) {
+    currentVel -= maxLinearStep;
+  } else {
+    currentVel = desiredValue;
+  }
+
+  if (desiredYawRate > currentTurn + maxTurnStep) {
+    currentTurn += maxTurnStep;
+  } else if (desiredYawRate < currentTurn - maxTurnStep) {
+    currentTurn -= maxTurnStep;
+  } else {
+    currentTurn = desiredYawRate;
+  }
+
+  trackingControlUpdate(currentVel, currentTurn);
+}
 }
 
 /**
