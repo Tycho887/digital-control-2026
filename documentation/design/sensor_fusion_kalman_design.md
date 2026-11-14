@@ -30,14 +30,18 @@ covariance-propagating design below in these ways:
   its bias is estimated as `b_a`.
 - **Magnetometer enabled by default:** the heading update is innovation-gated
   and runs unless disabled with `mag 0`.
-- **Outer control:** `pid.h` provides one incremental PID class. Two instances
-  (`velocityPid`, `yawRatePid`) close the forward-velocity and yaw-rate loops
-  around the estimator; the outputs feed the existing wheel-speed PI.
-- **Calibration capture:** `cal mag`, `cal noise` and `cal track` record raw
-  sensors, controller signals and estimator innovations into a compact buffer;
-  `src/scripts/analyze_calibration.py` checks the magnetometer axis, sensor
-  noise and PI tracking. NIS is not available because the stationary gains do
-  not propagate an innovation variance.
+- **Outer control:** reference limiters, a heading lead-lag controller, and
+  `yawRatePid` feed the existing wheel-speed PI loops. `useKfFeedback` can
+  bypass the estimator heading/yaw feedback for a feed-forward comparison while
+  leaving estimation and logging active; there is no outer velocity PID.
+- **Diagnostic trajectory:** `closedLoopTrajectory()` commands 0.20 m/s for
+  4 s, then +30 degrees/s for 3 s, with short baseline/settling phases.
+- **Calibration capture:** `cal mag`, `cal noise`, `cal track`, and `cal upside`
+  record raw sensors, controller signals and estimator innovations into a
+  compact buffer. `cal upside` is an armed 6 s wheels-off-the-ground sequence
+  with constant forward and differential wheel-speed plateaus. NIS is not
+  available because the stationary gains do not propagate innovation variance.
+  Analysis of the new upside/format-3 captures is deferred until real logs exist.
 
 The older `week08/DARE.m` and `week08/static_kf.mat` are deprecated. Sections
 1–7 and the appendix below describe the original quadrature-encoder design and
@@ -61,11 +65,18 @@ each candidate heading pair against gyro-integrated yaw. Acceptance:
 (assumed 0.1 °/s), accel Z (0.0285 m/s²), AS5X47 angle (0.068°), 10 ms wheel
 velocity (5.51e-4 m/s) and turn rate (7.87e-3 rad/s), and mag heading
 (0.01 rad). A measured/assumed ratio between roughly 0.5 and 2 is treated as
-plausible. The same capture reports mean normalized innovation squared
-`y²/S` per update; NIS ≈ 1 is consistent, NIS ≫ 1 means `R` is too small or
-`P` too confident. These are seeds for a retune, not an automatic R change.
+plausible. These are seeds for a retune, not an automatic R change. NIS is
+unavailable with the current fixed gains because neither `P` nor innovation
+variance `S` is propagated.
 
-`cal track` runs the week07-tuned PI on the quadrature encoders at 500 Hz.
+`cal upside` repeats the measurement with the wheels turning while the chassis
+is secured upside down: 0.5 s zero, 2.5 s at 0.20 m/s wheel equivalent, 2.5 s
+at +30 degrees/s differential wheel equivalent, then 0.5 s zero. Its raw capture
+separates motor-on sensor behavior from wheel-loop tracking; wheel-derived pose
+is not chassis ground truth. The separate upright trajectory is used afterward
+for KF/controller interaction checks.
+
+`cal track` runs the current quadrature-encoder PI at 500 Hz.
 It reports rise time, overshoot, settling time, steady-state/RMS error and
 3 V saturation for the PI feedback, AS5X47 velocity and KF velocity. The
 AS5X47/KF columns are an independent check on the encoder feedback; the

@@ -238,7 +238,7 @@ void URobot::sendHelp()
   usb.send(reply);
   snprintf(reply, MRL, "%% -- \tlog \tPrint log\r\n");
   usb.send(reply);
-  snprintf(reply, MRL, "%% -- \tcal mag|noise|track|stop|log|retrymag \tCalibration experiments\r\n");
+  snprintf(reply, MRL, "%% -- \tcal mag|noise|track|upside|stop|log|retrymag \tCalibration experiments\r\n");
   usb.send(reply);
   snprintf(reply, MRL, "%% -- \thelp \tSend on-line help\r\n");
   usb.send(reply);

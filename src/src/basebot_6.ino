@@ -41,6 +41,7 @@ void printLog();
 #include "AS5X47.h"
 #include "kalman.h"
 #include "pid.h"
+#include "trajectory.h"
 
 /**
 - Global variables */
@@ -77,6 +78,12 @@ uint32_t magLastUs = 0; // last magnetometer update consumed by the estimator
 // Outer-loop commands from the last control tick, for logging.
 float controlVCommand = 0.0f;     // m/s
 float controlOmegaCommand = 0.0f; // rad/s
+float controlOmegaRefLimited = 0.0f;
+float controlHeadingCorrection = 0.0f;
+float kfForwardAccelInput = 0.0f; // m/s^2, after startup offset removal
+float kfGyroYawInput = 0.0f;      // rad/s, forward KF sign convention
+const bool useKfFeedback = true;  // false: outer heading/yaw feed-forward only
+TrajectoryConfig closedLoopConfig;
 
 // Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
 // the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
@@ -148,6 +155,17 @@ typedef struct
   float yawRateError;     // omegaRef - KF omega (rad/s)
   float vCommand;         // outer-loop v command (m/s)
   float yawRateCommand;   // outer-loop yaw-rate command (rad/s)
+  float controlFeedback[2]; // filtered PI feedback (motor rad/s)
+  float as5Vel[2];        // independent wheel velocity (m/s)
+  float desiredHeading;   // rad
+  float headingError;     // actual heading-controller input (rad)
+  float omegaRefLimited;  // limited turn reference before yaw correction (rad/s)
+  float headingCorrection; // heading-controller output (rad/s)
+  float kfAccelInput;     // forward acceleration used by predict (m/s^2)
+  float kfGyroInput;      // yaw-rate input used by updateGyro (rad/s)
+  float kfInnov[KF_MEAS_COUNT];
+  uint16_t kfMask;
+  uint16_t diagnosticFlags;
 
 } LogData;
 
@@ -160,6 +178,7 @@ enum CalMode : uint8_t
   CAL_MAG = 1,
   CAL_NOISE = 2,
   CAL_TRACK = 3,
+  CAL_UPSIDE_DOWN = 4,
 };
 
 enum CalFlag : uint16_t
@@ -184,13 +203,26 @@ enum KfUpdateFlag : uint16_t
   CAL_KF_WHEEL_ENCODER = 1 << 5,
 };
 
+enum LogFlag : uint16_t
+{
+  LOG_KF_FEEDBACK = 1 << 0,
+  LOG_KF_HEALTHY = 1 << 1,
+  LOG_AS5_VALID = 1 << 2,
+  LOG_AS5_FRESH = 1 << 3,
+  LOG_WHEEL_ENCODER_FALLBACK = 1 << 4,
+  LOG_LEFT_SATURATED = 1 << 5,
+  LOG_RIGHT_SATURATED = 1 << 6,
+  LOG_HEADING_SATURATED = 1 << 7,
+  LOG_YAW_RATE_SATURATED = 1 << 8,
+};
+
 typedef struct
 {
   float time;
   uint16_t mode;
   uint16_t flags;
   uint16_t kfMask;
-  uint16_t pad;
+  uint16_t phase;
   float setpoint[2];       // motor rad/s
   float feedback[2];       // PI feedback, motor rad/s
   float motorVolt[2];      // V request, forward-positive
@@ -211,13 +243,12 @@ typedef struct
   float kfInnovVar[KF_MEAS_COUNT];
 } CalData;
 
-// The active sequenceTwoSteps run lasts 1.8 s. A row is about 156 bytes, so
-// the buffer covers about 3.1 s at 1 kHz. For the 3.6 s forwardThreeSeconds
-// run set logDivider to 2 (500 Hz) and logCoverageUs to 3700000.
+// The closed-loop trajectory lasts 7.6 s. Format-3 rows are captured at
+// 250 Hz; the compile-time check below requires margin around the full run.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
-const int logDivider = 1; // log one row per N control ticks
-const uint32_t logCoverageUs = 1900000;
+const int logDivider = 4; // log one row per N control ticks
+const uint32_t logCoverageUs = 8000000;
 static_assert(logDivider >= 1, "logDivider must be at least 1");
 static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
               "Log buffer must cover the complete sequence plus margin");
@@ -247,6 +278,7 @@ int calDivider = 1;
 int calTickCnt = 0;
 int calTrackIndex = 0;
 float calTrackStepEnd = 0.0f;
+uint16_t calPhase = 0;
 
 // State is also used to prevent a USB log request from blocking control.
 int state = 0;
@@ -414,6 +446,14 @@ void printLogValue(float value)
   Serial.print(buf);
 }
 
+void printPidHeader(const char *name, const PID_Coefficients &c, float limit)
+{
+  Serial.print("% "); Serial.print(name); Serial.print(" b0,b1,b2,a1,a2,limit");
+  printLogValue(c.b0); printLogValue(c.b1); printLogValue(c.b2);
+  printLogValue(c.a1); printLogValue(c.a2); printLogValue(limit);
+  Serial.println();
+}
+
 void printLog()
 {
   if (state > 0)
@@ -432,13 +472,32 @@ void printLog()
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
-  Serial.println("% log format 2 (static estimator, no covariance)");
+  Serial.println("% log format 3 (static estimator, no covariance)");
   Serial.print("% Sample time ");  Serial.print(sampleTimeUs);
-  Serial.print(" us, Gear ");  Serial.print(gear);
-  Serial.print(", Wheels ");  Serial.print(wheelRadius);
+  Serial.print(" us, log divider "); Serial.print(logDivider);
+  Serial.print(", gear ");  Serial.print(gear, 7);
+  Serial.print(", wheel radius ");  Serial.print(wheelRadius, 7);
+  Serial.print(" m, wheel base "); Serial.print(wheelBase, 7);
   Serial.print(" m, PPR ");  Serial.println(encoder.pulsPerRev);
   Serial.print("% maximum log samples ");  Serial.print(logsMax);
   Serial.print(" each sized ");  Serial.print(sizeof(LogData)); Serial.println(" bytes");
+  Serial.print("% KF heading/yaw feedback "); Serial.println(useKfFeedback ? 1 : 0);
+  Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
+  printLogValue(closedLoopConfig.initialRest);
+  printLogValue(closedLoopConfig.forwardDuration);
+  printLogValue(closedLoopConfig.turnDuration);
+  printLogValue(closedLoopConfig.finalRest); Serial.println();
+  Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
+  printLogValue(closedLoopConfig.forwardSpeed);
+  printLogValue(closedLoopConfig.turnRate); Serial.println();
+  printPidHeader("Wheel PI L", left_wheel_coeffs, controlVoltageLimit);
+  printPidHeader("Wheel PI R", right_wheel_coeffs, controlVoltageLimit);
+  printPidHeader("Heading", heading_coeffs, Lim_TU);
+  printPidHeader("Yaw rate", yaw_pid_coeffs, Lim_TU);
+  Serial.print("% Reference limiters KpLV,KpLT,Lim_VL,Lim_VU,Lim_TL,Lim_TU");
+  printLogValue(KpLV); printLogValue(KpLT); printLogValue(Lim_VL);
+  printLogValue(Lim_VU); printLogValue(Lim_TL); printLogValue(Lim_TU);
+  Serial.println();
   if (logTruncated)
     Serial.println("% WARNING: log buffer filled; final samples are missing.");
   // Columns
@@ -468,6 +527,17 @@ void printLog()
   Serial.println("% 39 yaw-rate error (rad/s)");
   Serial.println("% 40 outer-loop forward-velocity command (m/s)");
   Serial.println("% 41 outer-loop yaw-rate command (rad/s)");
+  Serial.println("% 42-43 filtered wheel PI feedback (left,right) (motor rad/s)");
+  Serial.println("% 44-45 AS5X47 wheel velocity (left,right) (m/s, forward-positive)");
+  Serial.println("% 46 desired heading (rad)");
+  Serial.println("% 47 actual heading-controller error (rad)");
+  Serial.println("% 48 limited turn reference before yaw correction (rad/s)");
+  Serial.println("% 49 heading-controller correction (rad/s)");
+  Serial.println("% 50 forward acceleration used by KF predict (m/s^2)");
+  Serial.println("% 51 yaw rate used by KF gyro update (rad/s)");
+  Serial.println("% 52-55 KF innovation (gyro, wheel v, wheel omega, mag)");
+  Serial.println("% 56 KF update mask (same bits as calibration column 4)");
+  Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation");
   Serial.println("% Static gains: no covariance is propagated or logged.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
@@ -515,6 +585,17 @@ void printLog()
     printLogValue(d->yawRateError); // 39
     printLogValue(d->vCommand); // 40
     printLogValue(d->yawRateCommand); // 41
+    for (int k = 0; k < 2; k++) printLogValue(d->controlFeedback[k]); // 42-43
+    for (int k = 0; k < 2; k++) printLogValue(d->as5Vel[k]); // 44-45
+    printLogValue(d->desiredHeading); // 46
+    printLogValue(d->headingError); // 47
+    printLogValue(d->omegaRefLimited); // 48
+    printLogValue(d->headingCorrection); // 49
+    printLogValue(d->kfAccelInput); // 50
+    printLogValue(d->kfGyroInput); // 51
+    for (int k = 0; k < KF_MEAS_COUNT; k++) printLogValue(d->kfInnov[k]); // 52-55
+    Serial.print(" "); Serial.print(d->kfMask); // 56
+    Serial.print(" "); Serial.print(d->diagnosticFlags); // 57
     Serial.println("");
     d++;
   }
@@ -588,6 +669,10 @@ bool start()
   turnLimiter.reset();
   controlVCommand = 0.0f;
   controlOmegaCommand = 0.0f;
+  controlOmegaRefLimited = 0.0f;
+  controlHeadingCorrection = 0.0f;
+  kfForwardAccelInput = 0.0f;
+  kfGyroYawInput = 0.0f;
   desiredYawRate = 0.0f;
   // A run starts with clean motion states and a clean residual accelerometer
   // bias. The stationary startup average (kfAccelBias) is measured at
@@ -839,6 +924,39 @@ void forwardThreeSeconds()
   }
 }
 
+void closedLoopTrajectory()
+{
+  if (state == 0)
+  {
+    bool button = digitalReadFast(PIN_START_BUTTON);
+    if (button or robot.missionStart)
+    {
+      if (!start()) return;
+      state = 10;
+      desiredValue = 0.0f;
+      desiredYawRate = 0.0f;
+      endTime = closedLoopConfig.duration();
+    }
+    return;
+  }
+
+  TrajectoryCommand command = trajectoryCommand(closedLoopConfig, time_sec);
+  if (command.phase == 0)
+  {
+    finished();
+    return;
+  }
+
+  state = command.phase;
+  desiredValue = command.velocity;
+  desiredYawRate = command.yawRate;
+  if (state == 12)
+  {
+    desiredHeading = wrapAngle(desiredHeading +
+                               desiredYawRate * sampleTimeUs * 1e-6f);
+  }
+}
+
 /**
 - Wheel-speed PI on the quadrature encoders.
 - Setpoints are motor-shaft rad/s, forward-positive. The alpha-beta filtered
@@ -874,21 +992,24 @@ void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
  * Week10 reference-limited cascade:
  *   vCmd     = velLimiter(vRef)
  *   omegaRef = turnLimiter(desiredYawRate + heading PID(wrapped heading error))
- *   omegaCmd = omegaRef + yaw-rate PID(omegaRef - estimator.omega)
+ *   omegaCmd = omegaRef + yaw-rate PID(omegaRef - selected yaw feedback)
  * The per-wheel PI is the forward-rate controller, so vCmd stays vRef
- * (after the velocity limiter). headingRef is in rad; vRef and omegaRef in
- * m/s and rad/s. */
+ * (after the velocity limiter). useKfFeedback selects estimator feedback;
+ * when false, heading/yaw errors are zero and only feed-forward remains.
+ * headingRef is in rad; vRef and omegaRef in m/s and rad/s. */
 void trackingControlUpdate(float vRef, float omegaRef, float headingRef)
 {
   desiredValue = vRef;
   desiredYawRate = omegaRef;
 
   const float vCmd = velLimiter.update(vRef);
-  const float headingCorrection =
-      headingPid.ComputeCCDE(wrapAngle(headingRef - estimator.theta));
-  const float omegaRefLimited = turnLimiter.update(omegaRef + headingCorrection);
-  const float omegaCmd =
-      omegaRefLimited + yawRatePid.ComputeCCDE(omegaRefLimited - estimator.omega);
+  const float headingFeedback = useKfFeedback ? estimator.theta : headingRef;
+  controlHeadingCorrection =
+      headingPid.ComputeCCDE(wrapAngle(headingRef - headingFeedback));
+  controlOmegaRefLimited = turnLimiter.update(omegaRef + controlHeadingCorrection);
+  const float omegaFeedback = useKfFeedback ? estimator.omega : controlOmegaRefLimited;
+  const float omegaCmd = controlOmegaRefLimited +
+      yawRatePid.ComputeCCDE(controlOmegaRefLimited - omegaFeedback);
 
   controlVCommand = vCmd;
   controlOmegaCommand = omegaCmd;
@@ -957,7 +1078,8 @@ void wheelOdometryUpdate()
   const uint32_t nowUs = micros();
   // controlFeedback is only refreshed while a wheel-speed loop runs.
   const bool wheelLoopActive =
-      state > 0 or (calState > 0 and calMode == CAL_TRACK);
+      state > 0 or (calState > 0 and
+                    (calMode == CAL_TRACK or calMode == CAL_UPSIDE_DOWN));
   float angleLeft = 0.0f, angleRight = 0.0f;
   if (!readWheelAngle(leftWheelSensor(), angleLeft) or
       !readWheelAngle(rightWheelSensor(), angleRight))
@@ -1084,10 +1206,12 @@ void estimatorUpdate()
   }
   // The startup average removes the bulk of the accelerometer offset; the
   // filter's b_a tracks the residual.
-  estimator.predict(kfAccelCalDone ? aRaw - kfAccelBias : 0.0f, dt);
+  kfForwardAccelInput = kfAccelCalDone ? aRaw - kfAccelBias : 0.0f;
+  estimator.predict(kfForwardAccelInput, dt);
   if (imu2.gyroFresh && imu2.gyroOffsetDone)
   {
-    estimator.updateGyro(imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad);
+    kfGyroYawInput = imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad;
+    estimator.updateGyro(kfGyroYawInput);
     if (estimator.lastInnovationValid[KF_M_GYRO])
       kfUpdateMask |= CAL_KF_GYRO;
   }
@@ -1188,6 +1312,36 @@ void updateLog()
     logs[logsCnt].yawRateError = desiredYawRate - estimator.omega;
     logs[logsCnt].vCommand = controlVCommand;
     logs[logsCnt].yawRateCommand = controlOmegaCommand;
+    for (int k = 0; k < 2; k++)
+    {
+      logs[logsCnt].controlFeedback[k] = controlFeedback[k];
+      logs[logsCnt].as5Vel[k] = as5VelLast[k];
+    }
+    logs[logsCnt].desiredHeading = desiredHeading;
+    logs[logsCnt].headingError = headingPid.lastError();
+    logs[logsCnt].omegaRefLimited = controlOmegaRefLimited;
+    logs[logsCnt].headingCorrection = controlHeadingCorrection;
+    logs[logsCnt].kfAccelInput = kfForwardAccelInput;
+    logs[logsCnt].kfGyroInput = kfGyroYawInput;
+    for (int k = 0; k < KF_MEAS_COUNT; k++)
+      logs[logsCnt].kfInnov[k] = estimator.lastInnovation[k];
+    logs[logsCnt].kfMask = kfUpdateMask;
+    uint16_t diagnosticFlags = 0;
+    if (useKfFeedback) diagnosticFlags |= LOG_KF_FEEDBACK;
+    if (estimator.healthy) diagnosticFlags |= LOG_KF_HEALTHY;
+    if (as5Valid) diagnosticFlags |= LOG_AS5_VALID;
+    if (as5Fresh) diagnosticFlags |= LOG_AS5_FRESH;
+    if (kfUpdateMask & CAL_KF_WHEEL_ENCODER)
+      diagnosticFlags |= LOG_WHEEL_ENCODER_FALLBACK;
+    if (fabsf(computedControl[0]) >= 0.99f * controlVoltageLimit)
+      diagnosticFlags |= LOG_LEFT_SATURATED;
+    if (fabsf(computedControl[1]) >= 0.99f * controlVoltageLimit)
+      diagnosticFlags |= LOG_RIGHT_SATURATED;
+    if (fabsf(headingPid.lastOutput()) >= 0.99f * Lim_TU)
+      diagnosticFlags |= LOG_HEADING_SATURATED;
+    if (fabsf(yawRatePid.lastOutput()) >= 0.99f * Lim_TU)
+      diagnosticFlags |= LOG_YAW_RATE_SATURATED;
+    logs[logsCnt].diagnosticFlags = diagnosticFlags;
 
     logsCnt++;
   }
@@ -1204,6 +1358,12 @@ const float calTrackDuration[] = {
 };
 const int calTrackSteps = sizeof(calTrackSpeed) / sizeof(calTrackSpeed[0]);
 
+const float calUpsideDuration[] = {0.5f, 2.5f, 2.5f, 0.5f};
+const int calUpsideSteps = sizeof(calUpsideDuration) / sizeof(calUpsideDuration[0]);
+const float calUpsideSpeed = 0.20f;
+const float calUpsideYawRate = 30.0f * PI / 180.0f;
+const float calNoiseSettleTime = 0.5f;
+
 const char * calModeName(CalMode mode)
 {
   switch (mode)
@@ -1211,6 +1371,7 @@ const char * calModeName(CalMode mode)
     case CAL_MAG: return "mag";
     case CAL_NOISE: return "noise";
     case CAL_TRACK: return "track";
+    case CAL_UPSIDE_DOWN: return "upside";
     default: return "none";
   }
 }
@@ -1256,11 +1417,15 @@ bool calStart(CalMode mode)
   motor.tick();
   resetWheelControl();
 
-  if (mode == CAL_TRACK)
+  if (mode == CAL_TRACK or mode == CAL_UPSIDE_DOWN)
   {
     calState = 0;
     calArmed = true;
-    usb.send("% cal track armed: clear the floor, then press start\r\n");
+    calPhase = 0;
+    if (mode == CAL_TRACK)
+      usb.send("% cal track armed: clear the floor, then press start\r\n");
+    else
+      usb.send("% cal upside armed: secure the robot upside down with wheels clear, then press start\r\n");
     return true;
   }
   calArmed = false;
@@ -1273,35 +1438,42 @@ bool calStart(CalMode mode)
   return true;
 }
 
-void calBeginTrack()
+void calBeginMotion()
 {
   calArmed = false;
   calState = 1;
-  calMode = CAL_TRACK;
   calCnt = 0;
   calTickCnt = 0;
   calDivider = 2;
   calStartUs = micros();
   calTrackIndex = 0;
-  calTrackStepEnd = time_sec + calTrackDuration[0];
+  calPhase = 10;
+  const float *durations = calMode == CAL_UPSIDE_DOWN ? calUpsideDuration : calTrackDuration;
+  const int steps = calMode == CAL_UPSIDE_DOWN ? calUpsideSteps : calTrackSteps;
+  calTrackStepEnd = time_sec + durations[0];
   motor.setPWMfrq(80000);
   float total = 0.0f;
-  for (int i = 0; i < calTrackSteps; i++)
-    total += calTrackDuration[i];
+  for (int i = 0; i < steps; i++)
+    total += durations[i];
   calEndTime = time_sec + total;
   resetWheelControl();
-  usb.send("% cal track started\r\n");
+  if (calMode == CAL_UPSIDE_DOWN)
+    usb.send("% cal upside started; motors stop automatically after 6 s\r\n");
+  else
+    usb.send("% cal track started\r\n");
 }
 
 void calFinish()
 {
+  if (calState == 0)
+    return;
   calState = 0;
   calArmed = false;
   motor.motorVoltage[0] = 0.0f;
   motor.motorVoltage[1] = 0.0f;
   motor.tick();
   resetWheelControl();
-  calPending = true;
+  calPending = calCnt > 0;
 }
 
 void calStop()
@@ -1322,6 +1494,52 @@ void calStop()
     usb.send("% cal stopped\r\n");
 }
 
+void calUpsideStep()
+{
+  if (calState == 0 or calMode != CAL_UPSIDE_DOWN)
+    return;
+  if (time_sec >= calTrackStepEnd)
+  {
+    calTrackIndex++;
+    if (calTrackIndex >= calUpsideSteps)
+    {
+      calFinish();
+      return;
+    }
+    calTrackStepEnd += calUpsideDuration[calTrackIndex];
+  }
+
+  calPhase = calTrackIndex == calUpsideSteps - 1 ? 2 : 10 + calTrackIndex;
+  float vRef = 0.0f;
+  float omegaRef = 0.0f;
+  if (calTrackIndex == 1)
+    vRef = calUpsideSpeed;
+  else if (calTrackIndex == 2)
+    omegaRef = calUpsideYawRate;
+
+  WheelSpeeds ws = polar2Cartesian(vRef, omegaRef);
+  const float mpsToMotorRadSec = gear / wheelRadius;
+  wheelSpeedControl(ws.left * mpsToMotorRadSec, ws.right * mpsToMotorRadSec);
+}
+
+void upsideDownCalibrationSequence()
+{
+  if (calState > 0)
+  {
+    if (calMode == CAL_UPSIDE_DOWN)
+      calUpsideStep();
+    return;
+  }
+  if (calArmed or calPending)
+    return;
+  if (!digitalReadFast(PIN_START_BUTTON) and !robot.missionStart)
+    return;
+  if (!calStart(CAL_UPSIDE_DOWN))
+    return;
+  calBeginMotion();
+  calUpsideStep();
+}
+
 void calTick()
 {
   if (calMode == CAL_TRACK)
@@ -1336,11 +1554,17 @@ void calTick()
       }
       calTrackStepEnd += calTrackDuration[calTrackIndex];
     }
+    calPhase = 10 + calTrackIndex;
     float motorSp = calTrackSpeed[calTrackIndex] * (gear / wheelRadius);
     wheelSpeedControl(motorSp, motorSp);
   }
+  else if (calMode == CAL_UPSIDE_DOWN)
+  {
+    calUpsideStep();
+  }
   else
   {
+    calPhase = 0;
     // Sensor-only experiments keep the motors off.
     motor.motorVoltage[0] = 0.0f;
     motor.motorVoltage[1] = 0.0f;
@@ -1374,7 +1598,7 @@ void updateCalLog()
   if (estimator.healthy) flags |= CAL_KF_HEALTHY;
   d.flags = flags;
   d.kfMask = kfUpdateMask;
-  d.pad = 0;
+  d.phase = calPhase;
 
   for (int k = 0; k < 2; k++)
   {
@@ -1429,10 +1653,33 @@ void printCalLog()
   Serial.print(" each sized ");
   Serial.print(sizeof(CalData));
   Serial.println(" bytes");
+  Serial.print("% Sample time "); Serial.print(sampleTimeUs);
+  Serial.print(" us, log divider "); Serial.print(calDivider);
+  Serial.print(", gear "); Serial.print(gear, 7);
+  Serial.print(", wheel radius "); Serial.print(wheelRadius, 7);
+  Serial.print(" m, wheel base "); Serial.print(wheelBase, 7); Serial.println(" m");
+  Serial.print("% Wheel PI L b0,b1,b2,a1,a2 ");
+  printLogValue(left_wheel_coeffs.b0); printLogValue(left_wheel_coeffs.b1);
+  printLogValue(left_wheel_coeffs.b2); printLogValue(left_wheel_coeffs.a1);
+  printLogValue(left_wheel_coeffs.a2); Serial.println();
+  Serial.print("% Wheel PI R b0,b1,b2,a1,a2 ");
+  printLogValue(right_wheel_coeffs.b0); printLogValue(right_wheel_coeffs.b1);
+  printLogValue(right_wheel_coeffs.b2); printLogValue(right_wheel_coeffs.a1);
+  printLogValue(right_wheel_coeffs.a2); Serial.println();
+  Serial.print("% Wheel voltage limit "); Serial.print(controlVoltageLimit, 6);
+  Serial.println(" V");
+  if (calMode == CAL_UPSIDE_DOWN)
+  {
+    Serial.print("% Upside schedule: 0.5 s zero, 2.5 s at ");
+    Serial.print(calUpsideSpeed, 6); Serial.print(" m/s, 2.5 s at ");
+    Serial.print(calUpsideYawRate, 9); Serial.println(" rad/s differential, 0.5 s zero");
+    Serial.print("% Noise analysis excludes "); Serial.print(calNoiseSettleTime, 3);
+    Serial.println(" s after each transition; phases 10 baseline, 11 forward, 12 turn, 2 settling");
+  }
   if (calTruncated)
     Serial.println("% WARNING: cal buffer filled; final samples are missing.");
   Serial.println("% 1 time (s)");
-  Serial.println("% 2 mode (1 mag, 2 noise, 3 track)");
+  Serial.println("% 2 mode (1 mag, 2 noise, 3 track, 4 upside)");
   Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy)");
   Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bit3 mag, bit4 mag rejected, bit5 wheel v/omega from encoder fallback)");
   Serial.println("% 5-6 setpoint (left,right) (motor rad/s)");
@@ -1450,6 +1697,7 @@ void printCalLog()
   Serial.println("% 31-32 estimator b_a, b_g (m/s^2, rad/s)");
   Serial.println("% 33-36 estimator innovation y (gyro, wheel v, wheel omega, mag)");
   Serial.println("% 37-40 innovation variance S (0: static gains do not propagate P)");
+  Serial.println("% 41 sequence phase (10 baseline, 11 forward, 12 turn, 2 settling; track uses 10 + step index)");
 
   for (int i = 0; i < calCnt; i++)
   {
@@ -1478,6 +1726,7 @@ void printCalLog()
       printLogValue(d.kfInnov[i2]);
     for (int i2 = 0; i2 < KF_MEAS_COUNT; i2++)
       printLogValue(d.kfInnovVar[i2]);
+    Serial.print(" "); Serial.print(d.phase);
     Serial.println("");
   }
   Serial.print("% sent ");
@@ -1498,6 +1747,8 @@ bool decodeExperiment(const char *buf)
     calStart(CAL_NOISE);
   else if (strncmp(p, "track", 5) == 0)
     calStart(CAL_TRACK);
+  else if (strncmp(p, "upside", 6) == 0)
+    calStart(CAL_UPSIDE_DOWN);
   else if (strncmp(p, "stop", 4) == 0)
     calStop();
   else if (strncmp(p, "log", 3) == 0)
@@ -1505,7 +1756,7 @@ bool decodeExperiment(const char *buf)
   else if (strncmp(p, "retrymag", 8) == 0)
     imu2.retryMag();
   else
-    usb.send("% cal commands: mag | noise | track | stop | log | retrymag\r\n");
+    usb.send("% cal commands: mag | noise | track | upside | stop | log | retrymag\r\n");
   return true;
 }
 
@@ -1552,12 +1803,13 @@ void loop ( void )
       else if (calArmed and
                (digitalReadFast(PIN_START_BUTTON) or robot.missionStart))
       {
-        calBeginTrack();
+        calBeginMotion();
         calTick();
       }
       else
       {
-        sequenceTwoSteps();
+        upsideDownCalibrationSequence();
+        //sequenceTwoSteps();
         //yawRateStep();
         //forwardThreeSeconds();
         if (state > 0)

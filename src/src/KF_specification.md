@@ -2,8 +2,8 @@
 
 Constant-gain, decoupled estimator for the planar differential-drive robot
 (`kalman.h` / `kalman.cpp`). The filter runs at 1 kHz. All quantities are SI:
-metres, seconds, radians. A reusable incremental PID (`pid.h`) closes the
-outer forward-velocity and yaw-rate loops around the estimator.
+metres, seconds, radians. Reusable incremental controllers (`pid.h`) provide
+heading/yaw-rate feedback around the estimator and inner wheel-speed PI control.
 
 The older 7-state covariance-propagating filter and `week08/DARE.m` are
 deprecated. They remain in git history and in `src/references/main.py` as
@@ -132,56 +132,70 @@ poseHeading = wrapAngle(theta - theta_at_start)
 
 ---
 
-## 6. Outer control loops
+## 6. Outer control loops and diagnostic trajectory
 
-`src/src/basebot_6.ino` runs a cascade every 1 ms:
+`src/src/basebot_6.ino` runs the current week10 control path every 1 ms:
 
 ```
-vError     = vRef - estimator.v
-omegaError = omegaRef - estimator.omega
-
-vCmd     = vRef     + velocityPid.ComputeCCDE(vError)
-omegaCmd = omegaRef + yawRatePid.ComputeCCDE(omegaError)
-
-left,right = polar2Cartesian(vCmd, omegaCmd) * (gear / wheelRadius)
+vCmd             = velLimiter(vRef)
+headingCorrection = headingPid(wrap(headingRef - headingFeedback))
+omegaRefLimited  = turnLimiter(omegaRef + headingCorrection)
+omegaCmd         = omegaRefLimited
+                   + yawRatePid(omegaRefLimited - omegaFeedback)
+left,right       = polar2Cartesian(vCmd, omegaCmd) * (gear / wheelRadius)
 ```
 
-The inner wheel-speed PI on the quadrature encoders receives motor-shaft
-rad/s. The outer PID outputs are clamped to ±0.30 m/s and ±2.00 rad/s. The
-incremental form clamps before storing `u[k]`, so it does not wind up.
+With `useKfFeedback = true`, heading and yaw feedback come from the estimator.
+Setting it to `false` makes those feedback errors zero, leaving reference-limited
+feed-forward plus the inner encoder wheel-speed PIs. Estimation and logging
+continue in both modes. There is no outer forward-velocity PID in this control
+architecture. The wheel, heading, and yaw coefficients and all limiter values
+are printed in the format-3 log header.
 
-The outer coefficients are placeholders in `basebot_6.ino`:
+The main loop currently selects `upsideDownCalibrationSequence()`, which waits
+for start, initializes a 500 Hz calibration capture, runs the six-second
+wheels-off-the-ground schedule, stops once, and transfers one `% CAL upside`
+capture. `cal upside` over USB arms the same experiment.
 
-```cpp
-vel_pid_coeffs = { 0.50f, -0.49f, 0.0f, -1.0f, 0.0f };
-yaw_pid_coeffs = { 0.40f, -0.39f, 0.0f, -1.0f, 0.0f };
-```
-
-They are defined in one block specifically so they can be replaced after
-tuning without touching the control path.
+To run the upright diagnostic trajectory, comment that call and uncomment
+`closedLoopTrajectory()`. It uses the host-testable helper in `trajectory.h`:
+0.2 s baseline, 4 s at 0.20 m/s, 3 s at +30 degrees/s with zero forward
+reference, and 0.4 s settling. The heading reference advances with the turn
+command and the run produces one format-3 capture at 250 Hz. Older experiments
+remain available by selecting their sequence call in `loop()`.
 
 ---
 
-## 7. Log format 2
+## 7. Log format 3 and calibration captures
 
-The standard serial log no longer contains a covariance. The estimator
-columns are:
+The standard serial log contains no covariance. Columns 1-41 retain their
+format-2 meanings, including estimator state, references, wheel setpoints,
+reference-versus-estimate errors, and outer-loop commands. Format 3 appends:
 
 | Columns | Content |
 |---------|---------|
-| 27-28 | estimator `v`, `omega` |
-| 29 | magnetometer heading |
-| 30-31 | wheel controller setpoint (left, right) |
-| 32 | yaw-rate reference |
-| 33-37 | estimator state `[v, omega, theta, b_a, b_g]` |
-| 38 | forward-velocity error |
-| 39 | yaw-rate error |
-| 40 | outer-loop forward-velocity command |
-| 41 | outer-loop yaw-rate command |
+| 42-43 | filtered wheel-PI feedback (motor rad/s) |
+| 44-45 | independent AS5X47 wheel velocity (m/s) |
+| 46-49 | desired heading, actual heading error, limited turn reference, heading correction |
+| 50-51 | acceleration and gyro inputs used by the estimator |
+| 52-55 | innovations (gyro, wheel v, wheel omega, mag) |
+| 56 | KF update mask |
+| 57 | KF/AS5X47/fallback/controller-saturation flags |
 
-The calibration capture keeps four innovation slots (gyro, wheel v, wheel
-omega, mag). Its innovation-variance columns are zero because the stationary
-filter does not propagate `S`; the analyzer skips NIS for these captures.
+The 7.6 s default trajectory is captured at 250 Hz. The header records geometry,
+controller coefficients, limiter parameters, trajectory settings, and the KF
+feedback mode. The serial header in `printLog()` is the authoritative column
+reference.
+
+Calibration captures preserve their first 40 columns and append sequence phase
+as column 41. In addition to `mag`, `noise`, and `track`, `cal upside` runs a
+separately armed 6 s motor-on sequence: 0.5 s zero, 2.5 s at 0.20 m/s wheel
+equivalent, 2.5 s at +30 degrees/s differential wheel equivalent, and 0.5 s
+zero. It uses the wheel PIs only, stops automatically, and records raw sensors
+and estimator behavior while the robot is secured upside down. Noise data is
+for later gain retuning; fixed-gain firmware has no runtime `R` to update and
+does not propagate innovation variance `S`. New-format analysis is deferred
+until hardware captures are available.
 
 ---
 
@@ -191,9 +205,11 @@ filter does not propagate `S`; the analyzer skips NIS for these captures.
 # Firmware
 cd src && pio run -e teensy41
 
-# Estimator and PID host checks
+# Estimator, trajectory, and PID host checks
 c++ -std=c++14 -O2 -Isrc/src tests/kalman_host/check.cpp src/src/kalman.cpp \
     -o /tmp/kalman-check && /tmp/kalman-check
+c++ -std=c++14 -O2 -Isrc/src tests/motion_host/trajectory_check.cpp \
+    -o /tmp/trajectory-check && /tmp/trajectory-check
 c++ -std=c++14 -O2 -Isrc/src tests/motion_host/controller_check.cpp \
     -o /tmp/controller-check && /tmp/controller-check
 
