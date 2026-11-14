@@ -61,39 +61,39 @@ The Teensy has USB vendor/product ID `16C0:0483`.
 
 For diagnostics, `log` plus Enter requests the samples already held in RAM;
 it does not start the motors. Even with no samples, the robot prints a header
-and `% sent 0 log lines`. The current firmware prints `% log format 3` and does
-not log a covariance. Columns 1-41 retain their format-2 meanings: columns
+and `% sent 0 log lines`. The current firmware prints `% log format 4` and does
+not log a covariance. Columns 1-41 keep their format-2 positions; the estimator
+and innovation meanings changed: columns
 27-28 are estimated linear/angular velocity, column 29 is magnetometer heading,
 columns 30-31 are wheel-speed setpoints, column 32 is yaw-rate reference,
-columns 33-37 are `[v, omega, theta, b_a, b_g]`, columns 38-39 are
-reference-versus-estimate errors, and columns 40-41 are outer-loop commands.
+columns 33-37 are `[v, omega, dead-reckoned theta, b_a, 0]`, columns 38-39 are
+the actual control errors (`vCmd - v` and the yaw-rate PID error), and columns
+40-41 are outer-loop commands.
 
-Format 3 appends filtered wheel-PI feedback (42-43), independent AS5X47 wheel
+Format 4 appends filtered wheel-PI feedback (42-43), independent AS5X47 wheel
 velocities (44-45), desired heading and actual heading-controller error
 (46-47), limited turn reference and heading correction (48-49), estimator
-acceleration/gyro inputs (50-51), four innovations (52-55), the KF update mask
-(56), and diagnostic flags (57). The flags record KF feedback/health, AS5X47
+acceleration/gyro inputs (50-51), three innovations plus a reserved slot
+(52-55), the KF update mask (56), and diagnostic flags (57). The flags record KF feedback/health, AS5X47
 status, encoder fallback, and wheel/heading/yaw-controller saturation. The
 header also records the controller coefficients, reference limiters, trajectory
 parameters, geometry, log divider, and whether KF feedback was enabled.
 
-The main loop currently selects `upsideDownCalibrationSequence()`. Keep the
-monitor open, secure the robot upside down with the wheels clear, and press start
-once. The firmware initializes a 500 Hz calibration capture, runs the six-second
-schedule below, stops the motors, and sends one `% CAL upside` capture. It does
-not emit the standard format-3 header.
-
-To capture the upright driving run instead, comment
-`upsideDownCalibrationSequence()` in `loop()` and uncomment
-`closedLoopTrajectory()`. That sequence has a 0.2 s stationary baseline,
-commands 0.20 m/s forward for 4.0 s, then +30 degrees/s (CCW) for 3.0 s with
-zero forward reference, followed by 0.4 s settling. The heading reference
+The main loop currently selects `closedLoopTrajectory()`. Place the robot
+upright with clear floor space, keep the monitor open, and press start once.
+The 7.6 s run has a 0.2 s stationary baseline, 4.0 s at 0.20 m/s forward,
+3.0 s at +30 degrees/s (CCW), and 0.4 s settling. The heading reference
 advances during the turn so the heading controller does not oppose it. The
-complete 7.6 s run is logged at 250 Hz (`logDivider = 4`) as one format-3
-capture. The 216-byte rows fit the shared 495 kB buffer with margin; a
-compile-time check requires 8 s of coverage. Older experiments remain available
-by commenting the selected call and uncommenting `sequenceTwoSteps()`,
-`yawRateStep()`, or `forwardThreeSeconds()`.
+complete run is logged at 250 Hz (`logDivider = 4`) as one format-4 capture.
+The 216-byte rows fit the shared 495 kB buffer with margin; a compile-time
+check requires 8 s of coverage.
+
+To run the wheels-off calibration instead, comment `closedLoopTrajectory()` in
+`loop()` and uncomment `upsideDownCalibrationSequence()`. That sequence runs
+the six-second schedule below and sends one `% CAL upside` capture instead of
+the standard format-4 header. Older experiments remain available by commenting
+the selected call and uncommenting `sequenceTwoSteps()`, `yawRateStep()`, or
+`forwardThreeSeconds()`.
 The firmware applies zero PWM before printing the completed log. It waits
 for a connected USB serial monitor before automatically sending a completed
 capture, so opening the monitor after the run can still retrieve the output.
@@ -108,21 +108,29 @@ sequence exceeds capacity, its log includes a warning about missing samples.
 
 The pose and velocity columns come from the stationary decoupled estimator in
 `src/src/kalman.h` and `kalman.cpp`. It runs at 1 kHz with state
-`[v, b_a, theta, omega, b_g]`: forward acceleration drives `v`, wheel `v`
-corrects `[v, b_a]`, and gyro / wheel `omega` / gated magnetometer heading
-correct `[theta, omega, b_g]`. The gains are constant; no covariance is
-propagated. Distance, `x`, and `y` are dead-reckoned outside the filter from
-`v` and `theta`, so wheel slip cannot inject an absolute pose error. The stock
-48-edge quadrature encoders still feed only the inner wheel-speed PI.
-Columns 11-14 report pose, columns 27-28 linear and angular velocity, column 29
-the magnetometer heading (`NaN` until a valid fix), and columns 33-37 the
-estimator state.
+`[v, omega, b_a]`: forward acceleration drives `v`, wheel `v` corrects
+`[v, b_a]`, and the gyro / wheel `omega` correct `omega`. Heading `theta` and
+distance `x`, `y`, `s` are dead-reckoned outside the filter from `v` and
+`omega` with the trapezoidal rule. The gains are constant; no covariance is
+propagated. The stock 48-edge quadrature encoders feed both the filter and the
+inner wheel-speed PI. Columns 11-14 report pose, columns 27-28 linear and
+angular velocity, column 29 the raw magnetometer heading (diagnostic only,
+`NaN` when unavailable), and columns 33-37 `[v, omega, theta, b_a, 0]`.
 
-The IMU driver enables the AK8963; `magc` runs a hard-iron calibration (rotate
-the robot 360 degrees by hand for 8 seconds), and `mag 0` / `mag 1` disable or
-enable the magnetometer heading. Mag offsets are RAM-only and printed after
-calibration; reboot after calibrating so the estimator starts from the
-calibrated heading.
+The IMU driver brings up the AK8963 behind the MPU-9250's bypass path. The
+whole IMU bus runs at 400 kHz, the MPU-9250 and AK8963 limit; the old 1 MHz
+setting is gone. The driver reads ST1 (0x02) explicitly before each 7-byte
+field read, because the library's `magUpdate()` starts at HXL (0x03), and it
+retries a data-ready sample instead of latching the sensor off after one
+missed sample. `cal retrymag` prints the MPU and AK WHO_AM_I, CNTL1, BYPASS_EN,
+I2C-master state, ST1/ST2, ASA values, offsets and raw counts; `cal mag` prints
+the same probe before its 15 s capture. `who=0x48` is a responding AK8963;
+`mpu=0x70` is an MPU-6500 with no magnetometer. `magc` runs a hard-iron
+calibration (rotate the robot 360 degrees by hand for 8 seconds), and `mag 0` /
+`mag 1` disable or enable the diagnostic heading. The estimator does not use
+the magnetometer: it is broken/unresponsive on the current hardware, and the
+heading is dead-reckoned from the gyro. Mag offsets are RAM-only and printed
+after calibration.
 
 The control path uses reference limiters for forward speed and turn rate, a
 heading lead-lag controller, yaw-rate PI, and the per-wheel encoder PI. The
@@ -136,9 +144,10 @@ the selected mode is printed in each log header.
 
 ## Calibration experiments
 
-Three USB-triggered experiments share a compact raw capture and the same
-495 kB buffer. A standard run and a calibration capture are mutually
-exclusive: starting one discards an unread capture from the other.
+Four USB-triggered experiments share a compact raw capture and the same
+495 kB buffer, plus an unbuffered stream. A standard run and a calibration
+capture are mutually exclusive: starting one discards an unread capture from
+the other.
 
 | Command | Motors | Capture | Procedure |
 | --- | --- | --- | --- |
@@ -146,9 +155,10 @@ exclusive: starting one discards an unread capture from the other.
 | `cal noise` | off | 1 kHz, 3 s | Hold the robot still. |
 | `cal track` | PI | 500 Hz, 6 s | Clear the floor, then press the start button (or send `start`). |
 | `cal upside` | wheel PI | 500 Hz, 6 s | Secure the robot upside down with wheels clear, then press start. |
+| `cal stream [Hz]` | off | 50-500 Hz, 20 min | Keep the robot still; end with `cal stop`. No RAM buffer. |
 | `cal stop` | off | - | Stop now and keep the samples captured so far. |
 | `cal log` | off | - | Re-send a completed calibration capture. |
-| `cal retrymag` | off | - | Re-run AK8963 bring-up and print WHO_AM_I, ST1, ST2 and raw values. |
+| `cal retrymag` | off | - | Probe the AK8963 and print WHO_AM_I, bypass, CNTL1, ST1/ST2 and raw values. |
 
 `cal mag` and `cal noise` start immediately and print their instructions.
 `cal track` and `cal upside` arm first. `cal track` runs the step schedule
@@ -157,6 +167,13 @@ exclusive: starting one discards an unread capture from the other.
 completed capture automatically when the monitor is connected; `cal log`
 repeats it while the robot stays powered.
 
+`cal stream` is unbuffered: it prints one row per divider at 50-500 Hz for up
+to 20 minutes and stops with `cal stop`, or automatically when a run or a
+buffered capture starts. Use it for the 10-minute stationary logs that the
+Allan analysis needs. Keep the monitor open and the robot still; if the host
+stops draining USB, the print can stall the 1 kHz control loop, so do not
+drive while streaming.
+
 `upsideDownCalibrationSequence()` starts with 0.5 s at zero reference, then
 spins both wheels at the equivalent of 0.20 m/s for 2.5 s, applies differential
 wheel speeds corresponding to +30 degrees/s for 2.5 s, and finishes with 0.5 s
@@ -164,27 +181,32 @@ at zero before forcing the motors off. It uses only the inner encoder PI for
 actuation while the estimator and raw-sensor logging continue. This supports
 motor-on noise and wheel-loop diagnostics without chassis motion; wheel-derived
 motion is not chassis ground truth in this configuration. The wheels rotate
-without the body turning, so the estimator learns the disagreement as `b_g`.
-Treat that state as an experiment artifact, not as a calibration result. When
+without the body turning, so the wheel-omega measurement disagrees with the
+gyro. The estimator has no `b_g` state; treat that disagreement as an
+experiment artifact, not as a calibration result. When
 selected in `loop()`, this function waits for the start button and initializes
 the capture itself. The USB command `cal upside` arms the same schedule for a
 start-button press. Do not call the low-level phase stepper directly from
 `loop()`; doing so bypasses initialization and completion handling.
 
-The calibration and driving procedures are separate. Save the completed upside
-capture before starting another experiment because all captures share one RAM
-buffer. Then select `closedLoopTrajectory()` in `loop()`, place the robot upright
-with clear floor space, rebuild/upload, and press start. For a feed-forward
+The calibration and driving procedures are separate. A standard ground run and
+a calibration capture share one RAM buffer, so save the completed capture
+before starting the other. `closedLoopTrajectory()` is selected by default;
+for the wheels-off calibration, comment it and uncomment
+`upsideDownCalibrationSequence()`, then rebuild/upload. For a feed-forward
 comparison, set `useKfFeedback = false` and repeat the upright trajectory.
 
-The capture header is `% CAL <mode>` followed by 40 original columns plus
-column 41, the sequence phase: time, mode,
+The capture header is `% CAL <mode>` followed by 40 original columns, column
+41 sequence phase, and columns 42-45: AK8963 status (low byte ST1, high byte
+ST2), IMU sample interval (us), and the low 16 bits of the encoder counts.
+The original columns are time, mode,
 sensor-fresh flags, estimator-update mask, setpoints, PI feedback, motor
 voltage and encoder velocity, raw gyro/accel/mag, AS5X47 angle and velocity,
-wheel window, mag heading, estimator `v/omega/theta/b_a/b_g`, and the last
+wheel window, mag heading, estimator `v/omega/theta/b_a/reserved`, and the last
 innovation `y` plus a zero variance column for the gyro, wheel-v, wheel-omega
-and mag updates. `gyro` is deg/s, `acc` is g, and `mag` is in the library's
-adjusted counts (0.15 uT/LSB). For upside captures, phase 10 is the baseline,
+and reserved slots. `gyro` is deg/s, `acc` is g, and `mag` is in the library's
+adjusted counts (0.15 uT/LSB). The mag columns and flags 8-10 (attempt, DRDY,
+overflow) are diagnostic only; the estimator does not consume them. For upside captures, phase 10 is the baseline,
 11 is forward wheel motion, 12 is differential turning, and 2 is final settling.
 The zero variance columns are intentional: the stationary filter does not
 propagate `S`. Noise captures provide measurements for later gain retuning;
@@ -213,10 +235,25 @@ while the robot is upside down, so the report keeps those quantities separate.
 Pass `--outdir DIR` to save PNGs instead of opening windows, or `--no-plots`
 for the table only.
 
-If column 29 of a standard log is `NaN` throughout, run `cal retrymag` and
-check the printed ST1/ST2 values. `cal mag` also reports whether the
-magnetometer was available, so an axis check is not confused with a missing
-sensor.
+A long `cal stream` capture is analyzed with:
+
+```sh
+python3 src/scripts/analyze_stream.py
+python3 src/scripts/analyze_stream.py src/logs/device-monitor-YYMMDD-HHMMSS.log
+```
+
+It reports the actual sample rate, per-axis noise, the mag attempt/DRDY/
+overflow counts, and the overlapping Allan deviation for gyro yaw and accel
+forward. The white-noise density (`q`) and the ADEV minimum are the seeds for
+`q_ba` in the DARE; the per-sample sigma is the measurement-noise input.
+Pass `--outdir DIR` to save the Allan plot or `--no-plots` for the table only.
+The stream is stationary data; do not use it while driving.
+
+If column 29 of a standard log is `NaN` throughout, run `cal retrymag`. A
+`who=0x48` answer means the AK8963 is responding; `who=0x00` with `mpu=0x71`
+points at the bypass path or PCB, while `mpu=0x70` is an MPU-6500 without a
+magnetometer. `cal mag` prints the same probe before its capture, so an axis
+check is not confused with a missing sensor.
 
 For manual builds and uploads, use PlatformIO:
 

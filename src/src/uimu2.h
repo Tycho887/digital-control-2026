@@ -84,14 +84,45 @@ public:
   float magHeading = 0.0f;
   uint32_t magTimestampUs = 0;
   /**
+   * Latest AK8963 status bytes. ST1 carries DRDY (bit 0) and HOFL (bit 3);
+   * ST2 carries HOFL (bit 3). They hold the last attempt; use magAttempt to
+   * tell whether they are fresh. */
+  uint8_t magSt1 = 0, magSt2 = 0;
+  /**
+   * True when a magnetometer read was attempted on this tick. */
+  bool magAttempt = false;
+  /**
+   * ASA factory adjustment values read from the AK8963 FUSE ROM. */
+  uint8_t magAsa[3] = {128, 128, 128};
+  /**
+   * Cached probe results for the log header: MPU/AK identity and bypass
+   * state. Set by magProbe(). */
+  uint8_t mpuWho = 0, akWho = 0, magCntl1 = 0, magIntCfg = 0,
+          magUserCtrl = 0;
+  /**
+   * Hard-iron offsets currently applied by the driver, in adjusted counts. */
+  int16_t magOffset[3] = {0, 0, 0};
+  /**
+   * MPU temperature, sampled at 1 Hz. */
+  float temperatureC = 0.0f;
+  bool temperatureValid = false;
+  /**
+   * Measured interval between IMU ticks, microseconds. */
+  uint32_t lastSampleTimeUs() const { return (uint32_t)sampleTimeus; }
+  /**
    * Use magnetometer for heading (command: mag 0/1) */
   bool useMag = true;
   /**
    * Start magnetometer offset calibration */
   void startMagCalibration();
   /**
+   * Probe the AK8963 bypass path and print MPU/AK identity, bypass state,
+   * CNTL1, ST1/ST2, ASA values and the raw field. Returns true when the
+   * AK8963 WHO_AM_I is 0x48. */
+  bool magProbe();
+  /**
    * Re-run AK8963 bring-up and report WHO_AM_I, ST1 and ST2.
-   * Returns true when a data-ready, non-overflow sample was read. */
+   * Returns true when the AK8963 is present. */
   bool retryMag();
 
 public:
@@ -122,6 +153,13 @@ private:
   /**
    * interface object for IMU */
   MPU9250_asukiaaa mpu{ADDRESS_MPU};
+  /**
+   * Read n bytes from an I2C register with a repeated start. */
+  bool readReg(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n);
+  /**
+   * Read the MPU temperature register (0x41) and update temperatureC. */
+  void readTemperature();
+  uint32_t lastTemperatureUs = 0;
   /// last read time (in us) from IMU
   uint32_t lastRead = 0;
   /// configured MPU I2C clock (AK8963 is limited to 400 kHz)

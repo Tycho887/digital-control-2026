@@ -56,10 +56,9 @@ const float wheelBase = 0.14;
 float distA = 0; // trip distance
 float pose[4];
 float poseVel[2];
-// Stationary estimator state
+// Filter state
 // IMU mounting: X down (vertical), Y right, Z backwards. A mounting change
-// must update these axis/sign choices together with the magnetometer mapping
-// in uimu2.cpp.
+// must update these axis/sign choices.
 const int imuForwardAxis = 2;             // forward = -IMU Z
 const float imuForwardAccelSign = -1.0f;
 const int imuYawAxis = 0;                  // CCW yaw = -IMU X
@@ -69,12 +68,11 @@ const float gyroToRad = PI / 180.0f;
 float kfAccelBias = 0.0f;
 uint32_t kfAccelCalCnt = 0;
 bool kfAccelCalDone = false;
-bool kfHeadingInit = false;
+float poseHeading = 0.0f;      // dead-reckoned heading, not a filter state
 float poseStartTheta = 0.0f;   // heading at start(), for run-relative pose
 float posePrevV = 0.0f;        // previous v for trapezoidal dead reckoning
-float posePrevThetaAbs = 0.0f; // previous absolute heading
+float posePrevOmega = 0.0f;    // previous omega for trapezoidal heading
 uint32_t kfLastUs = 0;
-uint32_t magLastUs = 0; // last magnetometer update consumed by the estimator
 // Outer-loop commands from the last control tick, for logging.
 float controlVCommand = 0.0f;     // m/s
 float controlOmegaCommand = 0.0f; // rad/s
@@ -150,9 +148,9 @@ typedef struct
   float encoderDelay[2];
   float controlSignal[2]; // Computed PID control signals (left, right)
   float controlSetpoint[2]; // Wheel-speed reference (left, right) (motor rad/s)
-  float kfState[5];       // [v, omega, theta, b_a, b_g]
-  float vError;           // vRef - KF v (m/s)
-  float yawRateError;     // omegaRef - KF omega (rad/s)
+  float kfState[5];       // [v, omega, dead-reckoned heading, b_a, reserved]
+  float vError;           // controlVCommand - KF v (m/s)
+  float yawRateError;     // yaw-rate PID error (rad/s)
   float vCommand;         // outer-loop v command (m/s)
   float yawRateCommand;   // outer-loop yaw-rate command (rad/s)
   float controlFeedback[2]; // filtered PI feedback (motor rad/s)
@@ -191,6 +189,9 @@ enum CalFlag : uint16_t
   CAL_AS5_VALID = 1 << 5,
   CAL_AS5_FRESH = 1 << 6,
   CAL_KF_HEALTHY = 1 << 7,
+  CAL_MAG_ATTEMPT = 1 << 8,
+  CAL_MAG_DRDY = 1 << 9,
+  CAL_MAG_OVERFLOW = 1 << 10,
 };
 
 enum KfUpdateFlag : uint16_t
@@ -198,8 +199,8 @@ enum KfUpdateFlag : uint16_t
   CAL_KF_GYRO = 1 << 0,
   CAL_KF_WHEEL_V = 1 << 1,
   CAL_KF_WHEEL_OMEGA = 1 << 2,
-  CAL_KF_MAG = 1 << 3,
-  CAL_KF_MAG_REJECTED = 1 << 4,
+  CAL_KF_RESERVED3 = 1 << 3,
+  CAL_KF_RESERVED4 = 1 << 4,
   CAL_KF_WHEEL_ENCODER = 1 << 5,
 };
 
@@ -236,11 +237,14 @@ typedef struct
   float magHeading;        // rad, NaN if unavailable
   float kfV;
   float kfOmega;
-  float kfTheta;
+  float kfTheta;   // dead-reckoned heading, not a filter state
   float kfBA;
-  float kfBG;
+  float kfBG;      // reserved (0); kept for log column compatibility
   float kfInnov[KF_MEAS_COUNT];
   float kfInnovVar[KF_MEAS_COUNT];
+  uint16_t magStatus;      // AK8963 ST1 (low byte) and ST2 (high byte)
+  uint16_t imuDtUs;        // measured IMU interval, microseconds
+  int16_t encoder[2];      // low 16 bits of the raw quadrature count
 } CalData;
 
 // The closed-loop trajectory lasts 7.6 s. Format-3 rows are captured at
@@ -255,6 +259,8 @@ static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 CalData * calLogs = (CalData*)logs;
 const int calMax = (logsMax * sizeof(LogData)) / sizeof(CalData);
+static_assert(sizeof(CalData) == 164,
+              "CalData layout changed; update the printCalLog columns");
 static_assert(calMax >= 3000,
               "Calibration buffer must hold the 6 s track capture at 500 Hz");
 const float currentScale = 0.0045; // A/count; requires hardware calibration
@@ -279,6 +285,14 @@ int calTickCnt = 0;
 int calTrackIndex = 0;
 float calTrackStepEnd = 0.0f;
 uint16_t calPhase = 0;
+
+// Unbuffered sensor stream for long static captures (noise, Allan, mag).
+// It does not use the log buffer and is printed while the robot is idle.
+bool streamActive = false;
+int streamDivider = 10;
+uint32_t streamStartMs = 0;
+int streamTickCnt = 0;
+const uint32_t streamMaxMs = 20UL * 60UL * 1000UL;
 
 // State is also used to prevent a USB log request from blocking control.
 int state = 0;
@@ -463,6 +477,7 @@ void printLog()
   }
   if (!Serial)
     return;
+  streamActive = false;
   if (logs == nullptr)
   {
     Serial.println("% Log buffer allocation failed; run disabled.");
@@ -472,7 +487,7 @@ void printLog()
   LogData * d = logs;
   Serial.print("% Basebot log for ");
   Serial.println(robot.getRobotName());
-  Serial.println("% log format 3 (static estimator, no covariance)");
+  Serial.println("% log format 4 (IMU + encoder estimator, no mag fusion, no covariance)");
   Serial.print("% Sample time ");  Serial.print(sampleTimeUs);
   Serial.print(" us, log divider "); Serial.print(logDivider);
   Serial.print(", gear ");  Serial.print(gear, 7);
@@ -518,13 +533,13 @@ void printLog()
   Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
   Serial.println("% 25-26 computed control signal (left,right) (V)");
   Serial.println("% 27-28 estimator velocity and yaw rate (m/s, rad/s)");
-  Serial.println("% 29 magnetometer heading (rad, NaN if unavailable)");
+  Serial.println("% 29 magnetometer heading (rad, diagnostic only, NaN if unavailable)");
   Serial.println("% 30-31 controller setpoint (left,right) (motor rad/s)");
   Serial.println("% 32 yaw-rate reference (rad/s)");
-  Serial.println("% 33-37 estimator state [v, omega, theta, b_a, b_g]");
-  Serial.println("%       (m/s, rad/s, rad, m/s^2, rad/s)");
-  Serial.println("% 38 forward-velocity error (m/s)");
-  Serial.println("% 39 yaw-rate error (rad/s)");
+  Serial.println("% 33-37 estimator [v, omega, dead-reckoned heading, b_a, reserved]");
+  Serial.println("%       (m/s, rad/s, rad, m/s^2, 0)");
+  Serial.println("% 38 forward-velocity control error (vCmd - v) (m/s)");
+  Serial.println("% 39 yaw-rate PID error (omegaRefLim - omega) (rad/s)");
   Serial.println("% 40 outer-loop forward-velocity command (m/s)");
   Serial.println("% 41 outer-loop yaw-rate command (rad/s)");
   Serial.println("% 42-43 filtered wheel PI feedback (left,right) (motor rad/s)");
@@ -535,7 +550,7 @@ void printLog()
   Serial.println("% 49 heading-controller correction (rad/s)");
   Serial.println("% 50 forward acceleration used by KF predict (m/s^2)");
   Serial.println("% 51 yaw rate used by KF gyro update (rad/s)");
-  Serial.println("% 52-55 KF innovation (gyro, wheel v, wheel omega, mag)");
+  Serial.println("% 52-55 KF innovation (gyro, wheel v, wheel omega, reserved)");
   Serial.println("% 56 KF update mask (same bits as calibration column 4)");
   Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation");
   Serial.println("% Static gains: no covariance is propagated or logged.");
@@ -676,16 +691,16 @@ bool start()
   desiredYawRate = 0.0f;
   // A run starts with clean motion states and a clean residual accelerometer
   // bias. The stationary startup average (kfAccelBias) is measured at
-  // power-on and kept so the offset is not re-learned as b_a. The learned
-  // heading and gyro bias stay.
+  // power-on and kept so the offset is not re-learned as b_a. The
+  // dead-reckoned heading stays.
   estimator.v = 0.0f;
   estimator.omega = 0.0f;
   estimator.b_a = 0.0f;
   // Capture the pose origin and hold the current heading.
-  desiredHeading = estimator.theta;
-  poseStartTheta = estimator.theta;
+  desiredHeading = poseHeading;
+  poseStartTheta = poseHeading;
   posePrevV = estimator.v;
-  posePrevThetaAbs = estimator.theta;
+  posePrevOmega = estimator.omega;
   // Make the first logged row use the new origin, before the next estimator tick.
   pose[0] = 0.0f; pose[1] = 0.0f; pose[2] = 0.0f;
   pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
@@ -1003,7 +1018,7 @@ void trackingControlUpdate(float vRef, float omegaRef, float headingRef)
   desiredYawRate = omegaRef;
 
   const float vCmd = velLimiter.update(vRef);
-  const float headingFeedback = useKfFeedback ? estimator.theta : headingRef;
+  const float headingFeedback = useKfFeedback ? poseHeading : headingRef;
   controlHeadingCorrection =
       headingPid.ComputeCCDE(wrapAngle(headingRef - headingFeedback));
   controlOmegaRefLimited = turnLimiter.update(omegaRef + controlHeadingCorrection);
@@ -1188,7 +1203,7 @@ void estimatorUpdate()
   if (dt <= 0.0f || dt > 0.020f)
   {
     posePrevV = estimator.v;
-    posePrevThetaAbs = estimator.theta;
+    posePrevOmega = estimator.omega;
     return;
   }
   float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
@@ -1218,47 +1233,24 @@ void estimatorUpdate()
   // Wheel speed comes from the AS5X47 absolute angles; the smoothed
   // quadrature feedback is the flagged fallback when the read fails.
   wheelOdometryUpdate();
-  // The static gain bank assumes a 10 Hz magnetometer update; uimu2.cpp
-  // samples it at 100 Hz, so consume one sample per 100 ms here.
-  const uint32_t magPeriodUs = 100000;
-  if (imu2.magFresh and imu2.magHeadingValid and
-      (nowUs - magLastUs) >= magPeriodUs)
-  {
-    if (!kfHeadingInit)
-    {
-      float delta = wrapAngle(imu2.magHeading - estimator.theta);
-      estimator.theta = wrapAngle(imu2.magHeading);
-      if (state > 0) poseStartTheta += delta;
-      desiredHeading = wrapAngle(desiredHeading + delta);
-      posePrevThetaAbs += delta;
-      kfHeadingInit = true;
-    }
-    else
-    {
-      estimator.updateMag(imu2.magHeading);
-      if (estimator.lastInnovationValid[KF_M_MAG])
-        kfUpdateMask |= CAL_KF_MAG;
-      else
-        kfUpdateMask |= CAL_KF_MAG_REJECTED;
-    }
-    magLastUs = nowUs;
-  }
 
-  // External dead reckoning: position is deliberately outside the filter.
+  // External dead reckoning: heading and position are deliberately outside
+  // the filter. Both use the trapezoidal rule over the filter's v and omega.
   const float vNow = estimator.v;
-  const float thetaNow = estimator.theta;
+  const float omegaNow = estimator.omega;
   const float ds = 0.5f * (posePrevV + vNow) * dt;
-  const float dtheta = wrapAngle(thetaNow - posePrevThetaAbs);
-  const float thetaMid = wrapAngle(posePrevThetaAbs + 0.5f * dtheta);
+  const float dtheta = 0.5f * (posePrevOmega + omegaNow) * dt;
+  const float thetaMid = wrapAngle(poseHeading + 0.5f * dtheta);
   pose[0] += ds * cosf(thetaMid);
   pose[1] += ds * sinf(thetaMid);
   distA += ds;
-  pose[2] = wrapAngle(thetaNow - poseStartTheta);
+  poseHeading = wrapAngle(poseHeading + dtheta);
+  pose[2] = wrapAngle(poseHeading - poseStartTheta);
   pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
   poseVel[0] = vNow;
-  poseVel[1] = estimator.omega;
+  poseVel[1] = omegaNow;
   posePrevV = vNow;
-  posePrevThetaAbs = thetaNow;
+  posePrevOmega = omegaNow;
 }
 
 void updateLog()
@@ -1305,11 +1297,11 @@ void updateLog()
     logs[logsCnt].controlSetpoint[1] = controlSetpoint[1];
     logs[logsCnt].kfState[0] = estimator.v;
     logs[logsCnt].kfState[1] = estimator.omega;
-    logs[logsCnt].kfState[2] = estimator.theta;
+    logs[logsCnt].kfState[2] = poseHeading;
     logs[logsCnt].kfState[3] = estimator.b_a;
-    logs[logsCnt].kfState[4] = estimator.b_g;
-    logs[logsCnt].vError = desiredValue - estimator.v;
-    logs[logsCnt].yawRateError = desiredYawRate - estimator.omega;
+    logs[logsCnt].kfState[4] = 0.0f; // reserved (former gyro bias)
+    logs[logsCnt].vError = controlVCommand - estimator.v;
+    logs[logsCnt].yawRateError = yawRatePid.lastError();
     logs[logsCnt].vCommand = controlVCommand;
     logs[logsCnt].yawRateCommand = controlOmegaCommand;
     for (int k = 0; k < 2; k++)
@@ -1394,6 +1386,7 @@ bool calStart(CalMode mode)
     usb.send("% Calibration buffer unavailable.\r\n");
     return false;
   }
+  streamActive = false;
   if (state > 0)
   {
     usb.send("% Standard run active; calibration disabled.\r\n");
@@ -1432,7 +1425,10 @@ bool calStart(CalMode mode)
   calState = 1;
   calEndTime = time_sec + ((mode == CAL_MAG) ? 15.0f : 3.0f);
   if (mode == CAL_MAG)
+  {
+    imu2.magProbe();
     usb.send("% cal mag: motors off. Rotate 360 deg by hand and back within 15 s.\r\n");
+  }
   else
     usb.send("% cal noise: motors off. Keep the robot still for 3 s.\r\n");
   return true;
@@ -1478,6 +1474,8 @@ void calFinish()
 
 void calStop()
 {
+  bool wasStreaming = streamActive;
+  streamActive = false;
   calArmed = false;
   if (calState > 0)
   {
@@ -1492,6 +1490,8 @@ void calStop()
     usb.send("% cal stopped; capture pending\r\n");
   else
     usb.send("% cal stopped\r\n");
+  if (wasStreaming)
+    usb.send("% stream stopped\r\n");
 }
 
 void calUpsideStep()
@@ -1596,6 +1596,12 @@ void updateCalLog()
   if (as5Valid) flags |= CAL_AS5_VALID;
   if (as5Fresh) flags |= CAL_AS5_FRESH;
   if (estimator.healthy) flags |= CAL_KF_HEALTHY;
+  if (imu2.magAttempt)
+  {
+    flags |= CAL_MAG_ATTEMPT;
+    if (imu2.magSt1 & 0x01) flags |= CAL_MAG_DRDY;
+    if ((imu2.magSt1 | imu2.magSt2) & 0x08) flags |= CAL_MAG_OVERFLOW;
+  }
   d.flags = flags;
   d.kfMask = kfUpdateMask;
   d.phase = calPhase;
@@ -1619,16 +1625,38 @@ void updateCalLog()
   d.magHeading = imu2.magHeadingValid ? imu2.magHeading : NAN;
   d.kfV = estimator.v;
   d.kfOmega = estimator.omega;
-  d.kfTheta = estimator.theta;
+  d.kfTheta = poseHeading;
   d.kfBA = estimator.b_a;
-  d.kfBG = estimator.b_g;
+  d.kfBG = 0.0f; // reserved (former gyro bias)
   for (int i = 0; i < KF_MEAS_COUNT; i++)
   {
     d.kfInnov[i] = estimator.lastInnovation[i];
     // Static gains do not propagate P, so there is no innovation variance S.
     d.kfInnovVar[i] = 0.0f;
   }
+  d.magStatus = (uint16_t)imu2.magSt1 | ((uint16_t)imu2.magSt2 << 8);
+  uint32_t dtUs = imu2.lastSampleTimeUs();
+  d.imuDtUs = dtUs > 0xFFFF ? 0xFFFF : (uint16_t)dtUs;
+  d.encoder[0] = (int16_t)(-encoder.encoder[0]);
+  d.encoder[1] = (int16_t)(encoder.encoder[1]);
   calCnt++;
+}
+
+void printMagProbeSummary()
+{
+  char s[240];
+  snprintf(s, sizeof(s),
+           "%% mag probe summary: mpu=0x%02X ak=0x%02X cntl1=0x%02X "
+           "bypass=%u mst=%u st1=0x%02X st2=0x%02X asa=%u,%u,%u "
+           "available=%u\r\n",
+           (unsigned)imu2.mpuWho, (unsigned)imu2.akWho,
+           (unsigned)imu2.magCntl1,
+           (unsigned)((imu2.magIntCfg >> 1) & 1),
+           (unsigned)((imu2.magUserCtrl >> 5) & 1),
+           (unsigned)imu2.magSt1, (unsigned)imu2.magSt2,
+           (unsigned)imu2.magAsa[0], (unsigned)imu2.magAsa[1],
+           (unsigned)imu2.magAsa[2], imu2.magAvailable ? 1u : 0u);
+  Serial.print(s);
 }
 
 void printCalLog()
@@ -1646,6 +1674,7 @@ void printCalLog()
     return;
   }
   calPending = false;
+  streamActive = false;
   Serial.print("% CAL ");
   Serial.println(calModeName(calMode));
   Serial.print("% max cal samples ");
@@ -1680,8 +1709,8 @@ void printCalLog()
     Serial.println("% WARNING: cal buffer filled; final samples are missing.");
   Serial.println("% 1 time (s)");
   Serial.println("% 2 mode (1 mag, 2 noise, 3 track, 4 upside)");
-  Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy)");
-  Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bit3 mag, bit4 mag rejected, bit5 wheel v/omega from encoder fallback)");
+  Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy, bit8 mag attempt, bit9 mag DRDY, bit10 mag overflow)");
+  Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bits3-4 reserved, bit5 wheel v/omega from encoder fallback)");
   Serial.println("% 5-6 setpoint (left,right) (motor rad/s)");
   Serial.println("% 7-8 PI feedback (left,right) (motor rad/s)");
   Serial.println("% 9-10 motor voltage request (left,right) (V, forward-positive)");
@@ -1693,11 +1722,24 @@ void printCalLog()
   Serial.println("% 24-25 AS5X47 wheel velocity (left,right) (m/s, forward-positive)");
   Serial.println("% 26 wheel window (s)");
   Serial.println("% 27 mag heading (rad, NaN if unavailable)");
-  Serial.println("% 28-30 estimator v, omega, theta (m/s, rad/s, rad)");
-  Serial.println("% 31-32 estimator b_a, b_g (m/s^2, rad/s)");
-  Serial.println("% 33-36 estimator innovation y (gyro, wheel v, wheel omega, mag)");
+  Serial.println("% 28-30 estimator v, omega, dead-reckoned heading (m/s, rad/s, rad)");
+  Serial.println("% 31-32 estimator b_a, reserved (m/s^2, 0)");
+  Serial.println("% 33-36 estimator innovation y (gyro, wheel v, wheel omega, reserved)");
   Serial.println("% 37-40 innovation variance S (0: static gains do not propagate P)");
   Serial.println("% 41 sequence phase (10 baseline, 11 forward, 12 turn, 2 settling; track uses 10 + step index)");
+  Serial.println("% 42 mag status (low byte ST1, high byte ST2)");
+  Serial.println("% 43 IMU sample interval (us)");
+  Serial.println("% 44-45 encoder count low 16 bits (left,right), forward-positive");
+  Serial.println("% IMU bus 400 kHz; gyro DLPF 92 Hz; accel DLPF 94 Hz; AK8963 continuous 100 Hz");
+  Serial.println("% IMU axes: forward = -acc[2], CCW yaw = -gyro[0]");
+  Serial.print("% AK8963 ASA ");
+  Serial.print(imu2.magAsa[0]); Serial.print(",");
+  Serial.print(imu2.magAsa[1]); Serial.print(",");
+  Serial.print(imu2.magAsa[2]); Serial.print(" offsets ");
+  Serial.print(imu2.magOffset[0]); Serial.print(",");
+  Serial.print(imu2.magOffset[1]); Serial.print(",");
+  Serial.println(imu2.magOffset[2]);
+  printMagProbeSummary();
 
   for (int i = 0; i < calCnt; i++)
   {
@@ -1727,11 +1769,114 @@ void printCalLog()
     for (int i2 = 0; i2 < KF_MEAS_COUNT; i2++)
       printLogValue(d.kfInnovVar[i2]);
     Serial.print(" "); Serial.print(d.phase);
+    Serial.print(" "); Serial.print(d.magStatus);
+    Serial.print(" "); Serial.print(d.imuDtUs);
+    Serial.print(" "); Serial.print(d.encoder[0]);
+    Serial.print(" "); Serial.print(d.encoder[1]);
     Serial.println("");
   }
   Serial.print("% sent ");
   Serial.print(calCnt);
   Serial.println(" cal lines");
+}
+
+void streamHeader(int hz)
+{
+  char s[180];
+  snprintf(s, sizeof(s), "%% CAL stream %d Hz (divider %d), cap %lu s\r\n",
+           hz, streamDivider, (unsigned long)(streamMaxMs / 1000));
+  usb.send(s);
+  usb.send("% 1 time (s)\r\n");
+  usb.send("% 2 IMU sample interval (us)\r\n");
+  usb.send("% 3 flags (same bits as the calibration capture)\r\n");
+  usb.send("% 4 AK8963 ST1\r\n");
+  usb.send("% 5 AK8963 ST2\r\n");
+  usb.send("% 6-8 gyro (x,y,z) (deg/s, offset-corrected)\r\n");
+  usb.send("% 9-11 accel (x,y,z) (g)\r\n");
+  usb.send("% 12-14 mag (x,y,z) (adjusted counts, 0.15 uT/LSB)\r\n");
+  usb.send("% 15-16 AS5X47 angle (left,right) (rad)\r\n");
+  usb.send("% 17-18 encoder counts (left,right), forward-positive\r\n");
+  usb.send("% 19 MPU temperature (C, updated at 1 Hz)\r\n");
+  usb.send("% IMU axes: forward = -acc[2], CCW yaw = -gyro[0]\r\n");
+  usb.send("% Keep the robot still; this stream is for stationary captures.\r\n");
+  printMagProbeSummary();
+}
+
+void startStream(int hz)
+{
+  if (state > 0 or calState > 0 or calArmed or calPending or logPending)
+  {
+    usb.send("% stream: finish the current run or capture first.\r\n");
+    return;
+  }
+  if (!usb.usbIsUp)
+  {
+    usb.send("% stream: open the monitor first.\r\n");
+    return;
+  }
+  if (hz < 50) hz = 50;
+  if (hz > 500) hz = 500;
+  streamDivider = 1000 / hz;
+  if (streamDivider < 2) streamDivider = 2;
+  streamActive = true;
+  streamStartMs = millis();
+  streamTickCnt = 0;
+  streamHeader(hz);
+}
+
+void streamTick()
+{
+  if (!streamActive)
+    return;
+  if (state > 0 or calState > 0)
+  {
+    streamActive = false;
+    usb.send("% stream stopped: run or capture started.\r\n");
+    return;
+  }
+  if (millis() - streamStartMs > streamMaxMs)
+  {
+    streamActive = false;
+    usb.send("% stream stopped: 20 min cap.\r\n");
+    return;
+  }
+  if ((streamTickCnt++ % streamDivider) != 0)
+    return;
+  if (!usb.usbIsUp)
+    return;
+  uint16_t flags = 0;
+  if (imu2.accelFresh) flags |= CAL_ACCEL_FRESH;
+  if (imu2.gyroFresh) flags |= CAL_GYRO_FRESH;
+  if (imu2.magFresh) flags |= CAL_MAG_FRESH;
+  if (imu2.magHeadingValid) flags |= CAL_MAG_VALID;
+  if (imu2.magAvailable) flags |= CAL_MAG_AVAILABLE;
+  if (as5Valid) flags |= CAL_AS5_VALID;
+  if (as5Fresh) flags |= CAL_AS5_FRESH;
+  if (imu2.magAttempt)
+  {
+    flags |= CAL_MAG_ATTEMPT;
+    if (imu2.magSt1 & 0x01) flags |= CAL_MAG_DRDY;
+    if ((imu2.magSt1 | imu2.magSt2) & 0x08) flags |= CAL_MAG_OVERFLOW;
+  }
+  uint32_t dtUs = imu2.lastSampleTimeUs();
+  if (dtUs > 0xFFFF) dtUs = 0xFFFF;
+  char buf[280];
+  int n = snprintf(buf, sizeof(buf),
+      "%.4f %u %u %u %u %.6g %.6g %.6g %.6g %.6g %.6g "
+      "%.4f %.4f %.4f %.6f %.6f %d %d %.3f\r\n",
+      time_sec, (unsigned)dtUs, (unsigned)flags,
+      (unsigned)imu2.magSt1, (unsigned)imu2.magSt2,
+      imu2.gyro[0], imu2.gyro[1], imu2.gyro[2],
+      imu2.acc[0], imu2.acc[1], imu2.acc[2],
+      imu2.mag[0], imu2.mag[1], imu2.mag[2],
+      as5AngleLast[0], as5AngleLast[1],
+      (int)(-encoder.encoder[0]), (int)(encoder.encoder[1]),
+      imu2.temperatureValid ? imu2.temperatureC : NAN);
+  if (n > 0)
+  {
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    Serial.write(buf, n);
+  }
 }
 
 bool decodeExperiment(const char *buf)
@@ -1749,6 +1894,16 @@ bool decodeExperiment(const char *buf)
     calStart(CAL_TRACK);
   else if (strncmp(p, "upside", 6) == 0)
     calStart(CAL_UPSIDE_DOWN);
+  else if (strncmp(p, "stream", 6) == 0)
+  {
+    const char *q = p + 6;
+    while (*q == ' ')
+      q++;
+    int hz = 100;
+    if (*q >= '0' && *q <= '9')
+      hz = strtol(q, NULL, 10);
+    startStream(hz);
+  }
   else if (strncmp(p, "stop", 4) == 0)
     calStop();
   else if (strncmp(p, "log", 3) == 0)
@@ -1756,7 +1911,7 @@ bool decodeExperiment(const char *buf)
   else if (strncmp(p, "retrymag", 8) == 0)
     imu2.retryMag();
   else
-    usb.send("% cal commands: mag | noise | track | upside | stop | log | retrymag\r\n");
+    usb.send("% cal commands: mag | noise | track | upside | stream [Hz] | stop | log | retrymag\r\n");
   return true;
 }
 
@@ -1773,10 +1928,11 @@ void setup()
   // not run from a global constructor or inside the first control tick.
   (void)leftWheelSensor();
   (void)rightWheelSensor();
-  estimator.reset(0.0f);
-  poseStartTheta = estimator.theta;
+  estimator.reset();
+  poseHeading = 0.0f;
+  poseStartTheta = poseHeading;
   posePrevV = estimator.v;
-  posePrevThetaAbs = estimator.theta;
+  posePrevOmega = estimator.omega;
   kfLastUs = micros();
   motor.setPWMfrq(0x13000); 
   usb.setup();
@@ -1808,7 +1964,8 @@ void loop ( void )
       }
       else
       {
-        upsideDownCalibrationSequence();
+        closedLoopTrajectory();
+        //upsideDownCalibrationSequence();
         //sequenceTwoSteps();
         //yawRateStep();
         //forwardThreeSeconds();
@@ -1824,6 +1981,7 @@ void loop ( void )
       if (calState > 0 and calTickCnt % calDivider == 0)
         updateCalLog();
       calTickCnt++;
+      streamTick();
       robot.tick();   
       display.tick(); 
     }

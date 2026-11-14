@@ -8,9 +8,9 @@
 //   /tmp/kalman-parity input.csv output.csv
 //
 // Input header (one row per filter step):
-//   step,dt,a,gyro,wheel_v,wheel_omega,mag,use_gyro,use_wheel,use_mag
+//   step,dt,a,gyro,wheel_v,wheel_omega,use_gyro,use_wheel
 // Output header:
-//   step,v,b_a,theta,omega,b_g,innov_gyro,innov_wheel_v,innov_wheel_omega,innov_mag,healthy
+//   step,v,b_a,omega,innov_gyro,innov_wheel_v,innov_wheel_omega,healthy
 #include "kalman.h"
 
 #include <stdio.h>
@@ -40,11 +40,11 @@ int main(int argc, char **argv)
   }
 
   StaticDecoupledEstimator f;
-  f.reset(0.0f);
+  f.reset();
 
   fprintf(out,
-          "step,v,b_a,theta,omega,b_g,innov_gyro,innov_wheel_v,"
-          "innov_wheel_omega,innov_mag,healthy\n");
+          "step,v,b_a,omega,innov_gyro,innov_wheel_v,"
+          "innov_wheel_omega,healthy\n");
 
   char line[1024];
   int lineNo = 0;
@@ -58,15 +58,15 @@ int main(int argc, char **argv)
       continue;
 
     int step = 0;
-    int useGyro = 0, useWheel = 0, useMag = 0;
+    int useGyro = 0, useWheel = 0;
     double dt = 0.0, a = 0.0, gyro = 0.0;
-    double wheelV = 0.0, wheelOmega = 0.0, mag = 0.0;
-    int fields = sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d",
-                        &step, &dt, &a, &gyro, &wheelV, &wheelOmega, &mag,
-                        &useGyro, &useWheel, &useMag);
-    if (fields != 10)
+    double wheelV = 0.0, wheelOmega = 0.0;
+    int fields = sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%d,%d",
+                        &step, &dt, &a, &gyro, &wheelV, &wheelOmega,
+                        &useGyro, &useWheel);
+    if (fields != 8)
     {
-      fprintf(stderr, "error: %s:%d: expected 10 fields, got %d\n",
+      fprintf(stderr, "error: %s:%d: expected 8 fields, got %d\n",
               argv[1], lineNo, fields);
       status = 1;
       break;
@@ -80,16 +80,12 @@ int main(int argc, char **argv)
       f.updateWheelV((float)wheelV);
       f.updateWheelOmega((float)wheelOmega);
     }
-    if (useMag)
-      f.updateMag((float)mag);
 
-    fprintf(out, "%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d\n",
-            step, (double)f.v, (double)f.b_a, (double)f.theta,
-            (double)f.omega, (double)f.b_g,
+    fprintf(out, "%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d\n",
+            step, (double)f.v, (double)f.b_a, (double)f.omega,
             (double)f.lastInnovation[KF_M_GYRO],
             (double)f.lastInnovation[KF_M_WHEEL_V],
             (double)f.lastInnovation[KF_M_WHEEL_OMEGA],
-            (double)f.lastInnovation[KF_M_MAG],
             f.healthy ? 1 : 0);
   }
 

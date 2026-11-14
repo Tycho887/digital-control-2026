@@ -1,268 +1,245 @@
 # Sensor-Fused Kalman Filter Design
 
-Differential-drive robot: linear velocity / angular velocity / distance / heading estimation
-Hardware: MPU-9250 (IMU with AK8963 magnetometer) + two AS5047P/AS5147 absolute magnetic angle sensors on the motor shafts (SPI). The stock 48-edge quadrature encoders still drive the wheel-speed PI loop, but the Kalman filter does not use them.
+Differential-drive robot: linear velocity / angular velocity / distance /
+heading estimation.
 
----
+Hardware used by the filter:
 
-## Implementation status
+- MPU-9250 accelerometer and gyro.
+- Two 48-PPR quadrature wheel encoders on the motor shafts.
+- Optional AS5047P/AS5147 absolute-angle sensors (currently dead; retained as
+  an upgrade path).
 
-The firmware now implements the stationary decoupled estimator in
-`src/src/kalman.h` and `src/src/kalman.cpp`, running at 1 kHz
-(`KF_specification.md` is the current reference). It differs from the original
-covariance-propagating design below in these ways:
-
-- **State:** `[v, b_a, θ, ω, b_g]`. Position `s`, `x`, and `y` are not filter
-  states; they are dead-reckoned outside the filter from `v` and `θ`.
-- **Constant gains:** no covariance is propagated. The gain bank is grouped by
-  measurement and update rate: wheel `v` at 100 Hz, gyro at 1 kHz, wheel `ω`
-  at 100 Hz, and a gated magnetometer heading.
-- **Sensor set:** MPU-9250 accelerometer/gyro/magnetometer and two
-  AS5047P/AS5147 absolute angles read over SPI. The stock quadrature encoders
-  are not filter measurements.
-- **No wheel position measurements:** the AS5X47 angles are differenced over
-  10 ms to give instantaneous `v` and `ω`; wheel-derived distance and heading
-  are not used.
-- **Datasheet noise:** gyro `0.1 °/s` RMS at DLPF 92 Hz, accelerometer
-  `300 µg/√Hz` over the 94 Hz DLPF band, and AS5X47 `0.068°` RMS angle noise.
-  The DLPF is configured to 92/94 Hz in `uimu2.cpp`.
-- **Accelerometer as input:** forward acceleration enters the predict step;
-  its bias is estimated as `b_a`.
-- **Magnetometer enabled by default:** the heading update is innovation-gated
-  and runs unless disabled with `mag 0`.
-- **Outer control:** reference limiters, a heading lead-lag controller, and
-  `yawRatePid` feed the existing wheel-speed PI loops. `useKfFeedback` can
-  bypass the estimator heading/yaw feedback for a feed-forward comparison while
-  leaving estimation and logging active; there is no outer velocity PID.
-- **Diagnostic trajectory:** `closedLoopTrajectory()` commands 0.20 m/s for
-  4 s, then +30 degrees/s for 3 s, with short baseline/settling phases.
-- **Calibration capture:** `cal mag`, `cal noise`, `cal track`, and `cal upside`
-  record raw sensors, controller signals and estimator innovations into a
-  compact buffer. `cal upside` is an armed 6 s wheels-off-the-ground sequence
-  with constant forward and differential wheel-speed plateaus. NIS is not
-  available because the stationary gains do not propagate innovation variance.
-  Analysis of the new upside/format-3 captures is deferred until real logs exist.
-
-The older `week08/DARE.m` and `week08/static_kf.mat` are deprecated. Sections
-1–7 and the appendix below describe the original quadrature-encoder design and
-are retained as background.
-
-## Calibration Procedure and Acceptance Checks
-
-The firmware assumptions under test are: IMU X is the vertical/down axis,
-forward is `-acc[2]`, CCW yaw is `-gyro[0]`, and magnetometer heading is
-`atan2(mag[1], -mag[2])`. `cal mag` (motors off, 200 Hz for 15 s) asks for a
-360° hand rotation. The analyzer reports the accelerometer gravity axis, the
-field component with the smallest rotation variation, and the slope/RMSE of
-each candidate heading pair against gyro-integrated yaw. Acceptance:
-
-- The gravity axis and the smallest-variation field axis agree (expected X).
-- The firmware heading slope is within about ±0.25 of +1 with RMSE below about
-  0.2 rad. A slope near -1 means the sign is reversed; a different best pair
-  means the axis mapping is wrong.
-
-`cal noise` (motors off, 1 kHz for 3 s) measures per-sample 1-sigma for gyro X
-(assumed 0.1 °/s), accel Z (0.0285 m/s²), AS5X47 angle (0.068°), 10 ms wheel
-velocity (5.51e-4 m/s) and turn rate (7.87e-3 rad/s), and mag heading
-(0.01 rad). A measured/assumed ratio between roughly 0.5 and 2 is treated as
-plausible. These are seeds for a retune, not an automatic R change. NIS is
-unavailable with the current fixed gains because neither `P` nor innovation
-variance `S` is propagated.
-
-`cal upside` repeats the measurement with the wheels turning while the chassis
-is secured upside down: 0.5 s zero, 2.5 s at 0.20 m/s wheel equivalent, 2.5 s
-at +30 degrees/s differential wheel equivalent, then 0.5 s zero. Its raw capture
-separates motor-on sensor behavior from wheel-loop tracking; wheel-derived pose
-is not chassis ground truth. The separate upright trajectory is used afterward
-for KF/controller interaction checks.
-
-`cal track` runs the current quadrature-encoder PI at 500 Hz.
-It reports rise time, overshoot, settling time, steady-state/RMS error and
-3 V saturation for the PI feedback, AS5X47 velocity and KF velocity. The
-AS5X47/KF columns are an independent check on the encoder feedback; the
-current 3 V limit is deliberately conservative, so saturation is reported
-rather than hidden.
-
-Magnetometer bring-up is checked with both the AK8963 WHO_AM_I register and a
-delayed data read (ST1 DRDY, ST2 HOFL). `cal retrymag` repeats that probe. A
-`NaN` mag heading in a standard log should be diagnosed this way before the
-axis result is interpreted.
+The AK8963 magnetometer is broken/unresponsive and is **not** used. It remains
+a raw diagnostic sensor only. The authoritative implementation reference is
+`src/src/KF_specification.md`; the gain generator is
+`kalman_filter_tuning/solve_dare.m`.
 
 ---
 
 ## 1. State Vector and Conventions
 
-**State:**
-
-```javascript
-x = [s, θ, v, ω, b_g, b_a]ᵀ
-     s   accumulated distance (m)
-     θ   accumulated heading (rad)
-     v   linear velocity (m/s)
-     ω   angular velocity (rad/s)
-     b_g gyro bias (rad/s)
-     b_a accelerometer bias (m/s²)
+```text
+x = [ v, omega, b_a ]
 ```
 
-Including b_g and b_a as states (instead of crudely inflating R) lets the filter estimate the biases online and avoids mis-weighting a constant offset as white noise.
-
-**Conventions:** v > 0 = forward, ω > 0 = CCW; left wheel ω_L, right wheel ω_R (rad/s); wheel radius r; wheelbase d.
-
----
-
-## 2. Process Model (Prediction Step)
-
-The accelerometer enters as a **control input** u = a_x (body-frame longitudinal acceleration, bias-corrected). State propagation is linear:
-
-```javascript
-x⁻_k = F x_{k-1} + B u_k
-```
-
-```javascript
-F = ⎡ 1  0  Δt   0    0     0   ⎤
-    ⎢ 0  1   0  Δt    0     0   ⎥
-    ⎢ 0  0   1   0    0     0   ⎥
-    ⎢ 0  0   0   1   −Δt    0   ⎥   ← gyro reading contains bias b_g; subtract
-    ⎢ 0  0   0   0    1     0   ⎥   ← b_g modeled as random walk
-    ⎣ 0  0   0   0    0     1   ⎦   ← b_a modeled as random walk
-
-B = [ Δt²/2, 0, Δt, 0, 0, 0 ]ᵀ
-```
-
-Note: u_k is the raw accelerometer reading minus the current b_a estimate.
-
-**Process noise covariance Q** (6×6, near-diagonal). Q has no datasheet values — gyro/accel bias random walk must come from an Allan-variance analysis of stationary IMU logs. If no Allan data is available yet, initialize from the table below and tune with measured data:
-
-| Param | Initial suggestion | Meaning |
+| Symbol | Meaning | Unit |
 | --- | --- | --- |
-| Q_s | 0 | distance carries no process noise |
-| Q_θ | 0 | heading carries no process noise |
-| Q_v | (0.05·Δt)² | longitudinal velocity random disturbance (bumps) |
-| Q_ω | (0.01·Δt)² | angular velocity random disturbance |
-| Q_bg | (1e-5)²·Δt | gyro bias random walk (Allan flat region) |
-| Q_ba | (1e-3)²·Δt | accelerometer bias random walk |
+| `v` | forward velocity | m/s |
+| `omega` | yaw rate | rad/s |
+| `b_a` | residual accelerometer bias | m/s² |
 
-> Stationary Allan-variance analysis: the white-noise region (slope −1/2) gives the measurement noise density; the flat floor gives bias instability. This is the only reliable source for Q_bg, Q_ba, and the IMU terms of R.
+**Integrated quantities are not states.** Distance `s`, heading `theta`, and
+pose `x`, `y` are dead-reckoned outside the filter. The DARE therefore has no
+unobservable integrator states and no magnetometer bias state.
+
+The gyro bias is removed by the IMU driver's startup offset calibration; it is
+not a filter state. With encoder-only wheel omega the DARE cannot identify a
+separate `b_g` state, so omitting it avoids a nearly unobservable mode.
+
+Conventions: `v > 0` forward, `omega > 0` CCW; left/right wheel linear
+velocities `v_L`, `v_R`; wheel radius `r`; wheelbase `d`.
 
 ---
 
-## 3. Measurement Model (Update Step)
+## 2. Process Model
 
-**Measurement vector (raw sensors stacked, not pre-fused):**
+The accelerometer enters as a control input `u = a_x` (body-frame forward
+acceleration, bias-corrected by the filter):
 
-```javascript
-z = [ω_L, ω_R, ω_gyro]ᵀ
+```text
+x_k+1 = F x_k + B u_k
 ```
 
-```javascript
-H = ⎡ r/2   r/2    0    0   0  0 ⎤   ← v = r/2·(ω_R + ω_L)
-    ⎢ r/d  −r/d    0    0   0  0 ⎥   ← ω = r/d·(ω_R − ω_L)
-    ⎣  0     0     0    1   1  0 ⎦   ← gyro reading = ω + b_g
+```text
+F = [ 1   0  -dt ]
+    [ 0   1    0 ]
+    [ 0   0    1 ]
+
+B = [ dt ]
+    [  0 ]
+    [  0 ]
 ```
 
-New states s, θ have zero columns in H — they are not measured directly, only propagated.
+`a_x` is the raw forward accelerometer reading minus the startup average; the
+filter subtracts `b_a`. `omega` is not propagated by the model; the gyro and
+wheel-omega updates correct it.
 
-**Measurement noise matrix:**
+Process noise:
 
-```javascript
-R = diag( σ²_ωL, σ²_ωR, σ²_gyro )
+```text
+Q = B*(sigma_accel^2 + q_v^2)*B' + diag(0, (q_om*dt)^2, q_ba^2*dt)
+```
+
+- `sigma_accel` is the measured per-sample accelerometer noise.
+- `q_v` is an unmodelled velocity disturbance (slip, bumps, drag), not sensor
+  noise.
+- `q_om` is the unmodelled angular acceleration; use the turn-limiter value.
+- `q_ba` is the accelerometer bias random walk, from Allan variance when
+  available.
+
+The firmware solves the blocks at their actual rates: the `[v, b_a]` block is
+lifted to 10 ms for the wheel-v update; the `omega` block uses a 1 ms DARE for
+the gyro and a 10 ms DARE for the wheel-omega update.
+
+---
+
+## 3. Measurement Model
+
+Measurements are stacked as raw scalar updates, not pre-combined into a
+correlated vector:
+
+```text
+z = [ v_wheel ; omega_wheel ; omega_gyro ]
+```
+
+```text
+H = [ 1  0  0 ]   wheel v
+    [ 0  1  0 ]   wheel omega
+    [ 0  1  0 ]   gyro omega
+```
+
+The wheel rows come from the encoder-derived left/right wheel velocities:
+
+```text
+v_wheel     = 0.5*(v_L + v_R)
+omega_wheel = (v_R - v_L)/d
+```
+
+The gyro reading is already offset-corrected by the driver. No magnetometer row
+exists.
+
+Measurement noise:
+
+```text
+R = diag(sigma_wheel_v^2, sigma_wheel_omega^2, sigma_gyro^2)
 ```
 
 | Entry | Value | Source |
 | --- | --- | --- |
-| σ²_gyro | 1.5×10⁻⁶ (rad/s)² @100Hz | datasheet noise density 0.01°/s/√Hz × √(f_s/2); bandwidth depends on actual DLPF setting |
-| σ²_ωL / σ²_ωR | from calibration, varies with speed/window length | see Section 5 |
+| `sigma_gyro` | 0.17 deg/s | 14 Nov `cal upside` phases 11/12 |
+| `sigma_wheel_v` | 0.0145 m/s | 10 ms encoder difference |
+| `sigma_wheel_omega` | 0.18 rad/s | 10 ms encoder difference |
 
-**Do NOT pre-combine encoders into v_enc / ω_enc and put both in z**: both derive from the same two noisy quantities, giving R a non-zero off-diagonal covariance (cov = r²/2d · (σ²_ωL − σ²_ωR)). Ignoring it makes the filter over-trust directions where the two "independent" measurements agree by construction. Stacking raw measurements sidesteps this entirely.
+The wheel `v` and wheel `omega` estimates share the same encoder counts, so
+their noise is correlated. The firmware applies two scalar updates for code
+size; the fixed gains absorb the small over-trust this creates.
 
 ---
 
-## 4. Discrete Kalman Equations (Embedded Implementation)
+## 4. Stationary Gains
 
-Prediction step (runs every IMU sample, e.g. 100 Hz):
+The firmware propagates no covariance. The gain bank is the steady-state DARE
+solution per block:
 
-```javascript
-1)  x⁻ = F x + B (a_raw − b_a)
-2)  P⁻ = F P Fᵀ + Q
+```text
+[P, ~, ~] = dare(F', H', Q, R);
+K = P*H'/(H*P*H' + R);
 ```
 
-Update step (runs whenever a new measurement arrives; gyro every cycle, encoders per window):
-
-```javascript
-3)  y  = z − H x⁻                (innovation)
-4)  S  = H P⁻ Hᵀ + R             (innovation covariance, 3×3)
-5)  K  = P⁻ Hᵀ S⁻¹               (Kalman gain, 6×3)
-6)  x⁺ = x⁻ + K y
-7)  P⁺ = (I − K H) P⁻            (or Joseph form, below)
+```text
+K_WHEEL_V     = [ 0.197604, -0.018533 ] over [v, b_a]
+K_GYRO        = 0.209730                over omega
+K_WHEEL_OMEGA = 0.012222                over omega
 ```
 
-**Embedded implementation notes:**
+The wheel-v first gain preserves roughly the previous 50 ms velocity step
+response. The bias gain is slower because the DARE trusts the accelerometer
+for short-term velocity and the wheel only for long-term correction. Tune the
+`q_v` disturbance if a faster response is required.
 
-- **S⁻¹ is a 3×3 inverse**: write out the adjugate formula or do row Gaussian elimination; no numeric library needed.
-- **Joseph-form covariance update** (numerically more stable, recommended):
-`P⁺ = (I − K H) P⁻ (I − K H)ᵀ + K R Kᵀ`
-- **Matrix sparsity**: F has ~10 nonzeros, H has 6. Expand element-wise and skip zero products — the full 6×6 P update needs only ~200 multiplications.
-- **Two-rate structure**: prediction runs every IMU cycle; encoder measurements accumulate over a fixed window (e.g. 20–50 ms) and inject as one update, while the gyro can inject every cycle. Compute the encoder entries of R from the current window length and speed (Section 5).
-- **Initialization:**
+`tests/kalman_host/verify_gains.py` checks the 100-step multi-rate error
+transition and compares the header gains with a NumPy replica of the DARE.
 
-```javascript
-  x₀ = [0, 0, 0, 0, b_g_cal, b_a_cal]ᵀ      (from 1–2 s of stationary averaging at power-on)
-  P₀ = diag(0, 0, 1, 1, (5°/s→0.087)², (80 mg→0.784)²)
-       ↑ bias initial uncertainty = datasheet zero-offset tolerance
+---
+
+## 5. Encoder Noise Model
+
+Encoder velocity per window:
+
+```text
+v_wheel = DeltaN * (2*pi/48) * r / (gear * dt_window)
 ```
 
+The quadrature encoder fallback is the active wheel source on the current
+hardware. The 10 ms window and the starting speed set the quantization/timing
+noise. The measured in-motion
+1-sigma values in the 14 Nov captures are 0.013-0.0145 m/s for wheel `v` and
+0.18 rad/s for wheel omega.
+
+The optional AS5X47 path differences its absolute angle over the same 10 ms
+window. Its datasheet angle noise is 0.068° RMS; when the sensor is repaired,
+use the AS5X47 noise figure and re-solve the DARE.
+
+Encoder timing jitter, wheel imperfection, and slip dominate the quantization
+floor. Slip is environment-dependent; inflate `sigma_wheel_v` / `q_v` during
+hard acceleration or turning rather than pretending the encoder is ideal.
+
 ---
 
-## 5. Encoder Noise Model (R Encoder Entries)
+## 6. Tuning Procedure
 
-Encoder velocity computed per window: `ω_wheel = ΔN·(2π/48) / Δt_window`
+1. **Stationary IMU log** (at least 10 min): Allan variance gives the gyro
+   bias random walk and accelerometer bias random walk. Replace the `q_ba`
+   placeholder and confirm `sigma_gyro` / `sigma_accel`.
+2. **Encoder noise captures**: compare encoder-derived wheel `v` and omega
+   against the gyro or AS5X47 over several speeds; update
+   `sigma_wheel_v` / `sigma_wheel_omega`.
+3. **Power-on stationary calibration**: the driver removes the gyro offset;
+   the firmware averages the accelerometer for 2 s and keeps the residual as
+   `b_a`.
+4. **Full-vehicle test**: drive straight and rotate in place; compare `v` and
+   omega against the encoder and gyro. Adjust `q_v` / `q_om` if the response
+   is too slow or too noisy, then regenerate the DARE gains.
 
-Quantization floor (timer resolution σ_t, e.g. 1 µs):
+---
 
-```javascript
-σ²_ω ≈ ω² · [ (σ_t/Δt)² + (Δθ_q/(ω·Δt))² ] / 12
+## 7. External Dead Reckoning
+
+After each filter tick:
+
+```text
+ds     = 0.5*(v_prev + v)*dt
+dtheta = 0.5*(omega_prev + omega)*dt
+mid    = wrap(theta + 0.5*dtheta)
+x     += ds*cos(mid)
+y     += ds*sin(mid)
+s     += ds
+theta  = wrap(theta + dtheta)
 ```
 
-with Δθ_q = 2π/48 = 0.131 rad. **Measure in practice**: use the gyro as reference (pure-rotation test) and compare against the encoder-derived wheel-speed difference; the residual variance is σ²_ωL/σ²_ωR. The quantization floor is only a starting value: wheel-radius error is a systematic error (belongs in the scale uncertainty of P, not in R), and slip is environment-dependent (inflate R during hard acceleration/turning).
-
-**Key datasheet values (MPU-9250, ±4 g / ±1000°/s configuration):**
-
-| Parameter | Value |
-| --- | --- |
-| Gyro noise density | 0.01 °/s/√Hz |
-| Gyro initial zero-rate offset tolerance | ±5 °/s (→ P₀,bg) |
-| Gyro zero-rate offset drift over temperature | up to ±30 °/s (−40 to +85 °C, no numeric table) |
-| Accelerometer noise density | 300 µg/√Hz |
-| Accelerometer zero-g offset tolerance | ±60 mg (X,Y) / ±80 mg (Z) (→ P₀,ba) |
-| Gyro/accel sensitivity error | ±3% |
-
-The firmware never verifies the chip ID, and the part is discontinued with many counterfeits on the market — **read WHO_AM_I (expect 0x71) and compare stationary measured noise against the table above**; if measured noise is 3–5× higher, you have a clone — tune R and Q from measurements instead.
+The log records the acceleration input, velocity, and yaw rate, so distance
+can also be reconstructed offline with the trapezoidal rule. Heading is
+relative to the run origin and has no absolute correction while the
+magnetometer is unavailable.
 
 ---
 
-## 6. Optional: Magnetometer Heading Anchor (AK8963)
+## 8. Excluded Sensors
 
-Append a row `[0, 1, 0, 0, 0, 0]` to H, append `atan2(m_y, m_x)` to z (after hard/soft-iron calibration on the robot — the ±300 µT factory tolerance makes raw data useless otherwise), and append σ²_mag ≈ (0.02~0.05)² rad² to R (tune from indoor measurements).
+**Magnetometer.** The AK8963 reports zero valid headings in both 14 Nov
+captures. It is not fused: no state, no gain, no update. The driver still
+probes it and logs raw values/ST1/ST2 for diagnostics; `cal mag` and
+`cal retrymag` remain available if the hardware is repaired. Re-enabling it
+would require a new DARE row and a new absolute-heading state, not a silent
+fallback.
 
-Enable only in clean magnetic environments: gate with `y² > 9·S_mag` → discard that update (motor currents and steel structure make the robot a hostile place for a magnetometer).
-
----
-
-## 7. Tuning Procedure
-
-1. **Stationary IMU log** (≥10 min): Allan variance → IMU terms of R, Q_bg, Q_ba.
-2. **Steady-speed wheel logs**: several speeds → per-wheel σ²_ω; verify 1/Δt scaling; cross-check wheel radius/wheelbase against the gyro.
-3. **Power-on stationary calibration**: estimate b_g_cal, b_a_cal, load into x₀.
-4. **Full-vehicle test**: drive 10 m straight, rotate 360° in place; compare filter output against an external ground-truth pose; scale Q_v, Q_ω, and encoder R according to residual ratios.
+**Gyro bias state.** Not estimated. The startup offset removes the bulk; the
+encoder wheel-omega noise makes an online `b_g` state unobservable in the
+current DARE. A future AS5X47 repair would make a bias state viable.
 
 ---
 
-## Appendix: Minimal Runnable Parameters
+## Appendix: Minimal Parameters
 
-```javascript
-Δt = 0.01 s (100 Hz IMU), encoder window 0.02–0.05 s
-R = diag(σ²_ωL, σ²_ωR, 1.5e-6)          ← encoder entries from measurement
-Q = diag(0, 0, (0.05Δt)², (0.01Δt)², 1e-10, 1e-6Δt)
-x₀ = [0, 0, 0, 0, b_g_cal, b_a_cal]
-P₀ = diag(0, 0, 1, 1, 7.6e-3, 0.615)
+```text
+dt        = 1 ms (filter), 10 ms wheel window
+sigma_gyro        = 0.17 deg/s
+sigma_accel       = 0.12 m/s^2
+sigma_wheel_v     = 0.0145 m/s
+sigma_wheel_omega = 0.18 rad/s
+q_v               = 1.0 m/s^2
+q_om              = 0.7 rad/s^2
+q_ba              = 3e-3 m/s^2/sqrt(s)
+x0                = [0, 0, 0]
 ```

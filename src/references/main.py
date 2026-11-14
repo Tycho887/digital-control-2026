@@ -3,9 +3,10 @@
 State: x = [s, theta, v, omega, b_a, b_g, b_m]
 
 The firmware now uses the stationary decoupled estimator in
-``src/src/kalman.{h,cpp}``: state [v, b_a, theta, omega, b_g], constant gains,
-and no covariance propagation.  The matching reference and parity check live
-in ``tests/kalman_host/verify_gains.py`` and
+``src/src/kalman.{h,cpp}``: state [v, omega, b_a], constant gains, and no
+covariance propagation.  Heading and distance are integrated outside the
+filter; the magnetometer is not fused.  The matching reference and parity
+check live in ``tests/kalman_host/verify_gains.py`` and
 ``tests/kalman_host/test_parity.py``.
 
 This file is retained as the historical 7-state reference and demo.

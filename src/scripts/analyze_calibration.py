@@ -18,13 +18,14 @@ from pathlib import Path
 
 import numpy as np
 
-# Geometry and assumed sensor noise (keep in sync with kalman.h / kalman.cpp).
+# Geometry and assumed sensor noise (keep in sync with
+# kalman_filter_tuning/solve_dare.m and the gain bank in kalman.h).
 GEAR = 9.6
 WHEEL_RADIUS = 0.0315
 WHEEL_BASE = 0.14
 CONTROL_VOLTAGE_LIMIT = 3.0
-SIGMA_GYRO_DEG = 0.1                  # deg/s
-SIGMA_ACCEL = 0.0285                  # m/s^2
+SIGMA_GYRO_DEG = 0.17                 # deg/s, DARE input from the 14 Nov logs
+SIGMA_ACCEL = 0.12                    # m/s^2, in-motion DARE input
 SIGMA_ANGLE_DEG = 0.068               # deg
 SIGMA_ANGLE = np.deg2rad(SIGMA_ANGLE_DEG)
 SIGMA_MAG = 0.01                      # rad
@@ -54,7 +55,11 @@ COL_KFBG = 31
 COL_KFINNOV = 32
 COL_KFINNOVVAR = 36
 COL_PHASE = 40
+COL_MAGSTATUS = 41
+COL_IMUDT = 42
+COL_ENCODER = 43
 N_COLUMNS = 40
+N_COLUMNS_FULL = 45
 
 # Firmware axis mapping and upside-down schedule (keep in sync with
 # basebot_6.ino and kalman.h).
@@ -64,7 +69,7 @@ YAW_GYRO_AXIS = 0            # imuYawAxis
 YAW_GYRO_SIGN = -1.0         # imuYawRateSign
 SETTLE_EXCLUDE = 0.5         # s discarded after each phase transition
 ENCODER_MOTION = 5.0         # motor rad/s, encoderMotion stall threshold
-KF_WHEEL_V0 = 0.18           # kalman.h K_WHEEL_V[0]
+KF_WHEEL_V0 = 0.197604345    # kalman.h K_WHEEL_V[0]
 PHASE_LABELS = {10: "baseline", 11: "forward", 12: "turn", 2: "settling"}
 PHASE_ORDER = (10, 11, 12, 2)
 
@@ -76,15 +81,16 @@ FLAG_MAG_AVAILABLE = 1 << 4
 FLAG_AS5_VALID = 1 << 5
 FLAG_AS5_FRESH = 1 << 6
 FLAG_KF_HEALTHY = 1 << 7
+CAL_MAG_ATTEMPT = 1 << 8
+CAL_MAG_DRDY = 1 << 9
+CAL_MAG_OVERFLOW = 1 << 10
 
 KF_GYRO = 1 << 0
 KF_WHEEL_V = 1 << 1
 KF_WHEEL_OMEGA = 1 << 2
-KF_MAG = 1 << 3
-KF_MAG_REJECTED = 1 << 4
 KF_WHEEL_ENCODER = 1 << 5
 
-STATE_NAMES = ["v", "omega", "theta", "b_a", "b_g"]
+STATE_NAMES = ["v", "omega", "theta", "b_a", "reserved"]
 
 
 def latest_log(directory):
@@ -123,6 +129,37 @@ def load_cal(path):
 
 def _bool_mask(data, bit):
     return (data[:, COL_FLAGS].astype(np.uint16) & bit) != 0
+
+
+def capture_status(data):
+    """Optional timing and AK8963 status from the 45-column captures.
+
+    Older 40/41-column logs return an empty dict.
+    """
+    if data.shape[1] < N_COLUMNS_FULL:
+        return {}
+    flags = data[:, COL_FLAGS].astype(np.uint16)
+    dt = data[:, COL_IMUDT].astype(float)
+    encoder = data[:, COL_ENCODER:COL_ENCODER + 2]
+    return {
+        "imu_dt_us": {
+            "median": float(np.median(dt)),
+            "min": float(np.min(dt)),
+            "max": float(np.max(dt)),
+        },
+        "mag": {
+            "attempt": int(np.sum((flags & CAL_MAG_ATTEMPT) != 0)),
+            "drdy": int(np.sum((flags & CAL_MAG_DRDY) != 0)),
+            "overflow": int(np.sum((flags & CAL_MAG_OVERFLOW) != 0)),
+            "valid": int(np.sum((flags & FLAG_MAG_VALID) != 0)),
+        },
+        "encoder": {
+            "left_last": int(encoder[-1, 0]),
+            "right_last": int(encoder[-1, 1]),
+            "left_changes": int(np.sum(np.diff(encoder[:, 0]) != 0)),
+            "right_changes": int(np.sum(np.diff(encoder[:, 1]) != 0)),
+        },
+    }
 
 
 def _select(data, mask):
@@ -417,9 +454,7 @@ def analyze_noise(t, data, outdir=None, show=False):
     nis_rows = []
     for bit, label, index in ((KF_GYRO, "gyro", 0),
                               (KF_WHEEL_V, "wheel v", 1),
-                              (KF_WHEEL_OMEGA, "wheel omega", 2),
-                              (KF_MAG, "mag", 3),
-                              (KF_MAG_REJECTED, "mag rejected", 3)):
+                              (KF_WHEEL_OMEGA, "wheel omega", 2)):
         row = _nis_table(data, bit, label, index)
         if row is None:
             continue
@@ -704,7 +739,6 @@ def analyze_upside(t, data, outdir=None, show=False):
     kf_om = data[:, COL_KFOMEGA]
     kf_theta = np.unwrap(data[:, COL_KFTHETA])
     kf_ba = data[:, COL_KFBA]
-    kf_bg = data[:, COL_KFBG]
 
     gyro_yaw_deg = YAW_GYRO_SIGN * gyro[:, YAW_GYRO_AXIS]
     accel_forward = FORWARD_ACCEL_SIGN * acc[:, FORWARD_ACCEL_AXIS] * 9.80665
@@ -769,8 +803,8 @@ def analyze_upside(t, data, outdir=None, show=False):
           % (ENCODER_MOTION, int(zero_feed.sum()),
              100.0 * zero_feed.sum() / max(1, int(wheel_rows.sum()))))
     if mag_valid == 0:
-        print("magnetometer: UNAVAILABLE (0 valid heading samples); the mag "
-              "update and K_MAG were never exercised.")
+        print("magnetometer: UNAVAILABLE (0 valid heading samples); it is "
+              "diagnostic-only and is not fused by the estimator.")
     else:
         print("magnetometer: %d valid heading samples" % mag_valid)
 
@@ -834,22 +868,16 @@ def analyze_upside(t, data, outdir=None, show=False):
     print("\n=== Bias and heading behaviour ===")
     print("b_a: start %+.4f, end %+.4f, swing %.4f m/s^2"
           % (kf_ba[0], kf_ba[-1], np.nanmax(kf_ba) - np.nanmin(kf_ba)))
-    print("b_g: start %+.4f, end %+.4f, swing %.4f rad/s"
-          % (kf_bg[0], kf_bg[-1], np.nanmax(kf_bg) - np.nanmin(kf_bg)))
+    print("reserved bias column: %.4f (former b_g; not estimated)"
+          % data[0, COL_KFBG])
     print("theta: total change %+.4f rad (%+.1f deg) while the body did not "
           "rotate" % (kf_theta[-1] - kf_theta[0],
                       np.degrees(kf_theta[-1] - kf_theta[0])))
     if turn.size:
         turn_gyro = float(np.mean(gyro_yaw_deg[phase == 12]))
         turn_wheel = float(np.mean(ref_om[phase == 12]))
-        turn_bg = float(kf_bg[turn[-1]] - kf_bg[turn[0]])
-        print("turn phase: wheel omega %.3f rad/s, gyro yaw %.3f deg/s, "
-              "b_g change %+.3f rad/s" % (turn_wheel, turn_gyro, turn_bg))
-        if (abs(turn_bg) > 0.5 * abs(turn_wheel)
-                and abs(turn_gyro) < 0.5):
-            print("note: b_g absorbed the wheel/gyro disagreement. That is "
-                  "the wheels-off geometry, not a physical gyro bias; do not "
-                  "use this run to calibrate b_g.")
+        print("turn phase: wheel omega %.3f rad/s, gyro yaw %.3f deg/s"
+              % (turn_wheel, turn_gyro))
     if settle.size:
         print("settling phase: v %+.4f m/s, omega %+.4f rad/s"
               % (kf_v[settle[-1]], kf_om[settle[-1]]))
@@ -876,9 +904,6 @@ def analyze_upside(t, data, outdir=None, show=False):
             "ba_start": float(kf_ba[0]),
             "ba_end": float(kf_ba[-1]),
             "ba_swing": float(np.nanmax(kf_ba) - np.nanmin(kf_ba)),
-            "bg_start": float(kf_bg[0]),
-            "bg_end": float(kf_bg[-1]),
-            "bg_swing": float(np.nanmax(kf_bg) - np.nanmin(kf_bg)),
             "theta_change": float(kf_theta[-1] - kf_theta[0]),
         },
     }
@@ -904,8 +929,7 @@ def analyze_upside(t, data, outdir=None, show=False):
         axes[1].legend(loc="best")
         axes[1].grid(True, alpha=0.3)
         axes[2].plot(t, kf_ba, lw=1.1, label="b_a (m/s^2)")
-        axes[2].plot(t, kf_bg, lw=1.1, label="b_g (rad/s)")
-        axes[2].set_ylabel("bias estimate")
+        axes[2].set_ylabel("accel bias estimate")
         axes[2].set_xlabel("time (s)")
         axes[2].legend(loc="best")
         axes[2].grid(True, alpha=0.3)
@@ -950,6 +974,14 @@ def main():
     print("Log:  %s" % path)
     print("Mode: %s" % mode)
     print("Samples: %d over %.3f s" % (len(t), t[-1] - t[0]))
+    status = capture_status(data)
+    if status:
+        dt = status["imu_dt_us"]
+        print("IMU interval (us): median %.0f, min %.0f, max %.0f"
+              % (dt["median"], dt["min"], dt["max"]))
+        mag = status["mag"]
+        print("mag: attempts %d, DRDY %d, overflow %d, valid %d"
+              % (mag["attempt"], mag["drdy"], mag["overflow"], mag["valid"]))
 
     show = not args.no_plots and args.outdir is None
     outdir = args.outdir

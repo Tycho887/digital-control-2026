@@ -43,7 +43,8 @@ void UDisplay::setup()
   {
     usb.send("%% UDisplay::setup: SSD1306 allocation failed\n");
   }
-  Wire.setClock(1000000);
+  // The display library sets the Wire1 clock; do not touch Wire here, it is
+  // the IMU bus and must stay at 400 kHz.
   // Show initial display buffer contents on the screen --
   // the library initializes this with an Adafruit splash screen.
   //

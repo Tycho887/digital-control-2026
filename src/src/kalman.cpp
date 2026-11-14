@@ -19,13 +19,11 @@ float wrapAngle(float a)
   return a;
 }
 
-void StaticDecoupledEstimator::reset(float heading0)
+void StaticDecoupledEstimator::reset()
 {
   v = 0.0f;
-  b_a = 0.0f;
-  theta = wrapAngle(heading0);
   omega = 0.0f;
-  b_g = 0.0f;
+  b_a = 0.0f;
   for (int i = 0; i < KF_MEAS_COUNT; ++i)
   {
     lastInnovation[i] = 0.0f;
@@ -39,9 +37,8 @@ bool StaticDecoupledEstimator::predict(float aForward, float dt)
   if (!isfinite(aForward) || !isfinite(dt) || dt <= 0.0f || dt > 0.05f)
     return false;
 
-  // v' = v + (a - b_a) * dt, theta' = theta + omega * dt.
+  // v' = v + (a - b_a) * dt.
   v += (aForward - b_a) * dt;
-  theta = wrapAngle(theta + omega * dt);
 
   healthy = healthy && finiteState();
   return healthy;
@@ -55,11 +52,9 @@ bool StaticDecoupledEstimator::updateGyro(float gyroZ)
     return false;
   }
 
-  // H*x = omega + b_g.
-  const float innovation = gyroZ - (omega + b_g);
-  theta = wrapAngle(theta + kf_gains::K_GYRO[0] * innovation);
-  omega += kf_gains::K_GYRO[1] * innovation;
-  b_g += kf_gains::K_GYRO[2] * innovation;
+  // H*x = omega. The driver has already removed the gyro offset.
+  const float innovation = gyroZ - omega;
+  omega += kf_gains::K_GYRO * innovation;
 
   lastInnovation[KF_M_GYRO] = innovation;
   lastInnovationValid[KF_M_GYRO] = true;
@@ -96,9 +91,7 @@ bool StaticDecoupledEstimator::updateWheelOmega(float omegaMeas)
 
   // H*x = omega.
   const float innovation = omegaMeas - omega;
-  theta = wrapAngle(theta + kf_gains::K_WHEEL_OMEGA[0] * innovation);
-  omega += kf_gains::K_WHEEL_OMEGA[1] * innovation;
-  b_g += kf_gains::K_WHEEL_OMEGA[2] * innovation;
+  omega += kf_gains::K_WHEEL_OMEGA * innovation;
 
   lastInnovation[KF_M_WHEEL_OMEGA] = innovation;
   lastInnovationValid[KF_M_WHEEL_OMEGA] = true;
@@ -106,37 +99,9 @@ bool StaticDecoupledEstimator::updateWheelOmega(float omegaMeas)
   return healthy;
 }
 
-bool StaticDecoupledEstimator::updateMag(float magHeading)
-{
-  if (!isfinite(magHeading))
-  {
-    lastInnovationValid[KF_M_MAG] = false;
-    return false;
-  }
-
-  // H*x = theta.
-  const float innovation = wrapAngle(magHeading - theta);
-  lastInnovation[KF_M_MAG] = innovation;
-  if (fabsf(innovation) > kf_gains::MAG_GATE_RAD)
-  {
-    // Magnetic disturbance: keep the sample out of the state.
-    lastInnovationValid[KF_M_MAG] = false;
-    return false;
-  }
-
-  theta = wrapAngle(theta + kf_gains::K_MAG[0] * innovation);
-  omega += kf_gains::K_MAG[1] * innovation;
-  b_g += kf_gains::K_MAG[2] * innovation;
-
-  lastInnovationValid[KF_M_MAG] = true;
-  healthy = healthy && finiteState();
-  return healthy;
-}
-
 bool StaticDecoupledEstimator::finiteState() const
 {
-  return isfinite(v) && isfinite(b_a) && isfinite(theta) &&
-         isfinite(omega) && isfinite(b_g);
+  return isfinite(v) && isfinite(omega) && isfinite(b_a);
 }
 
 StaticDecoupledEstimator estimator;

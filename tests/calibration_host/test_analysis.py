@@ -86,8 +86,10 @@ def run_mag_checks(module):
     assert result["vertical_axis"] == 0, result["vertical_axis"]
     assert abs(result["firmware_slope"] - 1.0) < 0.1, result["firmware_slope"]
     assert result["firmware_ok"], result
-    assert result["best"]["axes"] == (1, 2), result["best"]
+    # A synthetic field can be fit by more than one atan2 pair; the pair that
+    # wins differs only by a constant heading offset, which the fit absorbs.
     assert abs(abs(result["best"]["slope"]) - 1.0) < 0.1, result["best"]
+    assert result["best"]["rmse"] < 0.01, result["best"]
 
 
 def run_noise_checks(module):
@@ -101,10 +103,10 @@ def run_noise_checks(module):
     flags[::10] |= 0x40               # AS5 velocity fresh
     data[:, 2] = flags
 
-    data[:, 12] = rng.normal(0.0, 0.1, n)          # gyro X, deg/s
+    data[:, 12] = rng.normal(0.0, 0.17, n)         # gyro X, deg/s
     data[:, 15] = rng.normal(0.0, 0.02, n)
     data[:, 16] = rng.normal(0.0, 0.02, n)
-    data[:, 17] = rng.normal(0.0, 0.0285 / 9.80665, n)
+    data[:, 17] = rng.normal(0.0, 0.12 / 9.80665, n)
 
     sigma_angle = np.deg2rad(0.068)
     data[:, 21] = rng.normal(0.0, sigma_angle, n)
@@ -117,12 +119,11 @@ def run_noise_checks(module):
 
     kf_mask = np.full(n, 0x03, dtype=np.int64)  # gyro + wheel v
     kf_mask[::10] |= 0x04  # wheel omega
-    kf_mask[::10] |= 0x08  # mag
     data[:, 3] = kf_mask
     data[:, 32] = rng.normal(0.0, 1.0, n)  # gyro innovation
     data[:, 33] = rng.normal(0.0, 1.0, n)  # wheel v innovation
     data[:, 34] = rng.normal(0.0, 1.0, n)  # wheel omega innovation
-    data[:, 35] = rng.normal(0.0, 1.0, n)  # mag innovation
+    data[:, 35] = 0.0                       # reserved innovation slot
     data[:, 36:40] = 1.0
 
     result = quiet(module.analyze_noise, data[:, 0], data)
@@ -133,8 +134,7 @@ def run_noise_checks(module):
         ratio = checks[name]["ratio"]
         assert 0.5 <= ratio <= 2.0, (name, ratio)
     for row in result["nis"]:
-        if row["label"] != "mag rejected":
-            assert 0.7 <= row["mean"] <= 1.3, row
+        assert 0.7 <= row["mean"] <= 1.3, row
 
 
 def run_track_checks(module):
@@ -226,12 +226,12 @@ def run_upside_checks(module):
     data[:, 26] = np.nan  # no magnetometer heading
 
     rng = np.random.default_rng(11)
-    data[:, 12] = rng.normal(0.0, 0.1, n)             # gyro yaw, deg/s
+    data[:, 12] = rng.normal(0.0, 0.17, n)            # gyro yaw, deg/s
     data[:, 13] = rng.normal(0.0, 0.2, n)
     data[:, 14] = rng.normal(0.0, 0.1, n)
     data[:, 15] = rng.normal(0.0, 0.02, n)
     data[:, 16] = rng.normal(0.0, 0.02, n)
-    data[:, 17] = rng.normal(0.0, 0.0285 / 9.80665, n)  # forward = -Z
+    data[:, 17] = rng.normal(0.0, 0.12 / 9.80665, n)  # forward = -Z
 
     result = quiet(module.analyze_upside, t, data)
     assert result["sensor"]["as5_dead"], result["sensor"]
@@ -259,12 +259,37 @@ def run_upside_checks(module):
         live_result["tracking"]
 
 
+def run_status_checks(module):
+    n = 100
+    data = np.zeros((n, 45))
+    data[:, 0] = np.arange(n) * 0.001
+    data[:, 2] = 0x01 | 0x02 | (1 << 8) | (1 << 9) | (1 << 10)
+    data[:, 41] = 0x0008  # ST1 = 0x08 (overflow), ST2 = 0x00
+    data[:, 42] = 1000
+    data[:, 43] = np.arange(n)
+    data[:, 44] = -np.arange(n)
+
+    status = module.capture_status(data)
+    assert status["imu_dt_us"]["median"] == 1000, status
+    assert status["imu_dt_us"]["min"] == 1000, status
+    assert status["imu_dt_us"]["max"] == 1000, status
+    assert status["mag"]["attempt"] == n, status
+    assert status["mag"]["drdy"] == n, status
+    assert status["mag"]["overflow"] == n, status
+    assert status["mag"]["valid"] == 0, status
+    assert status["encoder"]["left_last"] == n - 1, status
+    assert status["encoder"]["right_last"] == -(n - 1), status
+    assert status["encoder"]["left_changes"] == n - 1, status
+    assert module.capture_status(data[:, :41]) == {}
+
+
 def main():
     module = load_analyzer()
     run_mag_checks(module)
     run_noise_checks(module)
     run_track_checks(module)
     run_upside_checks(module)
+    run_status_checks(module)
     print("PASS: calibration analyzer synthetic checks")
     return 0
 

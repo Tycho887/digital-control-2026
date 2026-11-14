@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Plot the stationary estimator, the outer-loop commands, and wheel setpoints.
 
-The Basebot log header documents the format-2 columns:
+The Basebot log header documents the format-4 columns:
 
     1      time (s)
     2      robot state
     3      forward velocity reference (m/s)
     30-31  wheel controller setpoint (left, right) (motor rad/s)
     32     yaw-rate reference (rad/s)
-    33-37  estimator state [v, omega, theta, b_a, b_g]
-    38     forward-velocity error (m/s)
-    39     yaw-rate error (rad/s)
+    33-37  estimator [v, omega, dead-reckoned theta, b_a, reserved]
+    38     forward-velocity control error (vCmd - v) (m/s)
+    39     yaw-rate PID error (omegaRefLim - omega) (rad/s)
     40     outer-loop forward-velocity command (m/s)
     41     outer-loop yaw-rate command (rad/s)
 
@@ -28,11 +28,11 @@ import matplotlib.pyplot as plt
 STATE_LABELS = [
     r"$v$ (m/s)",
     r"$\omega$ (rad/s)",
-    r"$\theta$ (rad)",
+    r"$\theta$ dead-reckoned (rad)",
     r"$b_a$ (m/s$^2$)",
-    r"$b_g$ (rad/s)",
+    r"reserved",
 ]
-STATE_NAMES = ["v", "omega", "theta", "b_a", "b_g"]
+STATE_NAMES = ["v", "omega", "theta", "b_a", "reserved"]
 
 COL_TIME = 0
 COL_STATE = 1
@@ -66,7 +66,7 @@ def load_log(path):
         raise SystemExit("%s contains no data rows (only header/comments)." % path)
     if data.shape[1] < N_COLUMNS:
         raise SystemExit(
-            "%s has %d columns, but the format-2 log needs %d (columns "
+            "%s has %d columns, but the format-4 log needs %d (columns "
             "1-41).\nThis looks like a log from older firmware."
             % (path, data.shape[1], N_COLUMNS)
         )

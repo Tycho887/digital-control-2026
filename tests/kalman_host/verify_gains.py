@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the stationary gain bank at the real multi-rate update schedule.
+"""Verify the stationary gain bank and its DARE origin.
 
-The firmware predicts at 1 kHz, applies the gyro update every step, the wheel
-v/omega updates every 10 ms, and the magnetometer update asynchronously. A
-single DARE solved at one rate cannot be applied unchanged at all three rates,
-so this script checks the closed-loop error transition over a full 100-step
-cycle instead.
+The firmware predicts at 1 kHz, applies the gyro update every step, and the
+wheel v/omega updates every 10 ms. The gain bank is solved per observable
+block at those rates. This script checks the 100-step closed-loop error
+transition, simulates a deterministic scenario, and compares the header gains
+with a NumPy replica of the DARE.
 
 Run with the host venv Python (numpy only):
 
@@ -24,13 +24,26 @@ HEADER = ROOT / "src" / "src" / "kalman.h"
 
 DT = 0.001
 WHEEL_DIVIDER = 10
-MAG_DIVIDER = 100
 
-# State order used by the checks: [v, b_a, theta, omega, b_g].
-V, BA, THETA, OMEGA, BG = range(5)
+# State order used by the checks: [v, omega, b_a].
+V, OMEGA, BA = range(3)
+
+# DARE inputs, kept in sync with kalman_filter_tuning/solve_dare.m.
+SIGMA_GYRO_DPS = 0.17
+SIGMA_ACCEL = 0.12
+SIGMA_WHEEL_V = 0.0145
+SIGMA_WHEEL_OMEGA = 0.18
+Q_V = 1.0
+Q_OM = 0.7
+Q_BA = 3e-3
 
 
-def parse_gain(header, name, count):
+def parse_gain(header, name, count=None):
+    if count is None:
+        match = re.search(rf"{name}\s*=\s*([-+0-9.eEfF]+)\s*;", header)
+        if match is None:
+            raise RuntimeError(f"could not find {name} in {HEADER}")
+        return float(match.group(1).rstrip("fF"))
     match = re.search(
         rf"{name}\s*\[\s*{count}\s*\]\s*=\s*\{{([^}}]*)\}}", header)
     if match is None:
@@ -45,84 +58,103 @@ def load_gains():
     header = HEADER.read_text()
     return {
         "K_WHEEL_V": parse_gain(header, "K_WHEEL_V", 2),
-        "K_GYRO": parse_gain(header, "K_GYRO", 3),
-        "K_WHEEL_OMEGA": parse_gain(header, "K_WHEEL_OMEGA", 3),
-        "K_MAG": parse_gain(header, "K_MAG", 3),
+        "K_GYRO": np.array([parse_gain(header, "K_GYRO")]),
+        "K_WHEEL_OMEGA": np.array([parse_gain(header, "K_WHEEL_OMEGA")]),
     }
 
 
+def dare_gain(F, H, Q, R, it=50000, tol=1e-13):
+    """Steady-state Kalman predictor DARE for x+ = F x + w, z = H x + v."""
+    P = Q.copy()
+    for _ in range(it):
+        S = H @ P @ H.T + R
+        Si = np.linalg.inv(S)
+        Pn = F @ P @ F.T - F @ P @ H.T @ Si @ H @ P @ F.T + Q
+        if np.max(np.abs(Pn - P)) < tol * max(1.0, np.max(np.abs(Pn))):
+            P = Pn
+            break
+        P = Pn
+    S = H @ P @ H.T + R
+    return P @ H.T @ np.linalg.inv(S)
+
+
+def expected_gains():
+    """NumPy replica of kalman_filter_tuning/solve_dare.m."""
+    sigma_gyro = SIGMA_GYRO_DPS * math.pi / 180.0
+
+    F_t = np.array([[1.0, -DT], [0.0, 1.0]])
+    B_t = np.array([[DT], [0.0]])
+    Q_t = B_t * (SIGMA_ACCEL ** 2 + Q_V ** 2) @ B_t.T
+    Q_t = Q_t + np.diag([0.0, Q_BA ** 2 * DT])
+    F_tw = np.linalg.matrix_power(F_t, WHEEL_DIVIDER)
+    Q_tw = np.zeros((2, 2))
+    Ak = np.eye(2)
+    for _ in range(WHEEL_DIVIDER):
+        Q_tw += Ak @ Q_t @ Ak.T
+        Ak = Ak @ F_t
+    K_v = dare_gain(F_tw, np.array([[1.0, 0.0]]), Q_tw,
+                    np.array([[SIGMA_WHEEL_V ** 2]]))
+
+    K_g = dare_gain(np.array([[1.0]]), np.array([[1.0]]),
+                    np.array([[(Q_OM * DT) ** 2]]),
+                    np.array([[sigma_gyro ** 2]]))
+
+    K_w = dare_gain(np.array([[1.0]]), np.array([[1.0]]),
+                    np.array([[WHEEL_DIVIDER * (Q_OM * DT) ** 2]]),
+                    np.array([[SIGMA_WHEEL_OMEGA ** 2]]))
+    return K_v.ravel(), K_g.ravel(), K_w.ravel()
+
+
 def predict_matrix():
-    A = np.eye(5)
+    A = np.eye(3)
     A[V, BA] = -DT
-    A[THETA, OMEGA] = DT
     return A
 
 
 def transitions(g):
-    H_gyro = np.array([0.0, 0.0, 0.0, 1.0, 1.0])
-    H_wheel_v = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
-    H_wheel_omega = np.array([0.0, 0.0, 0.0, 1.0, 0.0])
-    H_mag = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
+    H_gyro = np.array([0.0, 1.0, 0.0])
+    H_wheel_v = np.array([1.0, 0.0, 0.0])
+    H_wheel_omega = np.array([0.0, 1.0, 0.0])
 
-    K_gyro = np.array([0.0, 0.0, g["K_GYRO"][0], g["K_GYRO"][1],
-                       g["K_GYRO"][2]])
-    K_wheel_v = np.array([g["K_WHEEL_V"][0], g["K_WHEEL_V"][1], 0.0, 0.0,
-                          0.0])
-    K_wheel_omega = np.array([0.0, 0.0, g["K_WHEEL_OMEGA"][0],
-                              g["K_WHEEL_OMEGA"][1], g["K_WHEEL_OMEGA"][2]])
-    K_mag = np.array([0.0, 0.0, g["K_MAG"][0], g["K_MAG"][1],
-                      g["K_MAG"][2]])
+    K_gyro = np.array([0.0, float(g["K_GYRO"][0]), 0.0])
+    K_wheel_v = np.array([g["K_WHEEL_V"][0], 0.0, g["K_WHEEL_V"][1]])
+    K_wheel_omega = np.array([0.0, float(g["K_WHEEL_OMEGA"][0]), 0.0])
 
     return {
         "gyro": (K_gyro, H_gyro),
         "wheel_v": (K_wheel_v, H_wheel_v),
         "wheel_omega": (K_wheel_omega, H_wheel_omega),
-        "mag": (K_mag, H_mag),
     }
 
 
 def update_matrix(K, H):
-    return np.eye(5) - np.outer(K, H)
+    return np.eye(3) - np.outer(K, H)
 
 
 def cycle_transition(g, steps=100):
     A = predict_matrix()
     u = transitions(g)
 
-    M = np.eye(5)
+    M = np.eye(3)
     for k in range(steps):
         M = A @ M
         M = update_matrix(*u["gyro"]) @ M
         if k % WHEEL_DIVIDER == 0:
             M = update_matrix(*u["wheel_v"]) @ M
             M = update_matrix(*u["wheel_omega"]) @ M
-        if k % MAG_DIVIDER == 0:
-            M = update_matrix(*u["mag"]) @ M
     return M
 
 
-def wrap(a):
-    a = math.fmod(a, 2.0 * math.pi)
-    if a <= -math.pi:
-        a += 2.0 * math.pi
-    elif a > math.pi:
-        a -= 2.0 * math.pi
-    return a
-
-
-def simulate(g, seconds=5.0):
-    """Deterministic scenario with a velocity ramp, yaw rate, and biases."""
+def simulate(g, seconds=60.0):
+    """Deterministic scenario with a velocity ramp, yaw rate, and bias."""
     steps = int(seconds / DT)
     v = 0.0
     b_a = 0.0
-    theta = 0.0
     omega = 0.0
-    b_g = 0.0
 
     v_true = 0.0
     omega_true = 0.2
     b_a_true = 0.05
-    b_g_true = 0.01
 
     for i in range(steps):
         t = i * DT
@@ -131,13 +163,10 @@ def simulate(g, seconds=5.0):
 
         # Predict. The accelerometer reads a_true + b_a_true.
         v += (a_true + b_a_true - b_a) * DT
-        theta = wrap(theta + omega * DT)
 
-        # Gyro every step: omega + b_g.
-        innov = (omega_true + b_g_true) - (omega + b_g)
-        theta = wrap(theta + g["K_GYRO"][0] * innov)
-        omega += g["K_GYRO"][1] * innov
-        b_g += g["K_GYRO"][2] * innov
+        # Gyro every step.
+        innov = omega_true - omega
+        omega += float(g["K_GYRO"][0]) * innov
 
         # Wheel v/omega every 10 ms.
         if i % WHEEL_DIVIDER == 0:
@@ -146,9 +175,7 @@ def simulate(g, seconds=5.0):
             b_a += g["K_WHEEL_V"][1] * innov
 
             innov = omega_true - omega
-            theta = wrap(theta + g["K_WHEEL_OMEGA"][0] * innov)
-            omega += g["K_WHEEL_OMEGA"][1] * innov
-            b_g += g["K_WHEEL_OMEGA"][2] * innov
+            omega += float(g["K_WHEEL_OMEGA"][0]) * innov
 
     return {
         "v": v,
@@ -157,8 +184,6 @@ def simulate(g, seconds=5.0):
         "b_a_true": b_a_true,
         "omega": omega,
         "omega_true": omega_true,
-        "b_g": b_g,
-        "b_g_true": b_g_true,
     }
 
 
@@ -170,9 +195,24 @@ def main():
         if not np.all(np.isfinite(values)):
             failures.append(f"{name} contains non-finite values")
 
+    expected_v, expected_g, expected_w = expected_gains()
+    checks = (
+        ("K_WHEEL_V", g["K_WHEEL_V"], expected_v),
+        ("K_GYRO", g["K_GYRO"], expected_g),
+        ("K_WHEEL_OMEGA", g["K_WHEEL_OMEGA"], expected_w),
+    )
+    print("DARE gain check (header vs NumPy replica):")
+    for name, got, expected in checks:
+        ok = np.allclose(got, expected, rtol=0.05, atol=1e-6)
+        print(f"  {name:14s} header={np.array2string(got, precision=6)} "
+              f"expected={np.array2string(expected, precision=6)} "
+              f"{'OK' if ok else 'MISMATCH'}")
+        if not ok:
+            failures.append(f"{name} does not match the DARE within 5%")
+
     u = transitions(g)
     A = predict_matrix()
-    print("Individual update closed-loop |eig(A - A K H)|:")
+    print("\nIndividual update closed-loop |eig(A - A K H)|:")
     for name, (K, H) in u.items():
         eig = np.abs(np.linalg.eigvals(A @ update_matrix(K, H)))
         print(f"  {name:12s}: " + " ".join(f"{x:.6f}" for x in np.sort(eig)))
@@ -180,7 +220,7 @@ def main():
     M = cycle_transition(g)
     eig = np.abs(np.linalg.eigvals(M))
     max_eig = float(np.max(eig))
-    print("\n100-step cycle (1 kHz predict/gyro, 100 Hz wheel, 10 Hz mag):")
+    print("\n100-step cycle (1 kHz predict/gyro, 100 Hz wheel):")
     print("  |eig|: " + " ".join(f"{x:.6f}" for x in np.sort(eig)))
     print(f"  max |eig| = {max_eig:.6f}")
     if max_eig >= 1.0:
@@ -188,17 +228,16 @@ def main():
 
     sim = simulate(g)
     print("\nDeterministic simulation:")
-    print(f"  v     = {sim['v']:.6f}  (true {sim['v_true']:.6f})")
-    print(f"  b_a   = {sim['b_a']:.6f}  (true {sim['b_a_true']:.6f})")
+    print(f"  v   = {sim['v']:.6f}  (true {sim['v_true']:.6f})")
+    print(f"  b_a = {sim['b_a']:.6f}  (true {sim['b_a_true']:.6f})")
     print(f"  omega = {sim['omega']:.6f}  (true {sim['omega_true']:.6f})")
-    print(f"  b_g   = {sim['b_g']:.6f}  (true {sim['b_g_true']:.6f})")
 
     if abs(sim["v"] - sim["v_true"]) > 1e-2:
         failures.append("v did not track the velocity reference")
     if abs(sim["omega"] - sim["omega_true"]) > 1e-2:
         failures.append("omega did not track the yaw-rate reference")
-    if abs(sim["b_g"] - sim["b_g_true"]) > 1e-2:
-        failures.append("gyro bias did not converge")
+    if abs(sim["b_a"] - sim["b_a_true"]) > 2e-3:
+        failures.append("accelerometer bias did not converge")
 
     if failures:
         print("\nFAIL:")
@@ -206,7 +245,7 @@ def main():
             print(f"  - {failure}")
         return 1
 
-    print("\nPASS: gain bank is stable at the firmware update schedule.")
+    print("\nPASS: gain bank matches the DARE and is stable at the update schedule.")
     return 0
 
 

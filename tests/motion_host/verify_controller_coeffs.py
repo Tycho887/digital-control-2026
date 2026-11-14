@@ -111,7 +111,7 @@ def check_geometry(firmware_text, param_text):
     if different:
         print("WARNING: firmware geometry differs from Motor_model_param.m "
               "and/or week06. Confirm the physical values before changing the "
-              "KF gains; see src/src/KF_specification.md section 9.")
+              "KF gains; see src/src/controller_specification.md section 5.")
 
 
 def check_vector(name, expected, actual, failures):
@@ -181,7 +181,7 @@ def main():
         failures.append("MAG_UPDATE_DIVIDER not found in uimu2.cpp")
     else:
         divider = int(divider_match.group(1))
-        expected_divider = 100  # 10 Hz at the 1 kHz tick
+        expected_divider = 10  # 100 Hz sensor read; estimator gates to 10 Hz
         print("mag update divider expected %d  firmware %d  %s" %
               (expected_divider, divider,
                "OK" if divider == expected_divider else "MISMATCH"))

@@ -34,6 +34,9 @@ constexpr int MAG_H1_AXIS = 1;      // right
 constexpr int MAG_H2_AXIS = 2;      // backwards
 constexpr float MAG_H1_SIGN = 1.0f;
 constexpr float MAG_H2_SIGN = -1.0f;
+// AK8963 continuous mode runs at 100 Hz, so read it every 10th 1 kHz tick.
+// The estimator does not consume the heading; it is diagnostic only.
+constexpr uint32_t MAG_UPDATE_DIVIDER = 10;
 }
 
 UImu2 imu2;
@@ -48,19 +51,21 @@ void UImu2::setup()
 
 void UImu2::initMpu()
 {
+  // The MPU-9250 and the AK8963 behind its bypass path are both 400 kHz
+  // parts. Running the bus at 1 MHz (the old setting) is outside the
+  // datasheet limit and makes the magnetometer marginal, so the whole IMU
+  // bus stays at 400 kHz.
   #if defined(REGBOT_HW4)
-  Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_INT, I2C_RATE_1000 );
-  i2cClock = 1000000;
+  Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_INT, I2C_RATE_400 );
   #else
     #if defined(REGBOT_HW41) || defined(REGBOT_HW63_35)
     Wire.begin();
-    Wire.setClock(1000000);
-    i2cClock = 1000000;
+    Wire.setClock(400000);
     #else
-    Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_16_17, I2C_PULLUP_EXT, I2C_RATE_1000 );
-    i2cClock = 1000000;
+    Wire.begin ( I2C_MASTER, 0x00, I2C_PINS_16_17, I2C_PULLUP_EXT, I2C_RATE_400 );
     #endif
   #endif
+  i2cClock = 400000;
   /* Initialize and configure IMU */
   mpu.setWire(&Wire);
   uint8_t id = 0;
@@ -92,45 +97,11 @@ void UImu2::initMpu()
     Wire.write(0x1D);
     Wire.write(0x02);
     Wire.endTransmission();
-    // AK8963 magnetometer has a lower I2C clock limit than the MPU
-    Wire.setClock(400000);
+    // Bring up the AK8963 behind the MPU's bypass path and print the full
+    // register state. magProbe() decides whether the magnetometer is usable.
     mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
     delay(20);
-    // Check AK8963 presence: WHO_AM_I (register 0x00) is 0x48. The same
-    // bytes also expose whether a data-ready sample can be read, which is
-    // what the filter actually needs.
-    uint8_t who = 0;
-    Wire.beginTransmission(0x0C);
-    Wire.write(0x00);
-    if (Wire.endTransmission(false) == 0 and
-        Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1)
-      who = Wire.read();
-    uint8_t magRet = 1;
-    uint8_t st1 = 0;
-    uint8_t st2 = 0;
-    // A continuous-mode sample may not be ready on the first read; retry a
-    // few times before declaring the sensor unusable.
-    for (int attempt = 0; attempt < 3; attempt++)
-    {
-      magRet = mpu.magUpdate();
-      st1 = mpu.magBuff[0];
-      st2 = mpu.magBuff[6];
-      if (magRet == 0 and (st1 & 0x01) and
-          !(st1 & 0x08) and !(st2 & 0x08))
-        break;
-      delay(10);
-    }
-    magAvailable = (magRet == 0) and (st1 & 0x01) and
-                   !(st1 & 0x08) and !(st2 & 0x08);
-    magFresh = false;
-    magHeadingValid = false;
-    Wire.setClock(i2cClock);
-    const int MSL = 180;
-    char s[MSL];
-    snprintf(s, MSL,
-             "%% magnetometer AK8963 %s (who=0x%02X, ret=%u, st1=0x%02X, st2=0x%02X)\r\n",
-             magAvailable ? "ready" : "not usable", who, magRet, st1, st2);
-    usb.send(s);
+    magAvailable = magProbe();
   }
 }
 
@@ -186,24 +157,68 @@ void UImu2::startMagCalibration()
 
 bool UImu2::retryMag()
 {
-  Wire.setClock(400000);
   mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
   delay(20);
-  uint8_t who = 0;
-  Wire.beginTransmission(0x0C);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) == 0 and
-      Wire.requestFrom(uint8_t(0x0C), uint8_t(1)) == 1)
-    who = Wire.read();
-  uint8_t magRet = mpu.magUpdate();
-  uint8_t st1 = mpu.magBuff[0];
-  uint8_t st2 = mpu.magBuff[6];
-  Wire.setClock(i2cClock);
-  magAvailable = (magRet == 0) and (st1 & 0x01) and
-                 !(st1 & 0x08) and !(st2 & 0x08);
-  magHeadingValid = false;
   magFresh = false;
-  if (magAvailable)
+  magHeadingValid = false;
+  magAvailable = magProbe();
+  return magAvailable;
+}
+
+bool UImu2::magProbe()
+{
+  uint8_t mpuId = 0;
+  uint8_t pwr = 0;
+  uint8_t intCfg = 0;
+  uint8_t userCtrl = 0;
+  uint8_t akId = 0;
+  uint8_t cntl1 = 0;
+  uint8_t asa[3] = {0, 0, 0};
+  readReg(ADDRESS_MPU, 0x75, &mpuId, 1);
+  readReg(ADDRESS_MPU, 0x6B, &pwr, 1);
+  readReg(ADDRESS_MPU, 0x37, &intCfg, 1);
+  readReg(ADDRESS_MPU, 0x6A, &userCtrl, 1);
+  readReg(0x0C, 0x00, &akId, 1);
+  readReg(0x0C, 0x0A, &cntl1, 1);
+  mpuWho = mpuId;
+  akWho = akId;
+  magCntl1 = cntl1;
+  magIntCfg = intCfg;
+  magUserCtrl = userCtrl;
+  if (readReg(0x0C, 0x10, asa, 3))
+  {
+    magAsa[0] = asa[0];
+    magAsa[1] = asa[1];
+    magAsa[2] = asa[2];
+  }
+  magSt1 = 0;
+  magSt2 = 0;
+  magFresh = false;
+  magHeadingValid = false;
+  // The AK8963 updates at 100 Hz. Retry ST1 for up to 100 ms so a single
+  // phase miss at power-on cannot latch the sensor off.
+  bool validSample = false;
+  for (int attempt = 0; attempt < 10; attempt++)
+  {
+    uint8_t st1 = 0;
+    if (readReg(0x0C, 0x02, &st1, 1))
+    {
+      magSt1 = st1;
+      if ((st1 & 0x01) and !(st1 & 0x08))
+      {
+        uint8_t ret = mpu.magUpdate();
+        magSt2 = mpu.magBuff[6];
+        if (ret == 0 and !(magSt2 & 0x08))
+        {
+          validSample = true;
+          break;
+        }
+      }
+    }
+    delay(10);
+  }
+  bool available = akId == 0x48;
+  if (validSample)
   {
     mag[0] = mpu.magX();
     mag[1] = mpu.magY();
@@ -214,20 +229,55 @@ bool UImu2::retryMag()
     magFresh = true;
     magHeadingValid = true;
   }
-  const int MSL = 220;
+  magOffset[0] = mpu.magXOffset;
+  magOffset[1] = mpu.magYOffset;
+  magOffset[2] = mpu.magZOffset;
+  magAvailable = available;
+  const int MSL = 360;
   char s[MSL];
   snprintf(s, MSL,
-           "%% mag retry: who=0x%02X available=%d ret=%u st1=0x%02X "
-           "st2=0x%02X raw=%g %g %g heading=%g\r\n",
-           who, magAvailable, magRet, st1, st2,
-           mag[0], mag[1], mag[2], magHeading);
+           "%% mag probe: mpu=0x%02X ak=0x%02X cntl1=0x%02X bypass=%u "
+           "pwr=0x%02X mst=%u st1=0x%02X st2=0x%02X asa=%u,%u,%u "
+           "off=%d,%d,%d raw=%g,%g,%g heading=%g available=%u%s\r\n",
+           mpuId, akId, cntl1, (unsigned)((intCfg >> 1) & 1),
+           pwr, (unsigned)((userCtrl >> 5) & 1), magSt1, magSt2,
+           magAsa[0], magAsa[1], magAsa[2],
+           mpu.magXOffset, mpu.magYOffset, mpu.magZOffset,
+           mag[0], mag[1], mag[2], magHeading, available ? 1u : 0u,
+           mpuId == 0x70 ? " (MPU-6500: no AK8963)" : "");
   usb.send(s);
-  return magAvailable;
+  return available;
+}
+
+bool UImu2::readReg(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n)
+{
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0)
+    return false;
+  if (Wire.requestFrom(addr, n) != n)
+    return false;
+  for (uint8_t i = 0; i < n; i++)
+    buf[i] = Wire.read();
+  return true;
+}
+
+void UImu2::readTemperature()
+{
+  uint8_t b[2] = {0, 0};
+  if (readReg(ADDRESS_MPU, 0x41, b, 2))
+  {
+    int16_t raw = (int16_t)(((uint16_t)b[0] << 8) | b[1]);
+    temperatureC = raw / 333.87f + 21.0f;
+    temperatureValid = true;
+  }
+  lastTemperatureUs = micros();
 }
 
 void UImu2::tick()
 { // read data - first time will fail
   accelFresh = gyroFresh = magFresh = false;
+  magAttempt = false;
   // INT_STATUS bit 0 distinguishes new sensor samples from repeated register reads.
   bool dataReady = false;
   Wire.beginTransmission(ADDRESS_MPU);
@@ -326,52 +376,59 @@ void UImu2::tick()
       // IMU frame: X down, Y right, Z backwards (forward = -Z, CCW yaw = -X)
       if (!useMag)
         magHeadingValid = false;
-      else if (magAvailable and (tickCnt % 10) == 0)
-      { // AK8963 supports max 400 kHz I2C clock
-        Wire.setClock(400000);
-        uint8_t magRetval = mpu.magUpdate();
-        Wire.setClock(i2cClock);
-        // ST1: DRDY bit 0, DOR bit 1, HOFL bit 3. ST2 bit 3 is also HOFL.
-        // Require a fresh sample and reject magnetic overflow; accept DOR
-        // because the latest sample is still a valid measurement.
-        uint8_t st1 = mpu.magBuff[0];
-        uint8_t st2 = mpu.magBuff[6];
-        if (magRetval == 0 and (st1 & 0x01) and
-            !(st1 & 0x08) and !(st2 & 0x08))
+      else if (magAvailable and (tickCnt % MAG_UPDATE_DIVIDER) == 0)
+      { // ST1 must be read separately: magUpdate() starts at HXL (0x03).
+        magAttempt = true;
+        uint8_t st1 = 0;
+        if (readReg(0x0C, 0x02, &st1, 1))
         {
-          mag[0] = mpu.magX();
-          mag[1] = mpu.magY();
-          mag[2] = mpu.magZ();
-          magHeading = atan2f(MAG_H1_SIGN * mag[MAG_H1_AXIS],
-                              MAG_H2_SIGN * mag[MAG_H2_AXIS]);
-          magTimestampUs = micros();
-          magFresh = true;
-          magHeadingValid = true;
-          if (magCalActive)
-          { // accumulate raw range while the robot is rotated
-            for (int i = 0; i < 3; i++)
+          magSt1 = st1;
+          // ST1: DRDY bit 0, DOR bit 1, HOFL bit 3. ST2 bit 3 is also HOFL.
+          // Require a fresh sample and reject magnetic overflow; accept DOR
+          // because the latest sample is still a valid measurement.
+          if ((st1 & 0x01) and !(st1 & 0x08))
+          {
+            uint8_t magRetval = mpu.magUpdate();
+            magSt2 = mpu.magBuff[6];
+            if (magRetval == 0 and !(magSt2 & 0x08))
             {
-              if (mag[i] < magMin[i])
-                magMin[i] = mag[i];
-              if (mag[i] > magMax[i])
-                magMax[i] = mag[i];
-            }
-            if (millis() - magCalStart >= 8000)
-            { // hard-iron offset is the center of the measured range
-              mpu.magXOffset = (int16_t)((magMin[0] + magMax[0]) / 2);
-              mpu.magYOffset = (int16_t)((magMin[1] + magMax[1]) / 2);
-              mpu.magZOffset = (int16_t)((magMin[2] + magMax[2]) / 2);
-              magCalActive = false;
-              const int MSL = 150;
-              char s[MSL];
-              snprintf(s, MSL, "%% mag offsets x=%g y=%g z=%g\r\n",
-                       (float)mpu.magXOffset, (float)mpu.magYOffset, (float)mpu.magZOffset);
-              usb.send(s);
-              usb.send("%% Reboot to restart the filter from the calibrated heading\r\n");
+              mag[0] = mpu.magX();
+              mag[1] = mpu.magY();
+              mag[2] = mpu.magZ();
+              magHeading = atan2f(MAG_H1_SIGN * mag[MAG_H1_AXIS],
+                                  MAG_H2_SIGN * mag[MAG_H2_AXIS]);
+              magTimestampUs = micros();
+              magFresh = true;
+              magHeadingValid = true;
+              if (magCalActive)
+              { // accumulate raw range while the robot is rotated
+                for (int i = 0; i < 3; i++)
+                {
+                  if (mag[i] < magMin[i])
+                    magMin[i] = mag[i];
+                  if (mag[i] > magMax[i])
+                    magMax[i] = mag[i];
+                }
+                if (millis() - magCalStart >= 8000)
+                { // hard-iron offset is the center of the measured range
+                  mpu.magXOffset = (int16_t)((magMin[0] + magMax[0]) / 2);
+                  mpu.magYOffset = (int16_t)((magMin[1] + magMax[1]) / 2);
+                  mpu.magZOffset = (int16_t)((magMin[2] + magMax[2]) / 2);
+                  magCalActive = false;
+                  const int MSL = 150;
+                  char s[MSL];
+                  snprintf(s, MSL, "%% mag offsets x=%g y=%g z=%g\r\n",
+                           (float)mpu.magXOffset, (float)mpu.magYOffset, (float)mpu.magZOffset);
+                  usb.send(s);
+                  usb.send("%% Reboot to restart the filter from the calibrated heading\r\n");
+                }
+              }
             }
           }
         }
       }
+      if (micros() - lastTemperatureUs >= 1000000)
+        readTemperature();
     }
     { //  complementary tilt filter only
       estimateTilt();
