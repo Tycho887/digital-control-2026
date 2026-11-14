@@ -233,6 +233,33 @@ float endTime = 0;
 float desiredValue = 0;
 float desiredHeading = 0;
 
+// The abstract filter class is supposed to let us implement different filters.
+// The two main ones are low-pass filters for the wheel speed and a KF for the dead-reckoning.
+// It needs methods to allow for updates of internal states and sampling/interpolation of internal states
+// This is critical for sensors / controllers operating at different speeds
+
+struct WheelSpeeds 
+{
+  float left;
+  float right;
+};
+
+struct Polar
+{
+  float speed;
+  float heading;
+};
+
+WheelSpeeds polar2Cartesian(float speed, float heading)
+{
+  WheelSpeeds ws;
+  ws.left = speed - (heading * wheelBase / 2.0f);
+  ws.right = speed + (heading * wheelBase / 2.0f);
+  return ws;
+}
+
+
+
 class AlphaBetaFilter {
   public:
     // ---- Tuning ----
@@ -291,6 +318,45 @@ struct PID_Coefficients
   float b2;
   float a1;
   float a2;
+};
+
+class YawController {
+  public:
+    PID_Coefficients coeffs;
+    float u1 = 0.0f, u2 = 0.0f;
+    float e1 = 0.0f, e2 = 0.0f;
+    float error = 0.0f;
+    float ComputeCCDE(float error);
+    void reset() {
+      u1 = 0.0f;
+      u2 = 0.0f;
+      e1 = 0.0f;
+      e2 = 0.0f;
+      error = 0.0f;
+    }
+    YawController(PID_Coefficients x) {
+      coeffs = x;
+    }
+
+};
+
+class VelocityController {
+  public:
+    PID_Coefficients coeffs;
+    float u1 = 0.0f, u2 = 0.0f;
+    float e1 = 0.0f, e2 = 0.0f;
+    float error = 0.0f;
+    float ComputeCCDE(float error);
+    void reset() {
+      u1 = 0.0f;
+      u2 = 0.0f;
+      e1 = 0.0f;
+      e2 = 0.0f;
+      error = 0.0f;
+    }
+    VelocityController(PID_Coefficients x) {
+      coeffs = x;
+    }
 };
 
 class WheelController {
