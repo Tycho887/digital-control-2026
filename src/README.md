@@ -163,11 +163,13 @@ wheel speeds corresponding to +30 degrees/s for 2.5 s, and finishes with 0.5 s
 at zero before forcing the motors off. It uses only the inner encoder PI for
 actuation while the estimator and raw-sensor logging continue. This supports
 motor-on noise and wheel-loop diagnostics without chassis motion; wheel-derived
-motion is not chassis ground truth in this configuration. When selected in
-`loop()`, this function waits for the start button and initializes the capture
-itself. The USB command `cal upside` arms the same schedule for a start-button
-press. Do not call the low-level phase stepper directly from `loop()`; doing so
-bypasses initialization and completion handling.
+motion is not chassis ground truth in this configuration. The wheels rotate
+without the body turning, so the estimator learns the disagreement as `b_g`.
+Treat that state as an experiment artifact, not as a calibration result. When
+selected in `loop()`, this function waits for the start button and initializes
+the capture itself. The USB command `cal upside` arms the same schedule for a
+start-button press. Do not call the low-level phase stepper directly from
+`loop()`; doing so bypasses initialization and completion handling.
 
 The calibration and driving procedures are separate. Save the completed upside
 capture before starting another experiment because all captures share one RAM
@@ -188,7 +190,7 @@ The zero variance columns are intentional: the stationary filter does not
 propagate `S`. Noise captures provide measurements for later gain retuning;
 there is no on-device `R` matrix to update automatically.
 
-Analyze the newest existing mag/noise/track capture with:
+Analyze the newest existing mag/noise/track/upside capture with:
 
 ```sh
 python3 src/scripts/analyze_calibration.py
@@ -202,11 +204,14 @@ pair/sign against gyro-integrated yaw (including the firmware's current
 assumed values; NIS is unavailable because the stationary gains do not
 propagate `S`. `track` reports rise time, overshoot, settling time,
 steady-state and RMS error, and 3 V saturation for the PI feedback, AS5X47
-velocity and estimator velocity.
+velocity and estimator velocity. `upside` reports sensor health (dead AS5X47
+bus, magnetometer availability, encoder-fallback share, zero-velocity feed
+events), per-phase gyro and accelerometer noise, the estimator's first-order
+velocity response and steady-state tracking against the wheel reference, and
+the bias/heading behaviour. Wheel-derived velocity is not chassis ground truth
+while the robot is upside down, so the report keeps those quantities separate.
 Pass `--outdir DIR` to save PNGs instead of opening windows, or `--no-plots`
-for the table only. Upside-specific and format-3-specific analysis is deferred
-until real captures are available; the serial headers are the authoritative
-column descriptions for those new logs.
+for the table only.
 
 If column 29 of a standard log is `NaN` throughout, run `cal retrymag` and
 check the printed ST1/ST2 values. `cal mag` also reports whether the

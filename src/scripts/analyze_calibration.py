@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Analyze a firmware calibration capture (`cal mag`, `cal noise`, `cal track`).
+"""Analyze a firmware calibration capture.
 
-The firmware prints a `% CAL <mode>` line followed by the column header and
-rows documented in `printCalLog()` (src/src/basebot_6.ino). With no log
-argument the newest file in ../logs is used.
+Handles `cal mag`, `cal noise`, `cal track` and `cal upside`. The firmware
+prints a `% CAL <mode>` line followed by the column header and rows documented
+in `printCalLog()` (src/src/basebot_6.ino). With no log argument the newest
+file in ../logs is used.
 
 Examples:
     python3 src/scripts/analyze_calibration.py logs/device-monitor-....log
@@ -52,7 +53,20 @@ COL_KFBA = 30
 COL_KFBG = 31
 COL_KFINNOV = 32
 COL_KFINNOVVAR = 36
+COL_PHASE = 40
 N_COLUMNS = 40
+
+# Firmware axis mapping and upside-down schedule (keep in sync with
+# basebot_6.ino and kalman.h).
+FORWARD_ACCEL_AXIS = 2       # imuForwardAxis
+FORWARD_ACCEL_SIGN = -1.0    # imuForwardAccelSign
+YAW_GYRO_AXIS = 0            # imuYawAxis
+YAW_GYRO_SIGN = -1.0         # imuYawRateSign
+SETTLE_EXCLUDE = 0.5         # s discarded after each phase transition
+ENCODER_MOTION = 5.0         # motor rad/s, encoderMotion stall threshold
+KF_WHEEL_V0 = 0.18           # kalman.h K_WHEEL_V[0]
+PHASE_LABELS = {10: "baseline", 11: "forward", 12: "turn", 2: "settling"}
+PHASE_ORDER = (10, 11, 12, 2)
 
 FLAG_ACCEL_FRESH = 1 << 0
 FLAG_GYRO_FRESH = 1 << 1
@@ -68,6 +82,7 @@ KF_WHEEL_V = 1 << 1
 KF_WHEEL_OMEGA = 1 << 2
 KF_MAG = 1 << 3
 KF_MAG_REJECTED = 1 << 4
+KF_WHEEL_ENCODER = 1 << 5
 
 STATE_NAMES = ["v", "omega", "theta", "b_a", "b_g"]
 
@@ -605,6 +620,301 @@ def analyze_track(t, data, outdir=None, show=False):
     return {"steps": metrics, "summary": summary}
 
 
+def _phase_window(t, phase, target):
+    """Rows of one schedule phase, with the post-transition settle excluded.
+
+    The settling phase is no longer than the exclusion window, so it is
+    returned whole and flagged.
+    """
+    mask = phase == target
+    if not mask.any():
+        return mask, False
+    trimmed = mask & (t >= t[mask][0] + SETTLE_EXCLUDE)
+    if trimmed.sum() < 10:
+        return mask, False
+    return trimmed, True
+
+
+def _sigma(t, x, mask):
+    """Detrended 1-sigma of x over mask."""
+    tt = t[mask]
+    xx = x[mask]
+    good = np.isfinite(tt) & np.isfinite(xx)
+    if good.sum() < 3:
+        return float("nan")
+    return float(np.std(_detrend(tt[good], xx[good])))
+
+
+def _fit_first_order_tau(t, y, ref, start, duration=0.5):
+    """Fit dy/dt = (ref - y) / tau over the first part of a step."""
+    window = (t >= start) & (t <= start + duration)
+    tt = t[window]
+    yy = y[window]
+    rr = ref[window]
+    if tt.size < 5:
+        return float("nan")
+    dt = np.diff(tt)
+    dy = np.diff(yy)
+    err = rr[:-1] - yy[:-1]
+    span = float(np.nanmax(np.abs(err)))
+    if not np.isfinite(span) or span <= 0.0:
+        return float("nan")
+    good = (dt > 0.0) & np.isfinite(err) & np.isfinite(dy)
+    good &= np.abs(err) > 0.05 * span
+    if good.sum() < 5:
+        return float("nan")
+    slope = float(np.dot(err[good], dy[good] / dt[good]) /
+                  np.dot(err[good], err[good]))
+    if slope <= 0.0:
+        return float("nan")
+    return 1.0 / slope
+
+
+def _ratio_rms(y, ref, mask):
+    """Mean ratio and RMS difference of two signals over a steady window."""
+    good = mask & np.isfinite(y) & np.isfinite(ref)
+    if good.sum() < 3:
+        return float("nan"), float("nan")
+    ref_mean = float(np.mean(ref[good]))
+    ratio = (float(np.mean(y[good])) / ref_mean
+             if abs(ref_mean) > 1e-9 else float("nan"))
+    rms = float(np.sqrt(np.mean((y[good] - ref[good]) ** 2)))
+    return ratio, rms
+
+
+def analyze_upside(t, data, outdir=None, show=False):
+    """Estimator and sensor performance during the wheels-off schedule.
+
+    The robot is secured upside down, so wheel-derived velocity is not chassis
+    ground truth. The report therefore separates what the schedule can measure
+    (sensor noise, wheel-loop tracking, filter response, bias/gyro coupling)
+    from what it cannot (absolute body velocity and heading).
+    """
+    flags = data[:, COL_FLAGS].astype(np.uint16)
+    kf_mask = data[:, COL_KFMASK].astype(np.uint16)
+    phase = data[:, COL_PHASE].astype(int)
+
+    feedback = data[:, COL_FEEDBACK:COL_FEEDBACK + 2]
+    gyro = data[:, COL_GYRO:COL_GYRO + 3]
+    acc = data[:, COL_ACC:COL_ACC + 3]
+    as5_angle = data[:, COL_AS5ANGLE:COL_AS5ANGLE + 2]
+    as5_vel = data[:, COL_AS5VEL:COL_AS5VEL + 2]
+
+    kf_v = data[:, COL_KFV]
+    kf_om = data[:, COL_KFOMEGA]
+    kf_theta = np.unwrap(data[:, COL_KFTHETA])
+    kf_ba = data[:, COL_KFBA]
+    kf_bg = data[:, COL_KFBG]
+
+    gyro_yaw_deg = YAW_GYRO_SIGN * gyro[:, YAW_GYRO_AXIS]
+    accel_forward = FORWARD_ACCEL_SIGN * acc[:, FORWARD_ACCEL_AXIS] * 9.80665
+    enc_v = 0.5 * (feedback[:, 0] + feedback[:, 1]) * WHEEL_RADIUS / GEAR
+    enc_om = ((feedback[:, 1] - feedback[:, 0]) /
+              WHEEL_BASE * WHEEL_RADIUS / GEAR)
+
+    wheel_rows = (kf_mask & (KF_WHEEL_V | KF_WHEEL_OMEGA)) != 0
+    fallback = (kf_mask & KF_WHEEL_ENCODER) != 0
+    as5_fresh = (flags & FLAG_AS5_FRESH) != 0
+    mag_valid = int(np.sum((flags & FLAG_MAG_VALID) != 0))
+
+    # Sensor health. A dead SPI bus returns a constant frame with valid parity,
+    # so the angle and the derived velocity both stay at zero while the
+    # quadrature encoders show motion.
+    as5_ptp = np.ptp(as5_angle, axis=0)
+    wheel_moved = bool(np.any(np.abs(feedback) > ENCODER_MOTION))
+    as5_dead = bool(np.nanmax(as5_ptp) < 1e-6
+                    and not np.any(np.abs(as5_vel) > 1e-9)
+                    and wheel_moved)
+    zero_feed = wheel_rows & ~fallback & (
+        np.max(np.abs(feedback), axis=1) > ENCODER_MOTION)
+
+    fallback_share = {}
+    for target in PHASE_ORDER:
+        rows = (phase == target) & wheel_rows
+        fallback_share[target] = (float((rows & fallback).sum() / rows.sum())
+                                  if rows.sum() else float("nan"))
+
+    # Reconstruct the velocity the filter was fed. With a dead AS5X47 the
+    # encoder fallback is the only signal available.
+    if as5_dead or not as5_fresh.any():
+        ref_v = enc_v
+        ref_om = enc_om
+        source = ("encoder feedback (AS5X47 dead)" if as5_dead
+                  else "encoder feedback (no AS5X47 samples)")
+    else:
+        idx = np.flatnonzero(as5_fresh)
+        ref_v = np.interp(np.arange(len(t)), idx,
+                          0.5 * (as5_vel[idx, 0] + as5_vel[idx, 1]))
+        ref_om = np.interp(np.arange(len(t)), idx,
+                           (as5_vel[idx, 1] - as5_vel[idx, 0]) / WHEEL_BASE)
+        source = "AS5X47 velocity"
+
+    print("\n=== Sensor health ===")
+    print("AS5X47 angle peak-to-peak: L %.6f rad, R %.6f rad"
+          % (as5_ptp[0], as5_ptp[1]))
+    if as5_dead:
+        print("AS5X47: DEAD BUS (constant angle and zero velocity while the "
+              "wheels moved).")
+        print("         The filter's wheel measurement is the encoder "
+              "fallback, not an independent sensor.")
+    else:
+        print("AS5X47: angle varies; wheel velocity is available.")
+    for target in PHASE_ORDER:
+        share = fallback_share[target]
+        if np.isfinite(share):
+            print("encoder fallback share, phase %2d %-8s: %5.1f%%"
+                  % (target, PHASE_LABELS[target], 100.0 * share))
+    print("zero-velocity wheel updates while a wheel exceeded %.0f rad/s: "
+          "%d (%.1f%% of visible updates)"
+          % (ENCODER_MOTION, int(zero_feed.sum()),
+             100.0 * zero_feed.sum() / max(1, int(wheel_rows.sum()))))
+    if mag_valid == 0:
+        print("magnetometer: UNAVAILABLE (0 valid heading samples); the mag "
+              "update and K_MAG were never exercised.")
+    else:
+        print("magnetometer: %d valid heading samples" % mag_valid)
+
+    print("\n=== Sensor noise (1-sigma, %.1f s after each transition "
+          "excluded) ===" % SETTLE_EXCLUDE)
+    print("%-3s %-9s %5s %10s %12s %8s %8s  %s"
+          % ("ph", "phase", "n", "gyro yaw", "accel fwd", "ratio g",
+             "ratio a", "window"))
+    noise = {}
+    for target in PHASE_ORDER:
+        rows, trimmed = _phase_window(t, phase, target)
+        if not rows.any():
+            continue
+        gyro_sigma = _sigma(t, gyro_yaw_deg, rows)
+        accel_sigma = _sigma(t, accel_forward, rows)
+        noise[target] = {
+            "n": int(rows.sum()),
+            "gyro_yaw_deg": gyro_sigma,
+            "accel_forward": accel_sigma,
+            "gyro_ratio": (gyro_sigma / SIGMA_GYRO_DEG
+                           if np.isfinite(gyro_sigma) else float("nan")),
+            "accel_ratio": (accel_sigma / SIGMA_ACCEL
+                            if np.isfinite(accel_sigma) else float("nan")),
+            "trimmed": bool(trimmed),
+        }
+        print("%-3d %-9s %5d %9.3f  %11.4f %8.2f %8.2f  %s"
+              % (target, PHASE_LABELS[target], rows.sum(), gyro_sigma,
+                 accel_sigma, noise[target]["gyro_ratio"],
+                 noise[target]["accel_ratio"],
+                 "settled" if trimmed else "whole phase"))
+    print("assumed: gyro yaw %.3f deg/s, accel forward %.4f m/s^2"
+          % (SIGMA_GYRO_DEG, SIGMA_ACCEL))
+
+    fwd = np.flatnonzero(phase == 11)
+    turn = np.flatnonzero(phase == 12)
+    settle = np.flatnonzero(phase == 2)
+    fwd_start = float(t[fwd[0]]) if fwd.size else float("nan")
+    turn_start = float(t[turn[0]]) if turn.size else float("nan")
+
+    tau = _fit_first_order_tau(t, kf_v, ref_v, fwd_start)
+    tau_design = -WHEEL_WINDOW_NOMINAL / np.log(1.0 - KF_WHEEL_V0)
+    v_ratio, v_rms = _ratio_rms(
+        kf_v, ref_v, (phase == 11) & (t >= fwd_start + SETTLE_EXCLUDE))
+    om_ratio, om_rms = _ratio_rms(
+        kf_om, ref_om, (phase == 12) & (t >= turn_start + SETTLE_EXCLUDE))
+
+    print("\n=== Filter tracking (wheel reference: %s) ===" % source)
+    print("v step at %.3f s: tau = %.1f ms (K_WHEEL_V[0]=%.2f predicts "
+          "%.1f ms)" % (fwd_start, 1e3 * tau, KF_WHEEL_V0,
+                        1e3 * tau_design))
+    print("forward phase: KF/wheel v = %.3f, RMS diff = %.4f m/s"
+          % (v_ratio, v_rms))
+    print("turn phase:    KF/wheel omega = %.3f, RMS diff = %.4f rad/s"
+          % (om_ratio, om_rms))
+    if np.isfinite(tau) and np.isfinite(tau_design):
+        print("verdict: %s"
+              % ("matches the designed gain"
+                 if 0.7 < tau / tau_design < 1.4
+                 else "differs from the designed gain; check the wheel update"))
+
+    print("\n=== Bias and heading behaviour ===")
+    print("b_a: start %+.4f, end %+.4f, swing %.4f m/s^2"
+          % (kf_ba[0], kf_ba[-1], np.nanmax(kf_ba) - np.nanmin(kf_ba)))
+    print("b_g: start %+.4f, end %+.4f, swing %.4f rad/s"
+          % (kf_bg[0], kf_bg[-1], np.nanmax(kf_bg) - np.nanmin(kf_bg)))
+    print("theta: total change %+.4f rad (%+.1f deg) while the body did not "
+          "rotate" % (kf_theta[-1] - kf_theta[0],
+                      np.degrees(kf_theta[-1] - kf_theta[0])))
+    if turn.size:
+        turn_gyro = float(np.mean(gyro_yaw_deg[phase == 12]))
+        turn_wheel = float(np.mean(ref_om[phase == 12]))
+        turn_bg = float(kf_bg[turn[-1]] - kf_bg[turn[0]])
+        print("turn phase: wheel omega %.3f rad/s, gyro yaw %.3f deg/s, "
+              "b_g change %+.3f rad/s" % (turn_wheel, turn_gyro, turn_bg))
+        if (abs(turn_bg) > 0.5 * abs(turn_wheel)
+                and abs(turn_gyro) < 0.5):
+            print("note: b_g absorbed the wheel/gyro disagreement. That is "
+                  "the wheels-off geometry, not a physical gyro bias; do not "
+                  "use this run to calibrate b_g.")
+    if settle.size:
+        print("settling phase: v %+.4f m/s, omega %+.4f rad/s"
+              % (kf_v[settle[-1]], kf_om[settle[-1]]))
+
+    result = {
+        "sensor": {
+            "as5_dead": as5_dead,
+            "as5_angle_ptp": float(np.nanmax(as5_ptp)),
+            "mag_valid": mag_valid,
+            "fallback_share": fallback_share,
+            "zero_velocity_updates": int(zero_feed.sum()),
+        },
+        "noise": noise,
+        "tracking": {
+            "reference": source,
+            "tau": tau,
+            "tau_design": float(tau_design),
+            "v_ratio": v_ratio,
+            "v_rms": v_rms,
+            "omega_ratio": om_ratio,
+            "omega_rms": om_rms,
+        },
+        "bias": {
+            "ba_start": float(kf_ba[0]),
+            "ba_end": float(kf_ba[-1]),
+            "ba_swing": float(np.nanmax(kf_ba) - np.nanmin(kf_ba)),
+            "bg_start": float(kf_bg[0]),
+            "bg_end": float(kf_bg[-1]),
+            "bg_swing": float(np.nanmax(kf_bg) - np.nanmin(kf_bg)),
+            "theta_change": float(kf_theta[-1] - kf_theta[0]),
+        },
+    }
+
+    if outdir is not None or show:
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+        for target in PHASE_ORDER:
+            rows = np.flatnonzero(phase == target)
+            if rows.size == 0:
+                continue
+            color = {11: "tab:blue", 12: "tab:orange"}.get(target, "tab:gray")
+            for ax in axes:
+                ax.axvspan(t[rows[0]], t[rows[-1]], alpha=0.07, color=color)
+        axes[0].plot(t, ref_v, lw=0.9, alpha=0.8, label=source)
+        axes[0].plot(t, kf_v, lw=1.2, label="KF v")
+        axes[0].set_ylabel("velocity (m/s)")
+        axes[0].legend(loc="best")
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(t, ref_om, lw=0.9, alpha=0.8, label=source)
+        axes[1].plot(t, kf_om, lw=1.2, label="KF omega")
+        axes[1].set_ylabel("yaw rate (rad/s)")
+        axes[1].legend(loc="best")
+        axes[1].grid(True, alpha=0.3)
+        axes[2].plot(t, kf_ba, lw=1.1, label="b_a (m/s^2)")
+        axes[2].plot(t, kf_bg, lw=1.1, label="b_g (rad/s)")
+        axes[2].set_ylabel("bias estimate")
+        axes[2].set_xlabel("time (s)")
+        axes[2].legend(loc="best")
+        axes[2].grid(True, alpha=0.3)
+        fig.tight_layout()
+        _finish_fig(fig, outdir, "cal_upside")
+
+    return result
+
+
 def _finish_fig(fig, outdir, stem):
     if outdir is not None:
         outdir = Path(outdir)
@@ -649,6 +959,8 @@ def main():
         analyze_noise(t, data, outdir=outdir, show=show)
     elif mode == "track":
         analyze_track(t, data, outdir=outdir, show=show)
+    elif mode == "upside":
+        analyze_upside(t, data, outdir=outdir, show=show)
     else:
         raise SystemExit("Unknown calibration mode %r" % mode)
     return 0

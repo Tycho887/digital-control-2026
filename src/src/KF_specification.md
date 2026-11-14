@@ -194,8 +194,35 @@ equivalent, 2.5 s at +30 degrees/s differential wheel equivalent, and 0.5 s
 zero. It uses the wheel PIs only, stops automatically, and records raw sensors
 and estimator behavior while the robot is secured upside down. Noise data is
 for later gain retuning; fixed-gain firmware has no runtime `R` to update and
-does not propagate innovation variance `S`. New-format analysis is deferred
-until hardware captures are available.
+does not propagate innovation variance `S`.
+
+`scripts/analyze_calibration.py` implements the `upside` analysis. The first
+hardware capture (`logs/device-monitor-261114-144037.log`, 2987 samples,
+6.0 s) gave:
+
+| Quantity | Measured | Reference |
+|----------|----------|-----------|
+| Gyro yaw noise, phases 11/12 | 0.10–0.11 deg/s | 0.1 deg/s assumed |
+| Accel forward noise, phases 11/12 | 0.063–0.083 m/s² | 0.0285 m/s² assumed |
+| Accel forward noise, settling | 0.031 m/s² | 0.0285 m/s² assumed |
+| `v` step response | `tau` = 47 ms | 50 ms from `K_WHEEL_V[0]` |
+| `v` steady state, phase 11 | KF/wheel 1.02, RMS 19 mm/s | – |
+| `omega` steady state, phase 12 | KF/wheel 0.97, RMS 0.26 rad/s | – |
+| `b_a` swing | 0.44 m/s² | – |
+| `b_g` change, turn phase | −0.37 rad/s while the gyro read 0.04 deg/s | – |
+
+Two sensors failed in that capture. Both AS5X47 angles were constant zero and
+the filter ran on the encoder fallback for 98% of the forward phase, so the
+wheel measurement was not independent of the inner PI. The magnetometer never
+reported a valid heading, so `K_MAG` was never exercised. The gain bank is
+unchanged: retuning now would fit the fallback path and an untested mag gain.
+The measured accelerometer noise is 2–3× the DARE assumption, which is the
+input for the next gain regeneration once the hardware is repaired.
+
+The upside-down geometry separates wheel yaw rate from body yaw rate, so the
+filter drives `b_g` to about −0.30 rad/s to hold the gyro innovation at zero.
+That is a property of the experiment, not a gyro bias. Do not tune or persist
+`b_g` from a wheels-off capture.
 
 ---
 

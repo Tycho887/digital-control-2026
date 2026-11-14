@@ -25,7 +25,7 @@ ANALYZER = ROOT / "src" / "scripts" / "analyze_calibration.py"
 GEAR = 9.6
 WHEEL_RADIUS = 0.0315
 WHEEL_BASE = 0.14
-N_COLUMNS = 38
+N_COLUMNS = 41  # 40 capture columns plus the sequence phase
 
 
 def load_analyzer():
@@ -69,7 +69,7 @@ def run_mag_checks(module):
     data[:, 25] = 0.010
     data[:, 26] = np.arctan2(data[:, 19], -data[:, 20])
     data[:, 26] += np.random.default_rng(3).normal(0.0, 0.005, n)
-    data[:, 34:38] = 1.0
+    data[:, 36:40] = 1.0
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "cal.log"
@@ -119,11 +119,11 @@ def run_noise_checks(module):
     kf_mask[::10] |= 0x04  # wheel omega
     kf_mask[::10] |= 0x08  # mag
     data[:, 3] = kf_mask
-    data[:, 30] = rng.normal(0.0, 1.0, n)  # gyro innovation
-    data[:, 31] = rng.normal(0.0, 1.0, n)  # wheel v innovation
-    data[:, 32] = rng.normal(0.0, 1.0, n)  # wheel omega innovation
-    data[:, 33] = rng.normal(0.0, 1.0, n)  # mag innovation
-    data[:, 34:38] = 1.0
+    data[:, 32] = rng.normal(0.0, 1.0, n)  # gyro innovation
+    data[:, 33] = rng.normal(0.0, 1.0, n)  # wheel v innovation
+    data[:, 34] = rng.normal(0.0, 1.0, n)  # wheel omega innovation
+    data[:, 35] = rng.normal(0.0, 1.0, n)  # mag innovation
+    data[:, 36:40] = 1.0
 
     result = quiet(module.analyze_noise, data[:, 0], data)
     checks = result["checks"]
@@ -172,7 +172,7 @@ def run_track_checks(module):
     data[:, 23] = y * WHEEL_RADIUS / GEAR
     data[:, 24] = y * WHEEL_RADIUS / GEAR
     data[:, 27] = y * WHEEL_RADIUS / GEAR  # KF v
-    data[:, 34:38] = 1.0
+    data[:, 36:40] = 1.0
 
     result = quiet(module.analyze_track, t, data)
     steps = [m for m in result["steps"] if m["signal"] == "feedback"]
@@ -185,11 +185,86 @@ def run_track_checks(module):
     assert result["summary"]["as5x47"]["n"] == len(steps)
 
 
+def run_upside_checks(module):
+    n = 3000
+    t = np.arange(n) * 0.002
+    phase = np.full(n, 10)
+    phase[t >= 0.5] = 11
+    phase[t >= 3.0] = 12
+    phase[t >= 5.5] = 2
+
+    data = blank(n)
+    data[:, 0] = t
+    data[:, 1] = 4
+    data[:, 40] = phase
+    # accel/gyro fresh, AS5 valid+fresh, KF healthy; no magnetometer bits.
+    data[:, 2] = 0x01 | 0x02 | 0x20 | 0x40 | 0x80
+    kf_mask = np.full(n, 0x01, dtype=np.int64)
+    kf_mask[::5] |= 0x06 | 0x20  # wheel v/omega from the encoder fallback
+    data[:, 3] = kf_mask
+
+    fb_l = np.where(phase == 11, 60.0, 0.0)
+    fb_r = np.where(phase == 11, 60.0, np.where(phase == 12, 11.8, 0.0))
+    data[:, 6] = fb_l
+    data[:, 7] = fb_r
+    v_ref = 0.5 * (fb_l + fb_r) * WHEEL_RADIUS / GEAR
+    om_ref = (fb_r - fb_l) / WHEEL_BASE * WHEEL_RADIUS / GEAR
+
+    # First-order estimator response to the wheel reference.
+    v = np.zeros(n)
+    om = np.zeros(n)
+    tau_v, tau_om = 0.050, 0.080
+    for k in range(1, n):
+        dt = t[k] - t[k - 1]
+        v[k] = v[k - 1] + dt / tau_v * (v_ref[k] - v[k - 1])
+        om[k] = om[k - 1] + dt / tau_om * (om_ref[k] - om[k - 1])
+    data[:, 27] = v
+    data[:, 28] = om
+    data[:, 29] = np.cumsum(om) * 0.002
+    data[:, 30] = np.linspace(0.0, 0.02, n)
+    data[:, 31] = -om
+    data[:, 26] = np.nan  # no magnetometer heading
+
+    rng = np.random.default_rng(11)
+    data[:, 12] = rng.normal(0.0, 0.1, n)             # gyro yaw, deg/s
+    data[:, 13] = rng.normal(0.0, 0.2, n)
+    data[:, 14] = rng.normal(0.0, 0.1, n)
+    data[:, 15] = rng.normal(0.0, 0.02, n)
+    data[:, 16] = rng.normal(0.0, 0.02, n)
+    data[:, 17] = rng.normal(0.0, 0.0285 / 9.80665, n)  # forward = -Z
+
+    result = quiet(module.analyze_upside, t, data)
+    assert result["sensor"]["as5_dead"], result["sensor"]
+    assert result["sensor"]["mag_valid"] == 0, result["sensor"]
+    assert result["sensor"]["fallback_share"][11] > 0.9, result["sensor"]
+    reference = result["tracking"]["reference"]
+    assert reference.startswith("encoder"), reference
+    tau = result["tracking"]["tau"]
+    assert abs(tau - tau_v) < 0.015, (tau, tau_v)
+    assert 0.95 < result["tracking"]["v_ratio"] < 1.05, result["tracking"]
+    assert 0.95 < result["tracking"]["omega_ratio"] < 1.05, result["tracking"]
+    assert result["noise"][11]["trimmed"], result["noise"]
+    assert 0.8 < result["noise"][11]["gyro_ratio"] < 1.2, result["noise"]
+    assert 0.8 < result["noise"][11]["accel_ratio"] < 1.2, result["noise"]
+
+    # A live AS5X47 changes the reference source.
+    live = data.copy()
+    live[:, 21] = np.arange(n) * 0.001
+    live[:, 22] = live[:, 21]
+    live[:, 23] = fb_l * WHEEL_RADIUS / GEAR
+    live[:, 24] = fb_r * WHEEL_RADIUS / GEAR
+    live_result = quiet(module.analyze_upside, t, live)
+    assert not live_result["sensor"]["as5_dead"], live_result["sensor"]
+    assert live_result["tracking"]["reference"] == "AS5X47 velocity", \
+        live_result["tracking"]
+
+
 def main():
     module = load_analyzer()
     run_mag_checks(module)
     run_noise_checks(module)
     run_track_checks(module)
+    run_upside_checks(module)
     print("PASS: calibration analyzer synthetic checks")
     return 0
 
