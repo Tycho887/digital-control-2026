@@ -94,6 +94,8 @@ uint32_t kfAccelCalCnt = 0;
 bool kfAccelCalDone = false;
 float poseHeading = 0.0f;      // dead-reckoned heading, not a filter state
 float poseStartTheta = 0.0f;   // heading at start(), for run-relative pose
+float poseHeadingTotal = 0.0f;      // unwrapped trapezoidal heading
+float poseStartHeadingTotal = 0.0f; // unwrapped heading at start()
 float posePrevV = 0.0f;        // previous v for trapezoidal dead reckoning
 float posePrevOmega = 0.0f;    // previous omega for trapezoidal heading
 uint32_t kfLastUs = 0;
@@ -193,6 +195,8 @@ typedef struct
   float kfInnov[KF_MEAS_COUNT];
   float gyroRaw[3];       // imu2.gyro[], deg/s, offset-corrected
   float accRaw[3];        // imu2.acc[], g
+  float totalAngle;       // rad, unwrapped trapezoidal integral since start
+  float yawRateCorrection; // rad/s, yaw-rate PID output
   uint16_t kfMask;
   uint16_t diagnosticFlags;
 
@@ -301,12 +305,12 @@ typedef struct
   uint32_t gyroSampleCount;
 } CalData;
 
-// The closed-loop trajectory lasts 7.6 s. Format-4 rows are captured at
-// 250 Hz; the compile-time check below requires margin around the full run.
+// The closed-loop trajectory lasts 8.8 s. Format-4 rows are captured at
+// 200 Hz; the compile-time check below requires margin around the full run.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
-const int logDivider = 4; // log one row per N control ticks
-const uint32_t logCoverageUs = 8000000;
+const int logDivider = 5; // log one row per N control ticks
+const uint32_t logCoverageUs = 9000000;
 static_assert(logDivider >= 1, "logDivider must be at least 1");
 static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
               "Log buffer must cover the complete sequence plus margin");
@@ -594,24 +598,24 @@ void printLog(bool manual)
   Serial.println("% 1 time (sec)");
   Serial.println("% 2 state");
   Serial.println("% 3   forward velocity reference (m/s)");
-  Serial.println("% 4-5 motor voltage (left,right) (V)");
+  Serial.println("% 4-5 commanded motor voltage (left,right) (V, wheel PI output; not measured terminal voltage)");
   Serial.println("% 6-7 Encoder count (left, right)");
   Serial.println("% 8-9 motor vel (left, right) (rad/s)");
   Serial.println("% 10  Battery voltage (V)");
   Serial.println("% 11-13 pose (x,y,theta) (m, m, rad)");
-  Serial.println("% 14 trip distance (m)");
+  Serial.println("% 14 total distance (m, trapezoidal)");
   Serial.println("% 15-16 legacy calibrated current (left, right) (A), forward-positive");
   Serial.println("% 17 capture timestamp (us since start), ADC read follows actuator update");
   Serial.println("% 18-19 raw current ADC counts (left A1, right A0), 12 bit");
   Serial.println("% 20-21 signed PWM request (left,right), forward-positive, full scale 4096");
   Serial.println("% 22 driver flags: bits 0/1 enable L/R, bits 2/3 sleeping L/R");
   Serial.println("% 23-24 encoder estimate delay (left,right) (s)");
-  Serial.println("% 25-26 computed control signal (left,right) (V)");
+  Serial.println("% 25-26 wheel PI outputs (left,right) (V)");
   Serial.println("% 27-28 estimator velocity and yaw rate (m/s, rad/s)");
   Serial.println("% 29 magnetometer heading (rad, diagnostic only, NaN if unavailable)");
   Serial.println("% 30-31 controller setpoint (left,right) (motor rad/s)");
   Serial.println("% 32 yaw-rate reference (rad/s)");
-  Serial.println("% 33-37 estimator [v, omega, dead-reckoned heading, b_a, reserved]");
+  Serial.println("% 33-37 KF state [v, omega, wrapped dead-reckoned heading, b_a, reserved]");
   Serial.println("%       (m/s, rad/s, rad, m/s^2, 0)");
   Serial.println("% 38 forward-velocity control error (vCmd - v) (m/s)");
   Serial.println("% 39 yaw-rate PID error (omegaRefLim - omega) (rad/s)");
@@ -630,6 +634,8 @@ void printLog(bool manual)
   Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation, bit9 gyro fresh, bit10 gyro offset done, bit11 gyro config valid, bit12 accel fresh, bit13 gyro saturated");
   Serial.println("% 58-60 gyro raw (x,y,z) (deg/s, offset-corrected)");
   Serial.println("% 61-63 accel raw (x,y,z) (g)");
+  Serial.println("% 64 total angle (rad, unwrapped trapezoidal since start)");
+  Serial.println("% 65 yaw-rate PID output (rad/s)");
   Serial.println("% Static gains: no covariance is propagated or logged.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
@@ -638,6 +644,8 @@ void printLog(bool manual)
   Serial.print("% PWM frequency Hz "); Serial.println(motor.PWMfrq);
   Serial.println("% Voltage columns 4-5 are requests, NOT measured terminal voltages.");
   Serial.println("% Driver assumes supply loss 1 V, adds +/-0.4 V; battery <5.5 V uses 11.1 V fallback.");
+  Serial.println("% PID map: wheel L/R setpoint 30/31 - feedback 42/43 -> output 25/26;");
+  Serial.println("% yaw rate error 39 (ref 48, feedback 34) -> output 65; heading error 47 (ref 46, feedback 35) -> output 49.");
   
   for (int i = 0; i < logsCnt; i++)
   {
@@ -690,6 +698,8 @@ void printLog(bool manual)
     Serial.print(" "); Serial.print(d->diagnosticFlags); // 57
     for (int k = 0; k < 3; k++) printLogValue(d->gyroRaw[k]); // 58-60
     for (int k = 0; k < 3; k++) printLogValue(d->accRaw[k]);  // 61-63
+    printLogValue(d->totalAngle); // 64
+    printLogValue(d->yawRateCorrection); // 65
     Serial.println("");
     d++;
   }
@@ -833,6 +843,7 @@ bool start()
   // Capture the pose origin and hold the current heading.
   desiredHeading = poseHeading;
   poseStartTheta = poseHeading;
+  poseStartHeadingTotal = poseHeadingTotal;
   posePrevV = estimator.v;
   posePrevOmega = estimator.omega;
   // Make the first logged row use the new origin, before the next estimator tick.
@@ -1415,6 +1426,7 @@ void estimatorUpdate()
   pose[0] += ds * cosf(thetaMid);
   pose[1] += ds * sinf(thetaMid);
   distA += ds;
+  poseHeadingTotal += dtheta;
   poseHeading = wrapAngle(poseHeading + dtheta);
   pose[2] = wrapAngle(poseHeading - poseStartTheta);
   pose[3] = imu2.magHeadingValid ? imu2.magHeading : NAN;
@@ -1484,6 +1496,8 @@ void updateLog()
     logs[logsCnt].headingError = headingPid.lastError();
     logs[logsCnt].omegaRefLimited = controlOmegaRefLimited;
     logs[logsCnt].headingCorrection = controlHeadingCorrection;
+    logs[logsCnt].totalAngle = poseHeadingTotal - poseStartHeadingTotal;
+    logs[logsCnt].yawRateCorrection = yawRatePid.lastOutput();
     logs[logsCnt].kfAccelInput = kfForwardAccelInput;
     logs[logsCnt].kfGyroInput = kfGyroYawInput;
     for (int k = 0; k < KF_MEAS_COUNT; k++)
@@ -1718,6 +1732,7 @@ void calBeginMotion()
     kfGyroTimestampUs = 0;
     estimator.reset();
     poseHeading = poseStartTheta = 0;
+    poseHeadingTotal = poseStartHeadingTotal = 0;
     posePrevV = posePrevOmega = 0;
     pose[0] = pose[1] = pose[2] = distA = 0;
     kfLastUs = micros();
@@ -2327,6 +2342,8 @@ void setup()
   estimator.reset();
   poseHeading = 0.0f;
   poseStartTheta = poseHeading;
+  poseHeadingTotal = 0.0f;
+  poseStartHeadingTotal = poseHeadingTotal;
   posePrevV = estimator.v;
   posePrevOmega = estimator.omega;
   kfLastUs = micros();
