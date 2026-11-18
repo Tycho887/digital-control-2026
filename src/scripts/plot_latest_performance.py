@@ -37,7 +37,7 @@ C_STATE = 1
 C_VREF = 2
 C_MOTOR_V = 3          # 3-4
 C_MOTOR_VEL = 7        # 7-8
-C_X, C_Y = 10, 11      # position (m)
+C_X, C_Y, C_REL_HEADING = 10, 11, 12  # position (m), heading relative to start (rad)
 C_DIST = 13
 C_PWM = 19             # 19-20
 C_CONTROL = 24         # 24-25
@@ -62,9 +62,9 @@ C_YAW_PID = 64         # optional
 
 MIN_COLUMNS = 57
 
-PHASE_COLORS = {10: "#d9d9d9", 11: "#cfe2f3", 12: "#fce5cd", 13: "#f6eee4",
+PHASE_COLORS = {10: "#d9d9d9", 11: "#cfe2f3", 15: "#e7e2ed", 12: "#fce5cd", 13: "#f6eee4",
                 14: "#d9ead3", 2: "#efefef"}
-PHASE_LABELS = {10: "rest", 11: "forward", 12: "turn", 13: "turn settle",
+PHASE_LABELS = {10: "rest", 11: "forward", 15: "pre-turn stop", 12: "turn", 13: "turn settle",
                 14: "return", 2: "final settle"}
 
 
@@ -474,7 +474,13 @@ def main():
     if 14 in data[:, C_STATE] and data[-1, C_STATE] == 2:
         dx = data[-1, C_X] - data[0, C_X]
         dy = data[-1, C_Y] - data[0, C_Y]
-        print(f"Estimated distance from start at last sample: {100 * np.hypot(dx, dy):.1f} cm")
+        # XY uses the persistent odometry frame. Undo its starting heading
+        # to express the offset along the marked outbound and left axes.
+        start_heading = data[0, C_KF + 2] - data[0, C_REL_HEADING]
+        forward = dx * np.cos(start_heading) + dy * np.sin(start_heading)
+        left = -dx * np.sin(start_heading) + dy * np.cos(start_heading)
+        print(f"Estimated endpoint: X {100 * forward:+.1f} cm (forward), "
+              f"Y {100 * left:+.1f} cm (left), distance {100 * np.hypot(dx, dy):.1f} cm")
 
     outputs = [
         plot_tracking(path, data, meta, out_dir),

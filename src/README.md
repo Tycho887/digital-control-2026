@@ -107,10 +107,17 @@ upright with clear floor space, keep the monitor open, and press start once.
 The run starts on a new button press and the button must be released before
 another run; the input uses the internal pull-down, so a held or floating
 start input cannot restart the sequence after the log is sent.
-The 13.4 s run has a 0.2 s stationary baseline, a 4 s outbound leg, a 4 s
-counterclockwise turn, a 0.6 s hold at 180°, a 4 s return leg and 0.6 s of
-final settling. Both straights use the same braking profile. The complete
-run is logged at about 143 Hz (one row per seven control ticks). Afterward,
+With heading feedback enabled, the trajectory requires a configured, calibrated
+gyro and a sample from the last 20 ms. If feedback drops out during a run, the
+firmware stops the motors and retains the samples collected so far. If the
+monitor reports that gyro feedback is unavailable, keep the robot still,
+check `cal imu`, and press start again once the gyro is ready.
+The 15.8 s run has a 0.2 s stationary baseline, a 4 s outbound leg, a 0.5 s
+stop on the outbound heading, a 4 s clockwise turn, a 2.5 s hold at
+−180°, a 4 s return leg and 0.6 s of final settling. Both straights use the
+same braking profile. During the post-turn hold, read the axle midpoint and
+chassis heading against floor marks. The complete run is logged at 125 Hz
+(one row per eight control ticks). Afterward,
 `src/scripts/plot_latest_performance.py` reports the onboard estimate of
 the distance between the start and final positions alongside the 4 m path target.
 

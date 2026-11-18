@@ -16,16 +16,19 @@ int main()
 {
   TrajectoryConfig c;
   assert(c.valid());
-  assert(near(c.duration(), 13.4f, 2e-6f));
+  assert(near(c.duration(), 15.8f, 2e-6f));
 
-  const float turnStart = c.initialRest + c.forwardDuration;
+  const float outboundEnd = c.initialRest + c.forwardDuration;
+  const float turnStart = outboundEnd + c.preTurnSettle;
   const float turnEnd = turnStart + c.turnDuration;
   const float returnStart = turnEnd + c.turnSettle;
   const float restStart = returnStart + c.forwardDuration;
   assert(trajectoryCommand(c, 0.0f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest - 0.001f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest).phase == 11);
-  assert(trajectoryCommand(c, turnStart - 0.001f).phase == 11);
+  assert(trajectoryCommand(c, outboundEnd - 0.001f).phase == 11);
+  assert(trajectoryCommand(c, outboundEnd).phase == 15);
+  assert(trajectoryCommand(c, turnStart - 0.001f).phase == 15);
   assert(trajectoryCommand(c, turnStart).phase == 12);
   assert(trajectoryCommand(c, turnEnd - 0.001f).phase == 12);
   assert(trajectoryCommand(c, turnEnd).phase == 13);
@@ -41,7 +44,7 @@ int main()
   assert(near(trajectoryCommand(c, c.initialRest).velocity, cruiseSpeed, 1e-6f));
   assert(near(trajectoryCommand(c, 3.60f).velocity, cruiseSpeed, 1e-6f));
   assert(near(trajectoryCommand(c, 3.90f).velocity, cruiseSpeed / 2, 1e-6f));
-  assert(near(trajectoryCommand(c, turnStart - 0.001f).velocity, cruiseSpeed / 600, 1e-6f));
+  assert(near(trajectoryCommand(c, outboundEnd - 0.001f).velocity, cruiseSpeed / 600, 1e-6f));
   assert(trajectoryCommand(c, turnStart).velocity == 0.0f);
   assert(near(trajectoryCommand(c, returnStart).velocity, cruiseSpeed, 1e-6f));
   assert(near(trajectoryCommand(c, restStart - 0.30f).velocity, cruiseSpeed / 2, 1e-6f));
@@ -63,13 +66,13 @@ int main()
   }
   assert(near(outbound, 2.0f, 0.001f));
   assert(near(inbound, 2.0f, 0.001f));
-  assert(near(heading, 3.14159265f, 0.001f));
+  assert(near(heading, -3.14159265f, 0.001f));
   assert(std::hypot(x, y) < 0.002f);
   printf("PASS trajectory: legs %.4f / %.4f m, heading %.5f rad, endpoint error %.4f m\n",
          outbound, inbound, heading, std::hypot(x, y));
 
   c.turnRampTime = 0.5f;
-  const float peak = 3.14159265f / 3.5f;
+  const float peak = -3.14159265f / 3.5f;
   assert(near(trajectoryCommand(c, turnStart).yawRate, 0.0f, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, peak / 2, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.5f).yawRate, peak, 1e-6f));
@@ -117,6 +120,12 @@ int main()
   c.turnSettle = 0.0f;
   assert(trajectoryCommand(c, turnEnd).phase == 14);
   c.turnSettle = -0.1f;
+  assert(!c.valid());
+  c = TrajectoryConfig{};
+  c.preTurnSettle = 0.0f;
+  assert(near(c.duration(), 15.3f, 2e-6f));
+  assert(trajectoryCommand(c, outboundEnd).phase == 12);
+  c.preTurnSettle = -0.1f;
   assert(!c.valid());
   assert(trajectoryCommand(c, NAN).phase == 0);
   assert(trajectoryCommand(c, -0.001f).phase == 0);

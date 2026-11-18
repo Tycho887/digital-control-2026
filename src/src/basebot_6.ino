@@ -1096,25 +1096,37 @@ void forwardThreeSeconds()
   }
 }
 
+bool gyroFeedbackReady()
+{
+  // Use the same 20 ms sample-age limit as the yaw calibration experiment.
+  return imu2.gyroConfigurationValid && imu2.gyroOffsetDone &&
+         estimator.lastInnovationValid[KF_M_GYRO] &&
+         micros() - kfGyroTimestampUs <= 20000u;
+}
+
 void closedLoopTrajectory()
 {
-  // Require a new press for each run. A held or floating start input must not
-  // restart the sequence immediately after the log has been sent.
+  // Consume a button press or USB start request even when the gyro is unavailable.
   static bool startButtonLatched = false;
-  const bool button = digitalReadFast(PIN_START_BUTTON);
+  const bool button = digitalReadFast(PIN_START_BUTTON) or robot.missionStart;
   const bool newPress = button and !startButtonLatched;
   startButtonLatched = button;
+  if (state == 0 && !newPress) return;
+
+  if (useKfFeedback && !gyroFeedbackReady())
+  {
+    if (state != 0) finished();  // zero PWM and preserve the captured rows
+    usb.send("% trajectory disabled: gyro feedback unavailable; check 'cal imu', then press start again\r\n");
+    return;
+  }
 
   if (state == 0)
   {
-    if (newPress or robot.missionStart)
-    {
-      if (!start()) return;
-      state = 10;
-      desiredValue = 0.0f;
-      desiredYawRate = 0.0f;
-      endTime = closedLoopConfig.duration();
-    }
+    if (!start()) return;
+    state = 10;
+    desiredValue = 0.0f;
+    desiredYawRate = 0.0f;
+    endTime = closedLoopConfig.duration();
     return;
   }
 
@@ -1408,10 +1420,12 @@ void estimatorUpdate()
     kfGyroYawInput = (imuToBody[2][0] * imu2.gyro[0] +
                       imuToBody[2][1] * imu2.gyro[1] +
                       imuToBody[2][2] * imu2.gyro[2]) * gyroToRad;
-    kfGyroTimestampUs = imu2.gyroTimestampUs;
     estimator.updateGyro(kfGyroYawInput);
     if (estimator.lastInnovationValid[KF_M_GYRO])
+    {
+      kfGyroTimestampUs = imu2.gyroTimestampUs;
       kfUpdateMask |= CAL_KF_GYRO;
+    }
   }
   // Wheel speed comes from the AS5X47 absolute angles; the smoothed
   // quadrature feedback is the flagged fallback when the read fails.
@@ -1635,9 +1649,7 @@ bool calStart(CalMode mode)
     usb.send("% calibration blocked: previous capture pending; send 'cal log' or 'cal clear' first\r\n");
     return false;
   }
-  if (mode == CAL_YAW && (!imu2.gyroOffsetDone ||
-      !imu2.gyroConfigurationValid || kfGyroTimestampUs == 0 ||
-      micros() - kfGyroTimestampUs > 20000))
+  if (mode == CAL_YAW && !gyroFeedbackReady())
   {
     usb.send("% cal yaw refused: gyro configuration/calibration/freshness unavailable\r\n");
     return false;
@@ -1848,8 +1860,7 @@ void calTick()
     calPhase = 10 + calTrackIndex;
     if (calMode == CAL_YAW)
     {
-      if (!imu2.gyroOffsetDone || !imu2.gyroConfigurationValid ||
-          micros() - kfGyroTimestampUs > 20000)
+      if (!gyroFeedbackReady())
       {
         usb.send("% cal yaw stopped: gyro unavailable\r\n");
         calFinish();

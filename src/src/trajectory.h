@@ -8,16 +8,18 @@ struct TrajectoryConfig
   float initialRest = 0.2f;
   float forwardSpeed = 0.5f;      // mean m/s over the straight (2 m in 4 s)
   float forwardDuration = 4.0f;   // s
-  float turnRate = 0.78539816f;   // mean rad/s over the turn (180 deg in 4 s)
+  float turnRate = -0.78539816f;  // mean rad/s over the turn (clockwise 180 deg in 4 s)
   float turnDuration = 4.0f;      // s
   float finalRest = 0.6f;         // s
   float turnRampTime = 0.5f;      // s at each end of the turn; 0 restores the step
   float forwardBrakeTime = 0.6f;  // s of braking at the end of the straight; 0 restores the step
-  float turnSettle = 0.6f;        // s holding the new heading before the return leg
+  float turnSettle = 2.5f;        // s to observe the settled heading before the return leg
+  float preTurnSettle = 0.5f;     // s holding zero speed and outbound heading before the turn
 
   constexpr float duration() const
   {
-    return initialRest + forwardDuration + turnDuration + turnSettle + forwardDuration + finalRest;
+    return initialRest + forwardDuration + preTurnSettle + turnDuration +
+           turnSettle + forwardDuration + finalRest;
   }
 
   bool valid() const
@@ -30,6 +32,7 @@ struct TrajectoryConfig
            isfinite(turnDuration) && turnDuration > 0.0f &&
            isfinite(turnRampTime) && turnRampTime >= 0.0f &&
            isfinite(turnSettle) && turnSettle >= 0.0f &&
+           isfinite(preTurnSettle) && preTurnSettle >= 0.0f &&
            isfinite(finalRest) && finalRest >= 0.0f &&
            isfinite(duration());
   }
@@ -65,6 +68,10 @@ inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig &c, float elap
   end += c.forwardDuration;
   if (elapsed < end)
     return {straightLegSpeed(c, end - elapsed), 0.0f, 11};
+
+  end += c.preTurnSettle;
+  if (elapsed < end)
+    return {0.0f, 0.0f, 15};
 
   const float turnStart = end;
   end += c.turnDuration;
