@@ -86,10 +86,11 @@ the original start-button trajectory after diagnosing the measurement.
 The procedures below use older serial-triggered experiments. They are optional;
 the default turn-rate experiment above is fully automatic.
 
-Build/upload the firmware before these trials. Defaults in `src/tuning.h` are
-7 V maximum wheel voltage, wheel PI Kp 0.05/0.04 and Ki 0.1, and trial yaw PI
-Kp 2.5 and Ki 12.5. Gains use a 1 ms Tustin discretization. Trial gains are
-RAM-only; retain successful values in `tuning.h` before the next rebuild.
+Build/upload the firmware before these trials. The controller tuning block in
+`src/src/tuning.h` sets 7 V maximum wheel voltage, wheel PI Kp 0.05/0.04 and
+Ki 0.1, and trial yaw PI Kp 2.5 and Ki 12.5. Gains use a 1 ms Tustin
+discretization. Trial gains are RAM-only; retain successful values in the
+`tuning.h` block before the next rebuild.
 
 ## 1. Measure yaw before driving
 
@@ -169,9 +170,9 @@ by repeated trials. Yaw correction remains bounded at ±0.7 rad/s.
 
 The original trajectory retains heading control. Once the yaw
 trial passes, run that trajectory three times and measure distance and total
-angle externally: approximately 0.80 m and 90°. Tune the existing
-`heading_coeffs` separately if heading correction still introduces overshoot;
-do not compensate for a yaw-scale error using controller gains.
+angle externally: approximately 0.80 m and 90°. Tune the `headingCoeffs` entry
+in `src/src/tuning.h` separately if heading correction still introduces
+overshoot; do not compensate for a yaw-scale error using controller gains.
 
 ## 4. Retune estimator weights from suitable noise captures
 

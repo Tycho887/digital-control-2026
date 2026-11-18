@@ -1,6 +1,6 @@
 # Controller Specification — Cascaded Polar & Wheel-Speed Control
 
-Discrete-time control architecture (`basebot_6.ino`, `pid.h`, `trajectory.h`) for the Teensy 4.1 differential-drive robot, executing deterministically at $1\text{ kHz}$ ($T_s = 0.001\text{ s}$).
+Discrete-time control architecture (`basebot_6.ino`, `pid.h`, `trajectory.h`) for the Teensy 4.1 differential-drive robot, executing deterministically at $1\text{ kHz}$ ($T_s = 0.001\text{ s}$). The firmware defaults for every controller coefficient and limit below are defined in the single tuning block in `src/src/tuning.h`.
 
 ---
 
@@ -66,11 +66,11 @@ $$y[k] = y[k-1] + T_s \cdot \operatorname{sat}\!\left(K_p (r[k] - y[k-1]),\; \do
 * **Error Input:** $e_\omega[k] = \omega_{\text{ref,lim}}[k] - \hat{\omega}[k]$ ($\text{rad/s}$).
 * **Output Saturation:** $\pm \text{Lim}_{TU} = \pm 0.7\text{ rad/s}$.
 * **Total Yaw-Rate Command:** $\omega_{\text{cmd}}[k] = \omega_{\text{ref,lim}}[k] + \Delta\omega_\omega[k]$.
-* **Coefficients ($T_s = 1\text{ ms}$, $K_{pt} = 5.0$, $\tau_{i,t} = 0.2\text{ s}$):**
+* **Coefficients ($T_s = 1\text{ ms}$, $K_{pt} = 2.5$, $K_{it} = 12.5\text{ s}^{-1}$):**
 
 | $b_0$ | $b_1$ | $b_2$ | $a_1$ | $a_2$ |
 | :--- | :--- | :--- | :--- | :--- |
-| `5.0125f` | `-4.9875f` | `0.0f` | `-1.0f` | `0.0f` |
+| `2.50625f` | `-2.49375f` | `0.0f` | `-1.0f` | `0.0f` |
 
 ---
 
@@ -104,7 +104,7 @@ $$\hat{p}_k = \hat{p}_{\text{pred}} + \alpha r, \qquad \hat{v}_k = \hat{v}_{k-1}
 
 ### B. Inner Wheel-Speed PI Controllers (`leftController`, `rightController`)
 * **Error Input:** $e_{m,i}[k] = \omega_{m,i,\text{ref}}[k] - \omega_{m,i,\text{meas}}[k]$ ($\text{rad/s}$).
-* **Output Saturation:** $\pm \text{controlVoltageLimit} = \pm 3.0\text{ V}$ (applied to H-bridge at $80\text{ kHz}$ PWM with `motorVoltage[0] = -u_L`, `motorVoltage[1] = +u_R`).
+* **Output Saturation:** $\pm \text{controlVoltageLimit} = \pm 7.0\text{ V}$ (applied to H-bridge at $80\text{ kHz}$ PWM with `motorVoltage[0] = -u_L`, `motorVoltage[1] = +u_R`).
 * **Coefficients ($T_s = 1\text{ ms}$):**
 
 | Controller | $b_0$ | $b_1$ | $b_2$ | $a_1$ | $a_2$ |

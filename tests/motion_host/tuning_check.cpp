@@ -22,7 +22,7 @@ int main()
   for (const auto &step : tuning::yaw)
     assert(std::fabs(step.reference) <= 0.524f && step.duration >= 2.0f);
 
-  PIDController yaw(tuning::pi(tuning::yawKp, tuning::yawKi), 1000);
+  PIDController yaw(tuning::pi(2.5f, 12.5f), 1000);
   // Ten seconds of unit error: trapezoidal integral plus proportional term.
   for (int i = 0; i < 10000; ++i) yaw.ComputeCCDE(1);
   assert(std::fabs(yaw.lastOutput() - (2.5f + 12.5f * 9.9995f)) < 0.04f);

@@ -162,11 +162,12 @@ heading is dead-reckoned from the gyro. Mag offsets are RAM-only and printed
 after calibration.
 
 The control path uses reference limiters for forward speed and turn rate, a
-heading lead-lag controller, yaw-rate PI, and the per-wheel encoder PI. The
-current wheel coefficients come from `Motor_model_param.m` (`Kp = 0.05/0.04`,
-`Ki = 0.1` at 1 ms), with a 7 V actuator limit. Trial yaw PI gains are
-`Kp = 2.5`, `Ki = 12.5`. [Follow the tuning sequence](TUNING.md) for measured
-yaw calibration and isolated wheel/yaw trials. There is no outer
+heading lead-lag controller, yaw-rate PI, and the per-wheel encoder PI. All
+controller coefficients and limits are in the tuning block in
+`src/src/tuning.h`. The wheel coefficients come from `Motor_model_param.m`
+(`Kp = 0.05/0.04`, `Ki = 0.1` at 1 ms), with a 7 V actuator limit; trial yaw
+PI gains are `Kp = 2.5`, `Ki = 12.5`. [Follow the tuning sequence](TUNING.md)
+for measured yaw calibration and isolated wheel/yaw trials. There is no outer
 forward-velocity PID in this architecture. `useKfFeedback` near the top of
 `basebot_6.ino` defaults to `true`; setting it to `false` bypasses only the KF
 heading/yaw feedback, leaving reference-limited feed-forward and the inner

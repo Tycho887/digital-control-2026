@@ -8,13 +8,53 @@ namespace tuning
 enum class MainExperiment { TurnRateCalibration, OriginalTrajectory };
 constexpr MainExperiment mainExperiment = MainExperiment::TurnRateCalibration;
 constexpr float sampleTime = 0.001f;
-constexpr float wheelVoltageLimit = 7.0f;
-constexpr float leftKp = 0.05f;
-constexpr float rightKp = 0.04f;
-constexpr float wheelKi = 0.1f;
-// Conservative trial gains; validate after measured yaw calibration.
-constexpr float yawKp = 2.5f;
-constexpr float yawKi = 12.5f;
+
+// ============================================================================
+// Controller tuning
+// ----------------------------------------------------------------------------
+// Single location for every controller coefficient and limit. The CCDE form
+// at Ts = 1 ms is
+//   u[k] = b0*e[k] + b1*e[k-1] + b2*e[k-2] - a1*u[k-1] - a2*u[k-2]
+// Kp/Ki values in comments use the Tustin PI conversion
+//   b0 = Kp + Ki*Ts/2, b1 = -Kp + Ki*Ts/2, a1 = -1.
+// ============================================================================
+
+// Inner wheel-speed PI: motor-shaft rad/s error -> motor voltage (V).
+// Left Kp = 0.05, Ki = 0.1; right Kp = 0.04, Ki = 0.1.
+constexpr PID_Coefficients leftWheelCoeffs =
+    {0.05005f, -0.04995f, 0.0f, -1.0f, 0.0f};
+constexpr PID_Coefficients rightWheelCoeffs =
+    {0.04005f, -0.03995f, 0.0f, -1.0f, 0.0f};
+
+// Heading lead-lag: wrapped heading error (rad) -> yaw-rate correction
+// (rad/s). Includes Kph = 2.5.
+constexpr PID_Coefficients headingCoeffs =
+    {4.996878901f, -4.990636704f, 0.0f, -0.997503121f, 0.0f};
+
+// Heading-rate (yaw-rate) PI: rate error (rad/s) -> yaw-rate correction
+// (rad/s). Kp = 2.5, Ki = 12.5.
+constexpr PID_Coefficients yawRateCoeffs =
+    {2.50625f, -2.49375f, 0.0f, -1.0f, 0.0f};
+
+// Output limits. Lim_TU bounds the heading/yaw outputs (rad/s) and is also
+// the turn limiter's upper rate bound (rad/s^2); Lim_TL is the lower rate
+// bound.
+constexpr float wheelVoltageLimit = 7.0f; // wheel PI output (V)
+constexpr float Lim_TU = 0.7f;
+constexpr float Lim_TL = -0.7f;
+
+// Reference limiters. KpLV/KpLT are approach gains (1/s); Lim_V*/Lim_T*
+// bound acceleration (m/s^2) and angular acceleration (rad/s^2).
+constexpr float KpLV = 25.0f;
+constexpr float KpLT = 25.0f;
+constexpr float Lim_VU = 0.5f;
+constexpr float Lim_VL = -0.5f;
+
+// Encoder velocity alpha-beta filters (counts -> counts/s).
+constexpr float leftVelAlpha = 0.5f;
+constexpr float leftVelBeta = 0.1f;
+constexpr float rightVelAlpha = 0.8f;
+constexpr float rightVelBeta = 0.2f;
 
 // MPU9250_asukiaaa already negates each hardware gyro axis. These choices
 // refer to its reported axes, and must be checked with a measured rotation.
@@ -50,7 +90,8 @@ constexpr float duration(const Step (&steps)[N])
   return total;
 }
 
-// Tustin PI: u[k] = u[k-1] + b0*e[k] + b1*e[k-1].
+// Tustin PI conversion for RAM-only `cal gains` trials and host checks.
+// u[k] = u[k-1] + b0*e[k] + b1*e[k-1].
 constexpr PID_Coefficients pi(float kp, float ki)
 {
   return {kp + ki * sampleTime / 2, -kp + ki * sampleTime / 2,
