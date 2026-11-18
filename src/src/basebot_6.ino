@@ -112,7 +112,7 @@ float kfWheelVInput = 0.0f;
 float kfWheelOmegaInput = 0.0f;
 bool kfWheelEncoderSource = false;
 const bool useKfFeedback = true;  // false: outer heading/yaw feed-forward only
-TrajectoryConfig closedLoopConfig;
+constexpr TrajectoryConfig closedLoopConfig{};
 
 // Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
 // the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
@@ -305,14 +305,11 @@ typedef struct
   uint32_t gyroSampleCount;
 } CalData;
 
-// The closed-loop trajectory lasts 8.8 s. Format-4 rows are captured at
-// 200 Hz; the compile-time check below requires margin around the full run.
+// Fit the complete outbound, turn, return and final stop in one format-4 capture.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
-const int logDivider = 5; // log one row per N control ticks
-const uint32_t logCoverageUs = 9000000;
-static_assert(logDivider >= 1, "logDivider must be at least 1");
-static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
+const int logDivider = tuning::logDivider(closedLoopConfig.duration(), logsMax);
+static_assert((logsMax - 1) * sampleTimeUs * logDivider >= closedLoopConfig.duration() * 1e6f,
               "Log buffer must cover the complete sequence plus margin");
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 CalData * calLogs = (CalData*)logs;
@@ -580,6 +577,9 @@ void printLog(bool manual)
   printLogValue(closedLoopConfig.forwardDuration);
   printLogValue(closedLoopConfig.turnDuration);
   printLogValue(closedLoopConfig.finalRest); Serial.println();
+  Serial.print("% Trajectory post-turn settle,return duration (s) ");
+  printLogValue(closedLoopConfig.turnSettle);
+  printLogValue(closedLoopConfig.forwardDuration); Serial.println();
   Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
   printLogValue(closedLoopConfig.forwardSpeed);
   printLogValue(closedLoopConfig.turnRate); Serial.println();
@@ -1118,7 +1118,8 @@ void closedLoopTrajectory()
     return;
   }
 
-  TrajectoryCommand command = trajectoryCommand(closedLoopConfig, time_sec);
+  const float elapsed = (micros() - captureStartUs) * 1e-6f;
+  TrajectoryCommand command = trajectoryCommand(closedLoopConfig, elapsed);
   if (command.phase == 0)
   {
     finished();

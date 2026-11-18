@@ -16,16 +16,22 @@ int main()
 {
   TrajectoryConfig c;
   assert(c.valid());
-  assert(near(c.duration(), 8.8f, 1e-6f));
+  assert(near(c.duration(), 13.4f, 2e-6f));
 
   const float turnStart = c.initialRest + c.forwardDuration;
-  const float restStart = turnStart + c.turnDuration;
+  const float turnEnd = turnStart + c.turnDuration;
+  const float returnStart = turnEnd + c.turnSettle;
+  const float restStart = returnStart + c.forwardDuration;
   assert(trajectoryCommand(c, 0.0f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest - 0.001f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest).phase == 11);
   assert(trajectoryCommand(c, turnStart - 0.001f).phase == 11);
   assert(trajectoryCommand(c, turnStart).phase == 12);
-  assert(trajectoryCommand(c, restStart - 0.001f).phase == 12);
+  assert(trajectoryCommand(c, turnEnd - 0.001f).phase == 12);
+  assert(trajectoryCommand(c, turnEnd).phase == 13);
+  assert(trajectoryCommand(c, returnStart - 0.001f).phase == 13);
+  assert(trajectoryCommand(c, returnStart).phase == 14);
+  assert(trajectoryCommand(c, restStart - 0.001f).phase == 14);
   assert(trajectoryCommand(c, restStart).phase == 2);
   assert(trajectoryCommand(c, c.duration() - 0.001f).phase == 2);
   assert(trajectoryCommand(c, c.duration()).phase == 0);
@@ -37,28 +43,39 @@ int main()
   assert(near(trajectoryCommand(c, 3.90f).velocity, cruiseSpeed / 2, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart - 0.001f).velocity, cruiseSpeed / 600, 1e-6f));
   assert(trajectoryCommand(c, turnStart).velocity == 0.0f);
+  assert(near(trajectoryCommand(c, returnStart).velocity, cruiseSpeed, 1e-6f));
+  assert(near(trajectoryCommand(c, restStart - 0.30f).velocity, cruiseSpeed / 2, 1e-6f));
 
-  float distance = 0.0f;
+  float outbound = 0.0f, inbound = 0.0f;
   float heading = 0.0f;
-  for (float t = 0.0f; t < c.duration(); t += 0.001f)
+  float x = 0.0f, y = 0.0f;
+  for (unsigned us = 0; us * 1e-6f < c.duration(); us += 1000)
   {
-    TrajectoryCommand command = trajectoryCommand(c, t);
-    distance += command.velocity * 0.001f;
+    TrajectoryCommand command = trajectoryCommand(c, us * 1e-6f);
+    const float ds = command.velocity * 0.001f;
+    if (command.phase == 11) outbound += ds;
+    else if (command.phase == 14) inbound += ds;
+    else assert(ds == 0.0f);
+    if (command.phase != 12) assert(command.yawRate == 0.0f);
+    x += ds * std::cos(heading);
+    y += ds * std::sin(heading);
     heading += command.yawRate * 0.001f;
   }
-  assert(near(distance, 2.0f, 0.001f));
+  assert(near(outbound, 2.0f, 0.001f));
+  assert(near(inbound, 2.0f, 0.001f));
   assert(near(heading, 3.14159265f, 0.001f));
-  printf("PASS trajectory phases: distance=%.4f m heading=%.5f rad\n",
-         distance, heading);
+  assert(std::hypot(x, y) < 0.002f);
+  printf("PASS trajectory: legs %.4f / %.4f m, heading %.5f rad, endpoint error %.4f m\n",
+         outbound, inbound, heading, std::hypot(x, y));
 
   c.turnRampTime = 0.5f;
   const float peak = 3.14159265f / 3.5f;
   assert(near(trajectoryCommand(c, turnStart).yawRate, 0.0f, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, peak / 2, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.5f).yawRate, peak, 1e-6f));
-  assert(near(trajectoryCommand(c, restStart - 0.5f).yawRate, peak, 1e-6f));
-  assert(near(trajectoryCommand(c, restStart - 0.25f).yawRate, peak / 2, 1e-6f));
-  assert(trajectoryCommand(c, restStart).yawRate == 0.0f);
+  assert(near(trajectoryCommand(c, turnEnd - 0.5f).yawRate, peak, 1e-6f));
+  assert(near(trajectoryCommand(c, turnEnd - 0.25f).yawRate, peak / 2, 1e-6f));
+  assert(trajectoryCommand(c, turnEnd).yawRate == 0.0f);
 
   c.turnRate = -c.turnRate;
   assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, -peak / 2, 1e-6f));
@@ -95,6 +112,11 @@ int main()
   assert(!c.valid());
   c = TrajectoryConfig{};
   c.finalRest = NAN;
+  assert(!c.valid());
+  c = TrajectoryConfig{};
+  c.turnSettle = 0.0f;
+  assert(trajectoryCommand(c, turnEnd).phase == 14);
+  c.turnSettle = -0.1f;
   assert(!c.valid());
   assert(trajectoryCommand(c, NAN).phase == 0);
   assert(trajectoryCommand(c, -0.001f).phase == 0);

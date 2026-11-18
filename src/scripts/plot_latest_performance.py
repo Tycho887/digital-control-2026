@@ -37,6 +37,7 @@ C_STATE = 1
 C_VREF = 2
 C_MOTOR_V = 3          # 3-4
 C_MOTOR_VEL = 7        # 7-8
+C_X, C_Y = 10, 11      # position (m)
 C_DIST = 13
 C_PWM = 19             # 19-20
 C_CONTROL = 24         # 24-25
@@ -61,8 +62,10 @@ C_YAW_PID = 64         # optional
 
 MIN_COLUMNS = 57
 
-PHASE_COLORS = {10: "#d9d9d9", 11: "#cfe2f3", 12: "#fce5cd", 2: "#efefef"}
-PHASE_LABELS = {10: "rest", 11: "forward", 12: "turn", 2: "settle"}
+PHASE_COLORS = {10: "#d9d9d9", 11: "#cfe2f3", 12: "#fce5cd", 13: "#f6eee4",
+                14: "#d9ead3", 2: "#efefef"}
+PHASE_LABELS = {10: "rest", 11: "forward", 12: "turn", 13: "turn settle",
+                14: "return", 2: "final settle"}
 
 
 def parse_header(text):
@@ -109,6 +112,9 @@ def parse_header(text):
         if len(values) >= 2:
             meta["forward_speed"], meta["turn_rate"] = values[:2]
 
+    match = re.search(r"% Trajectory post-turn settle,return duration \(s\)\s+(\S+)\s+(\S+)", text)
+    return_duration = float(match.group(2)) if match else 0.0
+    meta["target_distance"] = meta["forward_speed"] * (meta["forward_duration"] + return_duration)
     return meta
 
 
@@ -117,6 +123,7 @@ def load_log(path):
     text = path.read_text(errors="replace")
     if "% log format 4" not in text:
         raise ValueError("not a format-4 log")
+    text = text.rsplit("% log format 4", 1)[1]
 
     rows = []
     for line in text.splitlines():
@@ -178,10 +185,10 @@ def shade_phases(ax, t, state):
             start = index
 
 
-def phase_handles():
+def phase_handles(state):
     return [Patch(facecolor=PHASE_COLORS[key], alpha=0.6,
                   label=PHASE_LABELS[key])
-            for key in (10, 11, 12, 2)]
+            for key in PHASE_LABELS if key in state]
 
 
 def finish_axis(ax, ylabel, title, legend=True):
@@ -220,7 +227,7 @@ def plot_tracking(path, data, meta, out_dir):
     ref_heading_deg = np.rad2deg(ref_heading)
     enc_heading_deg = np.rad2deg(yaw_enc)
     target_angle = meta["turn_rate"] * meta["turn_duration"]
-    target_distance = meta["forward_speed"] * meta["forward_duration"]
+    target_distance = meta["target_distance"]
     ref_distance = trapezoid(v_ref, t)
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True,
@@ -236,7 +243,7 @@ def plot_tracking(path, data, meta, out_dir):
     ax.plot(t, kf[:, 0], lw=1.2, label="KF v")
     ax.plot(t, v_enc, lw=0.8, alpha=0.55, label="encoder v")
     finish_axis(ax, "m/s", "Forward speed")
-    ax.legend(handles=phase_handles() + ax.get_legend_handles_labels()[0],
+    ax.legend(handles=phase_handles(state) + ax.get_legend_handles_labels()[0],
               loc="best", fontsize=7, ncol=2)
 
     ax = axes[0, 1]
@@ -462,8 +469,12 @@ def main():
 
     print(f"Selected log: {path}")
     print(f"Rows: {len(data)}, duration {data[-1, C_TIME] - data[0, C_TIME]:.2f} s")
-    print(f"Targets: {meta['forward_speed'] * meta['forward_duration']:.2f} m, "
+    print(f"Targets: {meta['target_distance']:.2f} m, "
           f"{np.rad2deg(meta['turn_rate'] * meta['turn_duration']):.1f} deg")
+    if 14 in data[:, C_STATE] and data[-1, C_STATE] == 2:
+        dx = data[-1, C_X] - data[0, C_X]
+        dy = data[-1, C_Y] - data[0, C_Y]
+        print(f"Estimated distance from start at last sample: {100 * np.hypot(dx, dy):.1f} cm")
 
     outputs = [
         plot_tracking(path, data, meta, out_dir),

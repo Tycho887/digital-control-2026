@@ -17,7 +17,12 @@ the Teensy requires to recognize an attached serial reader. Wait for that
 startup output, then press the robot's run button once. A completed run is
 sent and saved automatically; no `log` command is required.
 
-The default experiment is **Turn-rate calibration sequence**. Keep the robot
+The default button experiment drives 2 m out, turns 180°, and drives 2 m back.
+Mark the floor directly below the midpoint of the drive axle at the start
+and after the final stop. The distance between the two marks is the return
+error, regardless of which way the robot faces.
+
+For the optional **turn-rate calibration sequence**, keep the robot
 still for four seconds after pressing start: gyro and forward-acceleration
 offsets are calibrated automatically. It then performs six four-second turns
 at +0.2, −0.2, +0.4, −0.4, +0.6 and −0.6 rad/s, with two seconds of motors-off
@@ -25,8 +30,8 @@ coast-down after each turn. The complete run lasts 40 seconds. Only the wheel
 PI controllers drive the motors; yaw/heading feedback and reference limiters
 are bypassed. [The sequence and interpretation are documented here](TUNING.md).
 
-Run `src/scripts/plot_latest_log.m` in MATLAB from the repository root. It
-automatically recognizes the new capture, plots gyro/wheel/fused yaw,
+Run `src/scripts/plot_latest_log.m` in MATLAB from the repository root. For
+a turn-rate calibration capture it plots gyro/wheel/fused yaw,
 three-axis gyro rates and integrated angles, and wheel tracking, and prints
 per-turn ratios and actual gyro sample rates. It saves a PNG beside the log.
 Repeat the same button sequence with the body secured upside down and wheels
@@ -96,23 +101,22 @@ status, encoder fallback, and wheel/heading/yaw-controller saturation. The
 header also records the controller coefficients, reference limiters, trajectory
 parameters, geometry, log divider, and whether KF feedback was enabled.
 
-`MainExperiment::TurnRateCalibration` in `src/src/tuning.h` selects the default
-button sequence. To restore the original controller trajectory, select
-`MainExperiment::OriginalTrajectory` and rebuild/upload. Place the robot
+`MainExperiment::OriginalTrajectory` in `src/src/tuning.h` selects the
+out-and-back trajectory. Place the robot
 upright with clear floor space, keep the monitor open, and press start once.
 The run starts on a new button press and the button must be released before
 another run; the input uses the internal pull-down, so a held or floating
 start input cannot restart the sequence after the log is sent.
-The 7.6 s run has a 0.2 s stationary baseline, 4.0 s at 0.20 m/s forward,
-3.0 s at +30 degrees/s (CCW), and 0.4 s settling. The heading reference
-advances during the turn so the heading controller does not oppose it. The
-complete run is logged at 250 Hz (`logDivider = 4`) as one format-4 capture.
-The 216-byte rows fit the shared 495 kB buffer with margin; a compile-time
-check requires 8 s of coverage.
+The 13.4 s run has a 0.2 s stationary baseline, a 4 s outbound leg, a 4 s
+counterclockwise turn, a 0.6 s hold at 180°, a 4 s return leg and 0.6 s of
+final settling. Both straights use the same braking profile. The complete
+run is logged at about 143 Hz (one row per seven control ticks). Afterward,
+`src/scripts/plot_latest_performance.py` reports the onboard estimate of
+the distance between the start and final positions alongside the 4 m path target.
 
 The older six-second wheels-off experiment remains available through
 `upsideDownCalibrationSequence()` or `cal upside`; it sends `% CAL upside`
-instead of the standard format-4 header. The default 40-second sequence can
+instead of the standard format-4 header. The 40-second calibration sequence can
 also run upside down without changing the selected mode. Other older
 experiments remain available in `loop()` as commented calls.
 The firmware applies zero PWM before printing the completed log. During a
@@ -122,7 +126,7 @@ estimator `v`/`omega`, heading, outer-loop commands, wheel setpoints and the
 heading/yaw errors in the monitor. They are written only when the USB transmit
 buffer has room, so a missing or stalled monitor cannot stall the 1 kHz loop.
 
-The full 250 Hz capture is sent when a DTR-asserting monitor is connected.
+The full capture is sent when a DTR-asserting monitor is connected.
 Wait for `% sent ... log lines` before closing the monitor. If no monitor is
 connected at the end of the run, the capture is retained and a new start is
 refused until the log is retrieved. `log` forces a transfer (and also works
@@ -185,7 +189,7 @@ starting another.
 
 | Command | Motors | Capture | Procedure |
 | --- | --- | --- | --- |
-| Start button (default mode) | wheel PI | ~52.6 Hz, 40 s | Keep still for 4 s; automatic bidirectional turns and stops follow. |
+| Start button (turn-rate calibration mode) | wheel PI | ~52.6 Hz, 40 s | Keep still for 4 s; automatic bidirectional turns and stops follow. |
 | `cal mag` | off | ~143 Hz, 15 s | Rotate the robot 360 degrees by hand and back. |
 | `cal noise` | off | 500 Hz, 3 s | Hold the robot still. |
 | `cal track` | wheel PI | ~111 Hz, 19 s | Clear the floor, then press the start button (or send `start`). |
@@ -238,8 +242,8 @@ start-button press. Do not call the low-level phase stepper directly from
 
 The calibration and driving procedures are separate. A standard ground run and
 a calibration capture share one RAM buffer, so save the completed capture
-before starting the other. The turn-rate sequence is selected by default in
-`tuning.h`. For a feed-forward comparison of the original trajectory, select
+before starting the other. Select the turn-rate sequence in `tuning.h`.
+For a feed-forward comparison of the out-and-back trajectory, select
 `MainExperiment::OriginalTrajectory`, set `useKfFeedback = false` and repeat it
 upright after rebuilding/uploading.
 

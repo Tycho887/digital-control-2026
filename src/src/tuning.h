@@ -54,7 +54,7 @@ constexpr float Lim_VL = -6.0f;
 constexpr float leftVelAlpha = 0.5f;
 constexpr float leftVelBeta = 0.1f;
 constexpr float rightVelAlpha = 0.8f;
-constexpr float rightVelBeta = 0.2f;
+constexpr float rightVelBeta = 0.15f;
 
 // MPU9250_asukiaaa already negates each hardware gyro axis. These choices
 // refer to its reported axes, and must be checked with a measured rotation.
