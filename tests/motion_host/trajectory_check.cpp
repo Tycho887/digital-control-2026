@@ -16,7 +16,7 @@ int main()
 {
   TrajectoryConfig c;
   assert(c.valid());
-  assert(near(c.duration(), 7.6f, 1e-6f));
+  assert(near(c.duration(), 8.8f, 1e-6f));
 
   const float turnStart = c.initialRest + c.forwardDuration;
   const float restStart = turnStart + c.turnDuration;
@@ -38,13 +38,27 @@ int main()
     distance += command.velocity * 0.001f;
     heading += command.yawRate * 0.001f;
   }
-  assert(near(distance, 0.8f, 0.001f));
-  assert(near(heading, 1.5707963268f, 0.001f));
+  assert(near(distance, 2.0f, 0.001f));
+  assert(near(heading, 3.14159265f, 0.001f));
   printf("PASS trajectory phases: distance=%.4f m heading=%.5f rad\n",
          distance, heading);
 
+  c.turnRampTime = 0.5f;
+  const float peak = 3.14159265f / 3.5f;
+  assert(near(trajectoryCommand(c, turnStart).yawRate, 0.0f, 1e-6f));
+  assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, peak / 2, 1e-6f));
+  assert(near(trajectoryCommand(c, turnStart + 0.5f).yawRate, peak, 1e-6f));
+  assert(near(trajectoryCommand(c, restStart - 0.5f).yawRate, peak, 1e-6f));
+  assert(near(trajectoryCommand(c, restStart - 0.25f).yawRate, peak / 2, 1e-6f));
+  assert(trajectoryCommand(c, restStart).yawRate == 0.0f);
+
   c.turnRate = -c.turnRate;
-  assert(trajectoryCommand(c, turnStart).yawRate < 0.0f);
+  assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, -peak / 2, 1e-6f));
+  c.turnDuration = 0.5f; // The ramps meet at the midpoint of a short turn.
+  assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, 2 * c.turnRate, 1e-6f));
+  c.turnRampTime = 0.0f;
+  assert(trajectoryCommand(c, turnStart).yawRate == c.turnRate);
+  assert(trajectoryCommand(c, turnStart + 0.499f).yawRate == c.turnRate);
   c.turnRate = 0.0f;
   assert(!c.valid());
   assert(trajectoryCommand(c, turnStart).phase == 0);
@@ -54,6 +68,11 @@ int main()
   assert(!c.valid());
   c = TrajectoryConfig{};
   c.forwardDuration = -1.0f;
+  assert(!c.valid());
+  c = TrajectoryConfig{};
+  c.turnRampTime = -0.5f;
+  assert(!c.valid());
+  c.turnRampTime = NAN;
   assert(!c.valid());
   c = TrajectoryConfig{};
   c.finalRest = NAN;
