@@ -16,13 +16,15 @@ int main()
 {
   TrajectoryConfig c;
   assert(c.valid());
-  assert(near(c.duration(), 15.8f, 2e-6f));
+  assert(near(c.duration(), 22.2f, 2e-6f));
 
   const float outboundEnd = c.initialRest + c.forwardDuration;
   const float turnStart = outboundEnd + c.preTurnSettle;
   const float turnEnd = turnStart + c.turnDuration;
   const float returnStart = turnEnd + c.turnSettle;
-  const float restStart = returnStart + c.forwardDuration;
+  const float returnEnd = returnStart + c.forwardDuration;
+  const float finalTurnStart = returnEnd + c.preTurnSettle;
+  const float finalTurnEnd = finalTurnStart + c.turnDuration;
   assert(trajectoryCommand(c, 0.0f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest - 0.001f).phase == 10);
   assert(trajectoryCommand(c, c.initialRest).phase == 11);
@@ -34,8 +36,12 @@ int main()
   assert(trajectoryCommand(c, turnEnd).phase == 13);
   assert(trajectoryCommand(c, returnStart - 0.001f).phase == 13);
   assert(trajectoryCommand(c, returnStart).phase == 14);
-  assert(trajectoryCommand(c, restStart - 0.001f).phase == 14);
-  assert(trajectoryCommand(c, restStart).phase == 2);
+  assert(trajectoryCommand(c, returnEnd - 0.001f).phase == 14);
+  assert(trajectoryCommand(c, returnEnd).phase == 16);
+  assert(trajectoryCommand(c, finalTurnStart - 0.001f).phase == 16);
+  assert(trajectoryCommand(c, finalTurnStart).phase == 17);
+  assert(trajectoryCommand(c, finalTurnEnd - 0.001f).phase == 17);
+  assert(trajectoryCommand(c, finalTurnEnd).phase == 2);
   assert(trajectoryCommand(c, c.duration() - 0.001f).phase == 2);
   assert(trajectoryCommand(c, c.duration()).phase == 0);
 
@@ -47,10 +53,10 @@ int main()
   assert(near(trajectoryCommand(c, outboundEnd - 0.001f).velocity, cruiseSpeed / 600, 1e-6f));
   assert(trajectoryCommand(c, turnStart).velocity == 0.0f);
   assert(near(trajectoryCommand(c, returnStart).velocity, cruiseSpeed, 1e-6f));
-  assert(near(trajectoryCommand(c, restStart - 0.30f).velocity, cruiseSpeed / 2, 1e-6f));
+  assert(near(trajectoryCommand(c, returnEnd - 0.30f).velocity, cruiseSpeed / 2, 1e-6f));
 
   float outbound = 0.0f, inbound = 0.0f;
-  float heading = 0.0f;
+  float heading = 0.0f, firstTurnAngle = 0.0f, finalTurnAngle = 0.0f;
   float x = 0.0f, y = 0.0f;
   for (unsigned us = 0; us * 1e-6f < c.duration(); us += 1000)
   {
@@ -59,14 +65,18 @@ int main()
     if (command.phase == 11) outbound += ds;
     else if (command.phase == 14) inbound += ds;
     else assert(ds == 0.0f);
-    if (command.phase != 12) assert(command.yawRate == 0.0f);
+    if (command.phase == 12) firstTurnAngle += command.yawRate * 0.001f;
+    else if (command.phase == 17) finalTurnAngle += command.yawRate * 0.001f;
+    else assert(command.yawRate == 0.0f);
     x += ds * std::cos(heading);
     y += ds * std::sin(heading);
     heading += command.yawRate * 0.001f;
   }
   assert(near(outbound, 2.0f, 0.001f));
   assert(near(inbound, 2.0f, 0.001f));
-  assert(near(heading, -3.14159265f, 0.001f));
+  assert(near(firstTurnAngle, -3.14159265f, 0.001f));
+  assert(near(finalTurnAngle, 3.14159265f, 0.001f));
+  assert(near(heading, 0.0f, 0.001f));
   assert(std::hypot(x, y) < 0.002f);
   printf("PASS trajectory: legs %.4f / %.4f m, heading %.5f rad, endpoint error %.4f m\n",
          outbound, inbound, heading, std::hypot(x, y));
@@ -75,6 +85,7 @@ int main()
   const float peak = -3.14159265f / 3.5f;
   assert(near(trajectoryCommand(c, turnStart).yawRate, 0.0f, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.25f).yawRate, peak / 2, 1e-6f));
+  assert(near(trajectoryCommand(c, finalTurnStart + 0.25f).yawRate, -peak / 2, 1e-6f));
   assert(near(trajectoryCommand(c, turnStart + 0.5f).yawRate, peak, 1e-6f));
   assert(near(trajectoryCommand(c, turnEnd - 0.5f).yawRate, peak, 1e-6f));
   assert(near(trajectoryCommand(c, turnEnd - 0.25f).yawRate, peak / 2, 1e-6f));
@@ -123,7 +134,7 @@ int main()
   assert(!c.valid());
   c = TrajectoryConfig{};
   c.preTurnSettle = 0.0f;
-  assert(near(c.duration(), 15.3f, 2e-6f));
+  assert(near(c.duration(), 21.2f, 2e-6f));
   assert(trajectoryCommand(c, outboundEnd).phase == 12);
   c.preTurnSettle = -0.1f;
   assert(!c.valid());

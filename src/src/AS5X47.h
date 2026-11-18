@@ -307,6 +307,7 @@ class AS5X47 {
   public:
     AS5X47(uint8_t chipSelectPin);
     ReadDataFrame readRegister(uint16_t registerAddress);
+    int16_t readCheckedRegister(uint16_t registerAddress); // 14-bit data or -1 on error
     void writeRegister(uint16_t registerAddress, uint16_t registerValue);
     float readAngle(); // in deg
     float readVel(); // velocity in deg/sec

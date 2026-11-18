@@ -17,10 +17,10 @@ the Teensy requires to recognize an attached serial reader. Wait for that
 startup output, then press the robot's run button once. A completed run is
 sent and saved automatically; no `log` command is required.
 
-The default button experiment drives 2 m out, turns 180°, and drives 2 m back.
-Mark the floor directly below the midpoint of the drive axle at the start
-and after the final stop. The distance between the two marks is the return
-error, regardless of which way the robot faces.
+The default button experiment drives 2 m out, turns 180° clockwise, drives
+2 m back, and turns 180° counterclockwise. Mark the center of each wheel's
+contact patch at the start. At the finish, compare left to left and right to
+right. The displacement between the two pairs' midpoints is the return error.
 
 For the optional **turn-rate calibration sequence**, keep the robot
 still for four seconds after pressing start: gyro and forward-acceleration
@@ -100,6 +100,18 @@ acceleration/gyro inputs (50-51), three innovations plus a reserved slot
 status, encoder fallback, and wheel/heading/yaw-controller saturation. The
 header also records the controller coefficients, reference limiters, trajectory
 parameters, geometry, log divider, and whether KF feedback was enabled.
+Columns 66–71 contain left/right pairs for the AS5047P/AS5147 magnetic field
+magnitude (MAG, counts), native shaft angle (ANGLECOM, 16384 counts/rev), and
+diagnostics (DIAAGC). These sensors measure the rotating shaft magnets. The
+IMU compass heading occupies column 29. A value of −1 indicates a pending
+or rejected SPI read.
+Field magnitude can stay steady as a wheel turns. Check for a changing angle
+with advancing quadrature counts, LF set (bit 8), and COF/MAGH/MAGL clear
+(bits 9–11). An all-zero response has valid parity but also has LF clear.
+The Python performance script also compares native shaft travel to quadrature
+travel over intervals shorter than half a revolution. The configured mounting
+predicts ratios near −1 on the left and +1 on the right. The angle comes from
+the current control tick. MAG and DIAAGC are held between 16 ms reads.
 
 `MainExperiment::OriginalTrajectory` in `src/src/tuning.h` selects the
 out-and-back trajectory. Place the robot
@@ -112,14 +124,16 @@ gyro and a sample from the last 20 ms. If feedback drops out during a run, the
 firmware stops the motors and retains the samples collected so far. If the
 monitor reports that gyro feedback is unavailable, keep the robot still,
 check `cal imu`, and press start again once the gyro is ready.
-The 15.8 s run has a 0.2 s stationary baseline, a 4 s outbound leg, a 0.5 s
+The 22.2 s run has a 0.2 s stationary baseline, a 4 s outbound leg, a 0.5 s
 stop on the outbound heading, a 4 s clockwise turn, a 2.5 s hold at
-−180°, a 4 s return leg and 0.6 s of final settling. Both straights use the
+−180°, a 4 s return leg, a 0.5 s stop, a 4 s counterclockwise turn, and a
+2.5 s hold at the starting heading. Both straights use the
 same braking profile. During the post-turn hold, read the axle midpoint and
-chassis heading against floor marks. The complete run is logged at 125 Hz
-(one row per eight control ticks). Afterward,
-`src/scripts/plot_latest_performance.py` reports the onboard estimate of
-the distance between the start and final positions alongside the 4 m path target.
+chassis heading against floor marks. The complete run is logged at about 83 Hz
+(one row per twelve control ticks). Afterward,
+`src/scripts/plot_latest_performance.py` reports the estimated endpoint in the
+starting frame, the displacement during the final turn and hold, and the final
+heading relative to the start.
 
 The older six-second wheels-off experiment remains available through
 `upsideDownCalibrationSequence()` or `cal upside`; it sends `% CAL upside`

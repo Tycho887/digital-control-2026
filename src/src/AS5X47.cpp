@@ -36,21 +36,19 @@ AS5X47::AS5X47(uint8_t chipSelectPin) : spi(chipSelectPin) {
 
 ReadDataFrame AS5X47::readRegister(uint16_t registerAddress)
 {
-  ReadDataFrame receivedFrame;
-  receivedFrame.raw = 0;
-  CommandFrame command;
-  command.values.commandFrame = registerAddress;
-  command.values.rw = READ;
-  command.values.parc = 0; //isEven(command.raw); // actually don't care
-
-  CommandFrame nopCommand;
-  nopCommand.values.commandFrame = NOP_REG;
-  nopCommand.values.rw = READ;
-  nopCommand.values.parc = 0; //isEven(nopCommand.raw);
-  receivedFrame.raw = spi.readData(command.raw, nopCommand.raw);
-	return receivedFrame;
+  const uint16_t command = 0x4000u | (registerAddress & 0x3FFFu);
+  const uint16_t withParity = command | (__builtin_parity(command) << 15);
+  ReadDataFrame response;
+  response.raw = spi.readData(withParity, 0xC000u); // even-parity read of NOP
+  return response;
 }
 
+int16_t AS5X47::readCheckedRegister(uint16_t registerAddress)
+{
+  const ReadDataFrame frame = readRegister(registerAddress);
+  if (frame.values.ef || __builtin_parity(frame.raw)) return -1;
+  return frame.values.data;
+}
 
 
 void AS5X47::writeRegister(uint16_t registerAddress, uint16_t registerValue)

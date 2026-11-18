@@ -10,16 +10,16 @@ struct TrajectoryConfig
   float forwardDuration = 4.0f;   // s
   float turnRate = -0.78539816f;  // mean rad/s over the turn (clockwise 180 deg in 4 s)
   float turnDuration = 4.0f;      // s
-  float finalRest = 0.6f;         // s
+  float finalRest = 2.5f;         // s holding the starting heading after the final turn
   float turnRampTime = 0.5f;      // s at each end of the turn; 0 restores the step
   float forwardBrakeTime = 0.6f;  // s of braking at the end of the straight; 0 restores the step
   float turnSettle = 2.5f;        // s to observe the settled heading before the return leg
-  float preTurnSettle = 0.5f;     // s holding zero speed and outbound heading before the turn
+  float preTurnSettle = 0.5f;     // s at zero speed before each turn
 
   constexpr float duration() const
   {
     return initialRest + forwardDuration + preTurnSettle + turnDuration +
-           turnSettle + forwardDuration + finalRest;
+           turnSettle + forwardDuration + preTurnSettle + turnDuration + finalRest;
   }
 
   bool valid() const
@@ -56,6 +56,15 @@ inline float straightLegSpeed(const TrajectoryConfig &c, float remaining)
   return cruiseSpeed * fminf(1.0f, remaining / brake);
 }
 
+inline float turnProfileRate(const TrajectoryConfig &c, float timeToEdge)
+{
+  const float ramp = fminf(c.turnRampTime, 0.5f * c.turnDuration);
+  if (ramp == 0.0f) return c.turnRate;
+  // Two linear ramps and a plateau have area peak * (turnDuration - ramp).
+  const float peak = c.turnRate / (1.0f - ramp / c.turnDuration);
+  return peak * fminf(1.0f, timeToEdge / ramp);
+}
+
 inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig &c, float elapsed)
 {
   if (!c.valid() || !isfinite(elapsed) || elapsed < 0.0f)
@@ -76,16 +85,7 @@ inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig &c, float elap
   const float turnStart = end;
   end += c.turnDuration;
   if (elapsed < end)
-  {
-    const float ramp = fminf(c.turnRampTime, 0.5f * c.turnDuration);
-    if (ramp == 0.0f)
-      return {0.0f, c.turnRate, 12};
-
-    // Two linear ramps and a plateau have area peak * (turnDuration - ramp).
-    const float peak = c.turnRate / (1.0f - ramp / c.turnDuration);
-    const float timeToEdge = fminf(elapsed - turnStart, end - elapsed);
-    return {0.0f, peak * fminf(1.0f, timeToEdge / ramp), 12};
-  }
+    return {0.0f, turnProfileRate(c, fminf(elapsed - turnStart, end - elapsed)), 12};
 
   end += c.turnSettle;
   if (elapsed < end)
@@ -94,6 +94,15 @@ inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig &c, float elap
   end += c.forwardDuration;
   if (elapsed < end)
     return {straightLegSpeed(c, end - elapsed), 0.0f, 14};
+
+  end += c.preTurnSettle;
+  if (elapsed < end)
+    return {0.0f, 0.0f, 16};
+
+  const float finalTurnStart = end;
+  end += c.turnDuration;
+  if (elapsed < end)
+    return {0.0f, -turnProfileRate(c, fminf(elapsed - finalTurnStart, end - elapsed)), 17};
 
   end += c.finalRest;
   if (elapsed < end)

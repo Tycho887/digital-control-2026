@@ -156,6 +156,12 @@ float as5AngleLast[2] = {0.0f, 0.0f}; // rad, after direction sign
 float as5VelLast[2] = {0.0f, 0.0f};   // wheel m/s, forward-positive
 float as5Window = 0.0f;               // s
 
+struct WheelMagneticSample
+{
+  int16_t magnitude, angle, diaagc;  // 14-bit payloads, -1 until read or on SPI error
+};
+WheelMagneticSample wheelMagnetic[2] = {{-1, -1, -1}, {-1, -1, -1}};
+
 // ////////////////////////////////////////
 // define a structure for log elements
 typedef struct
@@ -199,6 +205,7 @@ typedef struct
   float yawRateCorrection; // rad/s, yaw-rate PID output
   uint16_t kfMask;
   uint16_t diagnosticFlags;
+  WheelMagneticSample wheelMagnetic[2];
 
 } LogData;
 
@@ -305,7 +312,7 @@ typedef struct
   uint32_t gyroSampleCount;
 } CalData;
 
-// Fit the complete outbound, turn, return and final stop in one format-4 capture.
+// Fit both straight legs, both turns and the final hold in one format-4 capture.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
 const int logDivider = tuning::logDivider(closedLoopConfig.duration(), logsMax);
@@ -583,6 +590,10 @@ void printLog(bool manual)
   Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
   printLogValue(closedLoopConfig.forwardSpeed);
   printLogValue(closedLoopConfig.turnRate); Serial.println();
+  Serial.print("% Final turn duration (s), mean rate (rad/s), pre-turn stop (s)");
+  printLogValue(closedLoopConfig.turnDuration);
+  printLogValue(-closedLoopConfig.turnRate);
+  printLogValue(closedLoopConfig.preTurnSettle); Serial.println();
   printPidHeader("Wheel PI L", runControllers.left, controlVoltageLimit);
   printPidHeader("Wheel PI R", runControllers.right, controlVoltageLimit);
   printPidHeader("Heading", heading_coeffs, tuning::Lim_TU);
@@ -636,6 +647,10 @@ void printLog(bool manual)
   Serial.println("% 61-63 accel raw (x,y,z) (g)");
   Serial.println("% 64 total angle (rad, unwrapped trapezoidal since start)");
   Serial.println("% 65 yaw-rate PID output (rad/s)");
+  Serial.println("% 66-67 AS5047P/AS5147 MAG L/R (14-bit field magnitude counts, CS 24/25)");
+  Serial.println("% 68-69 AS5047P/AS5147 ANGLECOM L/R (native motor-shaft counts, 16384/rev)");
+  Serial.println("% 70-71 AS5047P/AS5147 DIAAGC L/R (bits 7:0 AGC, 8 LF, 9 COF, 10 MAGH, 11 MAGL)");
+  Serial.println("% 66-71: -1 if unread or SPI error/parity failure; MAG and DIAAGC sampled every 16 ticks, angle every tick.");
   Serial.println("% Static gains: no covariance is propagated or logged.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
@@ -700,6 +715,9 @@ void printLog(bool manual)
     for (int k = 0; k < 3; k++) printLogValue(d->accRaw[k]);  // 61-63
     printLogValue(d->totalAngle); // 64
     printLogValue(d->yawRateCorrection); // 65
+    for (const auto &wheel : d->wheelMagnetic) printLogValue(wheel.magnitude); // 66-67
+    for (const auto &wheel : d->wheelMagnetic) printLogValue(wheel.angle);     // 68-69
+    for (const auto &wheel : d->wheelMagnetic) printLogValue(wheel.diaagc);    // 70-71
     Serial.println("");
     d++;
   }
@@ -814,6 +832,11 @@ bool start()
   wheelOdoAccum[0] = 0.0f;
   wheelOdoAccum[1] = 0.0f;
   wheelEncoderInit = false;
+  for (auto &wheel : wheelMagnetic)
+  {
+    wheel.magnitude = -1;
+    wheel.diaagc = -1;
+  }
   display.useDisplay = false;
   
   // Reset controllers and velocity filters for a clean run. Without the
@@ -1141,7 +1164,9 @@ void closedLoopTrajectory()
   state = command.phase;
   desiredValue = command.velocity;
   desiredYawRate = command.yawRate;
-  if (state == 12)
+  if (state == 2)
+    desiredHeading = poseStartTheta;
+  else if (desiredYawRate != 0.0f)
   {
     desiredHeading = wrapAngle(desiredHeading +
                                desiredYawRate * sampleTimeUs * 1e-6f);
@@ -1223,26 +1248,18 @@ void controlUpdate()
   trackingControlUpdate(desiredValue, desiredYawRate, desiredHeading);
 }
 
-/**
-- Read one AS5X47 compensated angle in motor-shaft radians.
-- Returns false when the command frame was flagged (`ef`) or the read frame
-  fails its even-parity check. `pard` is the frame parity bit, not an error
-  flag, so it must be verified rather than treated as a failure.
-- A dead SPI bus returns an all-zero word with valid parity; the caller also
-  compares the resulting speed against the quadrature encoders so a stuck bus
-  cannot silently feed zero velocity to the filter.
-- ANGLE_COMPSATED (0x3FFF) is the same register AS5X47::readAngle() uses. */
-bool readWheelAngle(AS5X47 &sensor, float &angleRad)
+// The AS5047P and AS5147 both use 0x3FFC for DIAAGC.
+// Stagger these read-only diagnostics after actuation, one SPI read per selected tick.
+void sampleWheelMagnetics()
 {
-  ReadDataFrame frame = sensor.readRegister(ANGLE_COMPSATED);
-  if (frame.values.ef)
-    return false;
-  if (__builtin_parity(frame.raw) != 0)
-    return false;
-  Angle angle;
-  angle.raw = frame.values.data;
-  angleRad = angle.values.cordicang * (2.0f * PI / 16384.0f);
-  return true;
+  constexpr uint16_t diaagcRegister = 0x3FFC;
+  switch (logTickCnt % 16)
+  {
+    case 0:  wheelMagnetic[0].magnitude = leftWheelSensor().readCheckedRegister(MAG_REG); break;
+    case 4:  wheelMagnetic[1].magnitude = rightWheelSensor().readCheckedRegister(MAG_REG); break;
+    case 8:  wheelMagnetic[0].diaagc = leftWheelSensor().readCheckedRegister(diaagcRegister); break;
+    case 12: wheelMagnetic[1].diaagc = rightWheelSensor().readCheckedRegister(diaagcRegister); break;
+  }
 }
 
 /**
@@ -1282,9 +1299,9 @@ void wheelOdometryUpdate()
       state > 0 or (calState > 0 and
                     (calMode == CAL_TRACK or calMode == CAL_UPSIDE_DOWN or
                      calMode == CAL_YAW or calMode == CAL_TURN_RATE));
-  float angleLeft = 0.0f, angleRight = 0.0f;
-  if (!readWheelAngle(leftWheelSensor(), angleLeft) or
-      !readWheelAngle(rightWheelSensor(), angleRight))
+  wheelMagnetic[0].angle = leftWheelSensor().readCheckedRegister(ANGLECOM_REG);
+  wheelMagnetic[1].angle = rightWheelSensor().readCheckedRegister(ANGLECOM_REG);
+  if (wheelMagnetic[0].angle < 0 or wheelMagnetic[1].angle < 0)
   {
     as5Valid = false;
     if (!wheelLoopActive)
@@ -1312,8 +1329,9 @@ void wheelOdometryUpdate()
     return;
   }
   wheelEncoderInit = false;
-  angleLeft *= AS5X47_LEFT_DIR;
-  angleRight *= AS5X47_RIGHT_DIR;
+  const float radiansPerCount = 2.0f * PI / 16384.0f;
+  const float angleLeft = AS5X47_LEFT_DIR * wheelMagnetic[0].angle * radiansPerCount;
+  const float angleRight = AS5X47_RIGHT_DIR * wheelMagnetic[1].angle * radiansPerCount;
   as5Valid = true;
   as5AngleLast[0] = angleLeft;
   as5AngleLast[1] = angleRight;
@@ -1391,6 +1409,9 @@ void estimatorUpdate()
   kfUpdateMask = 0;
   if (dt <= 0.0f || dt > 0.020f)
   {
+    for (auto &wheel : wheelMagnetic) wheel.angle = -1;
+    as5Fresh = false;
+    as5Valid = false;
     posePrevV = estimator.v;
     posePrevOmega = estimator.omega;
     return;
@@ -1506,6 +1527,7 @@ void updateLog()
     {
       logs[logsCnt].controlFeedback[k] = controlFeedback[k];
       logs[logsCnt].as5Vel[k] = as5VelLast[k];
+      logs[logsCnt].wheelMagnetic[k] = wheelMagnetic[k];
     }
     logs[logsCnt].desiredHeading = desiredHeading;
     logs[logsCnt].headingError = headingPid.lastError();
@@ -2400,6 +2422,7 @@ void loop ( void )
         }
       }
       motor.tick();
+      if (state > 0) sampleWheelMagnetics();
       if (logTickCnt % logDivider == 0)
         updateLog();
       logTickCnt++;

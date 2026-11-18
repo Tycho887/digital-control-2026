@@ -7,7 +7,7 @@
 
 int main()
 {
-  assert(tuning::wheelVoltageLimit == 7.0f);
+  assert(tuning::wheelVoltageLimit == 9.0f);
   assert(tuning::duration(tuning::track) == 19.0f);
   assert(tuning::duration(tuning::yaw) == 22.0f);
   // Actual shared-buffer capacity and sample counts must cover complete runs.

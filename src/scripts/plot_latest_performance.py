@@ -10,8 +10,8 @@ the log:
     <log>_estimator.png   KF state, accel bias, innovations, status summary
 
 Column numbers are the documented format-4 columns (1-based in the firmware
-header). The 58-63 raw IMU columns and the 64-65 total-angle / yaw-PID columns
-are optional, so older 57/63-column logs still plot.
+header). The raw IMU (58–63), total angle / yaw PI (64–65), and wheel magnetic
+diagnostics (66–71) are optional. Earlier format-4 logs still plot.
 
 Usage:
     .venv/bin/python src/scripts/plot_latest_performance.py
@@ -36,6 +36,7 @@ C_TIME = 0
 C_STATE = 1
 C_VREF = 2
 C_MOTOR_V = 3          # 3-4
+C_ENCODER = 5          # forward-positive quadrature counts, L/R
 C_MOTOR_VEL = 7        # 7-8
 C_X, C_Y, C_REL_HEADING = 10, 11, 12  # position (m), heading relative to start (rad)
 C_DIST = 13
@@ -59,13 +60,14 @@ C_GYRO = 57            # 57-59, optional
 C_ACC = 60             # 60-62, optional
 C_TOTAL_ANGLE = 63     # optional
 C_YAW_PID = 64         # optional
+C_MAG, C_ANGLECOM, C_DIAAGC = 65, 67, 69  # optional L/R pairs, AS5047P/AS5147
 
 MIN_COLUMNS = 57
 
 PHASE_COLORS = {10: "#d9d9d9", 11: "#cfe2f3", 15: "#e7e2ed", 12: "#fce5cd", 13: "#f6eee4",
-                14: "#d9ead3", 2: "#efefef"}
+                14: "#d9ead3", 16: "#e7e2ed", 17: "#fce5cd", 2: "#efefef"}
 PHASE_LABELS = {10: "rest", 11: "forward", 15: "pre-turn stop", 12: "turn", 13: "turn settle",
-                14: "return", 2: "final settle"}
+                14: "return", 16: "return stop", 17: "final turn", 2: "final settle"}
 
 
 def parse_header(text):
@@ -91,6 +93,8 @@ def parse_header(text):
         meta["gear"] = float(match.group(1))
         meta["radius"] = float(match.group(2))
         meta["base"] = float(match.group(3))
+    match = re.search(r"wheel base [\d.eE+-]+ m, PPR (\d+)", text)
+    meta["ppr"] = int(match.group(1)) if match else None
 
     match = re.search(
         r"% Trajectory baseline,forward duration,turn duration,settling "
@@ -115,6 +119,10 @@ def parse_header(text):
     match = re.search(r"% Trajectory post-turn settle,return duration \(s\)\s+(\S+)\s+(\S+)", text)
     return_duration = float(match.group(2)) if match else 0.0
     meta["target_distance"] = meta["forward_speed"] * (meta["forward_duration"] + return_duration)
+    meta["turn_angles"] = [meta["turn_rate"] * meta["turn_duration"]]
+    match = re.search(r"% Final turn duration \(s\), mean rate \(rad/s\), pre-turn stop \(s\)\s+(\S+)\s+(\S+)", text)
+    if match:
+        meta["turn_angles"].append(float(match.group(1)) * float(match.group(2)))
     return meta
 
 
@@ -226,7 +234,7 @@ def plot_tracking(path, data, meta, out_dir):
     heading_deg = np.rad2deg(total_angle)
     ref_heading_deg = np.rad2deg(ref_heading)
     enc_heading_deg = np.rad2deg(yaw_enc)
-    target_angle = meta["turn_rate"] * meta["turn_duration"]
+    target_angle = sum(meta["turn_angles"])
     target_distance = meta["target_distance"]
     ref_distance = trapezoid(v_ref, t)
 
@@ -269,7 +277,7 @@ def plot_tracking(path, data, meta, out_dir):
     ax.plot(t, ref_heading_deg, "k--", lw=1.2, label="desired heading")
     ax.plot(t, heading_deg, lw=1.2, label="KF total angle")
     ax.plot(t, enc_heading_deg, lw=1.0, alpha=0.8, label="encoder yaw")
-    if target_angle:
+    if meta["turn_duration"]:
         ax.axhline(np.rad2deg(target_angle), color="k", ls=":",
                    lw=0.9, label="target angle")
     finish_axis(ax, "deg", "Heading / total angle")
@@ -450,6 +458,39 @@ def plot_estimator(path, data, meta, out_dir):
     return out
 
 
+def report_wheel_magnetics(data, ppr):
+    if data.shape[1] < C_DIAAGC + 2:
+        return
+    for k, side in enumerate(("left", "right")):
+        mag = data[:, C_MAG + k]
+        angle = data[:, C_ANGLECOM + k]
+        diag = data[:, C_DIAAGC + k].astype(int)
+        valid_mag = mag[mag >= 0]
+        magnitude = (f"{valid_mag.min():.0f}..{valid_mag.max():.0f} counts"
+                     if valid_mag.size else "unavailable")
+        encoder_step = np.diff(data[:, C_ENCODER + k])
+        moving = encoder_step != 0
+        angle_pairs = moving & (angle[:-1] >= 0) & (angle[1:] >= 0)
+        changes = np.count_nonzero(angle_pairs & (np.diff(angle) != 0))
+        ready = (diag >= 0) & ((diag & 0xF00) == 0x100)  # LF set, COF/MAGH/MAGL clear
+        print(f"AS5 {side}: MAG {magnitude} ({valid_mag.size}/{len(mag)} rows), "
+              f"DIAAGC ready and field OK {ready.sum()}/{len(diag)} rows, "
+              f"angle changed in {changes}/{moving.sum()} moving intervals "
+              f"({angle_pairs.sum()} with two valid frames).")
+        if ppr:
+            # A sampled shaft angle wraps every revolution. Allow one encoder
+            # count of quantization margin when choosing unambiguous intervals.
+            usable = angle_pairs & (np.abs(encoder_step) + 1 < ppr / 2)
+            if usable.any():
+                angle_step = (np.diff(angle)[usable] + 8192) % 16384 - 8192
+                counts = encoder_step[usable]
+                shaft_revs = np.sum(angle_step * np.sign(counts)) / 16384
+                encoder_revs = np.sum(np.abs(counts)) / ppr
+                print(f"  Native shaft travel / forward-positive quadrature travel "
+                      f"{shaft_revs / encoder_revs:+.3f} over {usable.sum()} intervals "
+                      f"(expected {(-1, 1)[k]:+d} with the configured mounting).")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", nargs="?", type=Path,
@@ -469,8 +510,9 @@ def main():
 
     print(f"Selected log: {path}")
     print(f"Rows: {len(data)}, duration {data[-1, C_TIME] - data[0, C_TIME]:.2f} s")
-    print(f"Targets: {meta['target_distance']:.2f} m, "
-          f"{np.rad2deg(meta['turn_rate'] * meta['turn_duration']):.1f} deg")
+    turns = ", ".join(f"{np.rad2deg(a):+.1f}°" for a in meta["turn_angles"])
+    print(f"Targets: {meta['target_distance']:.2f} m, turns {turns}")
+    report_wheel_magnetics(data, meta["ppr"])
     if 14 in data[:, C_STATE] and data[-1, C_STATE] == 2:
         dx = data[-1, C_X] - data[0, C_X]
         dy = data[-1, C_Y] - data[0, C_Y]
@@ -481,6 +523,12 @@ def main():
         left = -dx * np.sin(start_heading) + dy * np.cos(start_heading)
         print(f"Estimated endpoint: X {100 * forward:+.1f} cm (forward), "
               f"Y {100 * left:+.1f} cm (left), distance {100 * np.hypot(dx, dy):.1f} cm")
+        final_turn = np.flatnonzero(data[:, C_STATE] == 17)
+        if final_turn.size:
+            shift = data[-1, C_X:C_Y + 1] - data[final_turn[0], C_X:C_Y + 1]
+            print(f"Estimated displacement during final turn and hold: "
+                  f"{100 * np.linalg.norm(shift):.1f} cm, final heading relative to start "
+                  f"{np.rad2deg(data[-1, C_REL_HEADING]):+.2f}°")
 
     outputs = [
         plot_tracking(path, data, meta, out_dir),
