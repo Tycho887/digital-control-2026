@@ -67,8 +67,22 @@ float distA = 0; // trip distance
 float pose[4];
 float poseVel[2];
 // Filter state
-// IMU mounting: X down (vertical), Y right, Z backwards. A mounting change
-// must update these axis/sign choices.
+// IMU measurement frame -> body. Fitted from
+// src/logs/device-monitor-261118-111000.log: the spin axis is
+// [-0.4517, 0.0208, 0.8919] (0.08 deg from the previous fit), and row 0
+// is the forward-accel regression direction (0.87 deg from the projected
+// +X axis; fit slope 0.718, corr 0.758). The library negates the accel
+// axes, so row 0 points opposite the geometric body forward; row 2 is
+// the body +Z yaw axis. The static row-0 projection is 0.607 m/s^2 and is
+// removed by the startup kfAccelBias average. A mounting change must
+// refit this matrix.
+constexpr float imuToBody[3][3] = {
+    {-0.892062f,  0.004577f, -0.451891f},
+    {-0.013500f, -0.999772f,  0.016524f},
+    {-0.451712f,  0.020841f,  0.891920f},
+};
+// Legacy single-axis mapping, kept for the log header; the estimator uses
+// imuToBody instead.
 const int imuForwardAxis = 2;             // forward = -IMU Z
 const float imuForwardAccelSign = -1.0f;
 const int imuYawAxis = tuning::yawAxis;
@@ -177,6 +191,8 @@ typedef struct
   float kfAccelInput;     // forward acceleration used by predict (m/s^2)
   float kfGyroInput;      // yaw-rate input used by updateGyro (rad/s)
   float kfInnov[KF_MEAS_COUNT];
+  float gyroRaw[3];       // imu2.gyro[], deg/s, offset-corrected
+  float accRaw[3];        // imu2.acc[], g
   uint16_t kfMask;
   uint16_t diagnosticFlags;
 
@@ -235,6 +251,11 @@ enum LogFlag : uint16_t
   LOG_RIGHT_SATURATED = 1 << 6,
   LOG_HEADING_SATURATED = 1 << 7,
   LOG_YAW_RATE_SATURATED = 1 << 8,
+  LOG_GYRO_FRESH = 1 << 9,
+  LOG_GYRO_OFFSET_DONE = 1 << 10,
+  LOG_GYRO_CONFIG_VALID = 1 << 11,
+  LOG_ACCEL_FRESH = 1 << 12,
+  LOG_GYRO_SATURATED = 1 << 13,
 };
 
 typedef struct
@@ -545,6 +566,11 @@ void printLog(bool manual)
   Serial.print("% Yaw mapping axis,sign,scale ");
   Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
   printLogValue(tuning::yawScale); Serial.println();
+  Serial.print("% IMU to body rows (row0=accel forward, row2=yaw):");
+  for (int row = 0; row < 3; row++)
+    for (int col = 0; col < 3; col++)
+      printLogValue(imuToBody[row][col]);
+  Serial.println();
   Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
   printLogValue(closedLoopConfig.initialRest);
   printLogValue(closedLoopConfig.forwardDuration);
@@ -601,7 +627,9 @@ void printLog(bool manual)
   Serial.println("% 51 yaw rate used by KF gyro update (rad/s)");
   Serial.println("% 52-55 KF innovation (gyro, wheel v, wheel omega, reserved)");
   Serial.println("% 56 KF update mask (same bits as calibration column 4)");
-  Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation");
+  Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation, bit9 gyro fresh, bit10 gyro offset done, bit11 gyro config valid, bit12 accel fresh, bit13 gyro saturated");
+  Serial.println("% 58-60 gyro raw (x,y,z) (deg/s, offset-corrected)");
+  Serial.println("% 61-63 accel raw (x,y,z) (g)");
   Serial.println("% Static gains: no covariance is propagated or logged.");
   
   Serial.print("% Current A/count "); Serial.print(currentScale,7);
@@ -660,6 +688,8 @@ void printLog(bool manual)
     for (int k = 0; k < KF_MEAS_COUNT; k++) printLogValue(d->kfInnov[k]); // 52-55
     Serial.print(" "); Serial.print(d->kfMask); // 56
     Serial.print(" "); Serial.print(d->diagnosticFlags); // 57
+    for (int k = 0; k < 3; k++) printLogValue(d->gyroRaw[k]); // 58-60
+    for (int k = 0; k < 3; k++) printLogValue(d->accRaw[k]);  // 61-63
     Serial.println("");
     d++;
   }
@@ -1341,7 +1371,9 @@ void estimatorUpdate()
     posePrevOmega = estimator.omega;
     return;
   }
-  float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
+  float aRaw = (imuToBody[0][0] * imu2.acc[0] +
+                imuToBody[0][1] * imu2.acc[1] +
+                imuToBody[0][2] * imu2.acc[2]) * gravity;
   // Average every fresh IMU read at power-on. The driver's data-ready flag can
   // stay false even while accelUpdate() returns new samples, so use the
   // timestamp rather than imu2.accelFresh.
@@ -1361,8 +1393,9 @@ void estimatorUpdate()
   estimator.predict(kfForwardAccelInput, dt);
   if (imu2.gyroFresh && imu2.gyroOffsetDone && imu2.gyroConfigurationValid)
   {
-    kfGyroYawInput = imuYawRateSign * tuning::yawScale *
-                     imu2.gyro[imuYawAxis] * gyroToRad;
+    kfGyroYawInput = (imuToBody[2][0] * imu2.gyro[0] +
+                      imuToBody[2][1] * imu2.gyro[1] +
+                      imuToBody[2][2] * imu2.gyro[2]) * gyroToRad;
     kfGyroTimestampUs = imu2.gyroTimestampUs;
     estimator.updateGyro(kfGyroYawInput);
     if (estimator.lastInnovationValid[KF_M_GYRO])
@@ -1455,6 +1488,11 @@ void updateLog()
     logs[logsCnt].kfGyroInput = kfGyroYawInput;
     for (int k = 0; k < KF_MEAS_COUNT; k++)
       logs[logsCnt].kfInnov[k] = estimator.lastInnovation[k];
+    for (int k = 0; k < 3; k++)
+    {
+      logs[logsCnt].gyroRaw[k] = imu2.gyro[k];
+      logs[logsCnt].accRaw[k] = imu2.acc[k];
+    }
     logs[logsCnt].kfMask = kfUpdateMask;
     uint16_t diagnosticFlags = 0;
     if (useKfFeedback) diagnosticFlags |= LOG_KF_FEEDBACK;
@@ -1471,6 +1509,13 @@ void updateLog()
       diagnosticFlags |= LOG_HEADING_SATURATED;
     if (fabsf(yawRatePid.lastOutput()) >= 0.99f * tuning::Lim_TU)
       diagnosticFlags |= LOG_YAW_RATE_SATURATED;
+    if (imu2.gyroFresh) diagnosticFlags |= LOG_GYRO_FRESH;
+    if (imu2.gyroOffsetDone) diagnosticFlags |= LOG_GYRO_OFFSET_DONE;
+    if (imu2.gyroConfigurationValid) diagnosticFlags |= LOG_GYRO_CONFIG_VALID;
+    if (imu2.accelFresh) diagnosticFlags |= LOG_ACCEL_FRESH;
+    for (int k = 0; k < 3; k++)
+      if (fabsf(imu2.gyro[k]) >= 0.99f * 1000.0f)
+        diagnosticFlags |= LOG_GYRO_SATURATED;
     logs[logsCnt].diagnosticFlags = diagnosticFlags;
 
     logsCnt++;

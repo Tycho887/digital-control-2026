@@ -6,11 +6,11 @@
 struct TrajectoryConfig
 {
   float initialRest = 0.2f;
-  float forwardSpeed = 0.20f;      // m/s
-  float forwardDuration = 4.0f;    // s
-  float turnRate = 0.5235987756f;  // rad/s, positive CCW
-  float turnDuration = 3.0f;       // s
-  float finalRest = 0.4f;          // s
+  float forwardSpeed = 0.5f;      // m/s
+  float forwardDuration = 4.0f;   // s
+  float turnRate = 0.78539816f;          // rad/s, 45 deg/s -> should turn about 180 deg in 4 s
+  float turnDuration = 4.0f;      // s
+  float finalRest = 0.6f;         // s
 
   float duration() const
   {

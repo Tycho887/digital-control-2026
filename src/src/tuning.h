@@ -6,7 +6,7 @@
 namespace tuning
 {
 enum class MainExperiment { TurnRateCalibration, OriginalTrajectory };
-constexpr MainExperiment mainExperiment = MainExperiment::TurnRateCalibration;
+constexpr MainExperiment mainExperiment = MainExperiment::OriginalTrajectory;
 constexpr float sampleTime = 0.001f;
 
 // ============================================================================
@@ -39,16 +39,16 @@ constexpr PID_Coefficients yawRateCoeffs =
 // Output limits. Lim_TU bounds the heading/yaw outputs (rad/s) and is also
 // the turn limiter's upper rate bound (rad/s^2); Lim_TL is the lower rate
 // bound.
-constexpr float wheelVoltageLimit = 7.0f; // wheel PI output (V)
-constexpr float Lim_TU = 0.7f;
-constexpr float Lim_TL = -0.7f;
+constexpr float wheelVoltageLimit = 9.0f; // wheel PI output (V)
+constexpr float Lim_TU = 2.5f;
+constexpr float Lim_TL = -2.5f;
 
 // Reference limiters. KpLV/KpLT are approach gains (1/s); Lim_V*/Lim_T*
 // bound acceleration (m/s^2) and angular acceleration (rad/s^2).
 constexpr float KpLV = 25.0f;
 constexpr float KpLT = 25.0f;
-constexpr float Lim_VU = 0.5f;
-constexpr float Lim_VL = -0.5f;
+constexpr float Lim_VU = 6.0f;
+constexpr float Lim_VL = -6.0f;
 
 // Encoder velocity alpha-beta filters (counts -> counts/s).
 constexpr float leftVelAlpha = 0.5f;
