@@ -29,6 +29,7 @@
 #define UIMU2_H
 
 #include <MPU9250_asukiaaa.h>
+#include "turn_rate_calibration.h"
 
 
 // I2C address 0x69 could be 0x68 depends on your wiring.
@@ -62,8 +63,17 @@ public:
   void initMpu();  
   /**
    * Calibration handling */
-  uint32_t gyroOffsetStartCnt = 1000;
-  bool     gyroOffsetDone;
+  bool gyroOffsetDone = false;
+  bool gyroConfigurationValid = false;
+  bool gyroConfigurationReadable = false;
+  uint8_t gyroConfigRegister = 0, gyroDlpfRegister = 0, gyroDividerRegister = 0;
+  int16_t gyroCounts[3] = {};
+  turnrate::Mean3 gyroCalibration;
+  void beginGyroCalibration();
+  float gyroOffset(unsigned axis) const { return offsetGyro[axis]; }
+  // Read back range/DLPF/sample divider used by the active asukiaaa driver.
+  bool readGyroConfiguration();
+  void printGyroConfiguration();
   /**
    * Newest obtained gyro values
    * in degrees per second */

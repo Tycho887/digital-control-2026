@@ -102,7 +102,40 @@ void UImu2::initMpu()
     mpu.beginMag(MAG_MODE_CONTINUOUS_100HZ);
     delay(20);
     magAvailable = magProbe();
+    readGyroConfiguration();
   }
+}
+
+bool UImu2::readGyroConfiguration()
+{
+  gyroConfigurationReadable = readReg(ADDRESS_MPU, 0x1B, &gyroConfigRegister, 1) &&
+      readReg(ADDRESS_MPU, 0x1A, &gyroDlpfRegister, 1) &&
+      readReg(ADDRESS_MPU, 0x19, &gyroDividerRegister, 1);
+  gyroConfigurationValid = gyroConfigurationReadable &&
+      (gyroConfigRegister & 0x1B) == GYRO_FULL_SCALE_1000_DPS;
+  return gyroConfigurationValid;
+}
+
+void UImu2::beginGyroCalibration()
+{
+  gyroCalibration = {};
+  gyroOffsetDone = false;
+  for (unsigned k = 0; k < 3; ++k) offsetGyro[k] = 0;
+}
+
+void UImu2::printGyroConfiguration()
+{
+  readGyroConfiguration();
+  char message[300];
+  const unsigned ranges[] = {250, 500, 1000, 2000};
+  snprintf(message, sizeof(message),
+      "%% Gyro config readable=%u valid=%u register=0x%02X range=%u dps "
+      "library_range=1000 dps library_scale=0.030517578125 dps/count "
+      "library_negates_raw=1 dlpf=%u divider=%u calibrated=%u\r\n",
+      gyroConfigurationReadable ? 1u : 0u, gyroConfigurationValid ? 1u : 0u,
+      gyroConfigRegister, ranges[(gyroConfigRegister >> 3) & 3],
+      gyroDlpfRegister & 7, gyroDividerRegister, gyroOffsetDone ? 1u : 0u);
+  usb.send(message);
 }
 
 
@@ -119,7 +152,7 @@ bool UImu2::decode(const char* cmd)
   }
   else if (strncmp(cmd, "gyroc", 5) == 0)
   {
-    gyroOffsetDone = false;
+    beginGyroCalibration();
   }
   else
     found = false;
@@ -296,7 +329,8 @@ void UImu2::tick()
       sampleTimeus = dt;
       if (mpu.accelUpdate() == 0)
       {
-        accelFresh = dataReady; accelTimestampUs = micros();
+        accelFresh = dataReady;
+        if (accelFresh) accelTimestampUs = micros();
         // rectify raw data - except magnetometer
 //         int16_t * a = mpu.getAcc();
         float accw[3];
@@ -310,59 +344,24 @@ void UImu2::tick()
       // Gyro
       if (mpu.gyroUpdate() == 0)
       { // gyro
-        gyroFresh = dataReady; gyroTimestampUs = micros();
-        if (gyroOffsetDone)
-        { // production
-          gyro[0] = mpu.gyroX() - offsetGyro[0];
-          gyro[1] = mpu.gyroY() - offsetGyro[1];
-          gyro[2] = mpu.gyroZ() - offsetGyro[2];
-        }
-        else
-        { // calibrate
-          // use raw values
-          gyro[0] = mpu.gyroX();
-          gyro[1] = mpu.gyroY();
-          gyro[2] = mpu.gyroZ();
-          // start calibration
-          if (tickCnt < gyroOffsetStartCnt)
-          { // zero offset before 1000 summations
-            offsetGyro[0] = 0;
-            offsetGyro[1] = 0;
-            offsetGyro[2] = 0;
+        gyroFresh = dataReady;
+        if (gyroFresh) gyroTimestampUs = micros();
+        const float reported[3] = {mpu.gyroX(), mpu.gyroY(), mpu.gyroZ()};
+        for (unsigned k = 0; k < 3; ++k)
+          gyroCounts[k] = static_cast<int16_t>(
+              (static_cast<uint16_t>(mpu.gyroBuff[2*k]) << 8) | mpu.gyroBuff[2*k+1]);
+        if (!gyroOffsetDone && gyroFresh)
+        {
+          gyroCalibration.add(reported, turnrate::gyroCalibrationSamples);
+          if (gyroCalibration.count == turnrate::gyroCalibrationSamples)
+          {
+            for (unsigned k = 0; k < 3; ++k) offsetGyro[k] = gyroCalibration.value[k];
+            gyroOffsetDone = true;
+            usb.send("% gyro stationary calibration complete (1000 fresh samples)\r\n");
           }
-          else if (tickCnt <= gyroOffsetStartCnt + 1000)
-          { // not finished offset calculation
-            // summation over 1 second
-            offsetGyro[0] += gyro[0];
-            offsetGyro[1] += gyro[1];
-            offsetGyro[2] += gyro[2];
-            if ((tickCnt - gyroOffsetStartCnt) % 100 == 0)
-            {
-              const int MSL = 150;
-              char s[MSL];
-              snprintf(s, MSL,"%% UImu2::gyrooffset n=%lu, gx=%g sumgx=%g\r\n",
-                       tickCnt - gyroOffsetStartCnt,
-                       gyro[0],
-                       offsetGyro[0]/(tickCnt - gyroOffsetStartCnt));
-              usb.send(s);
-            }
-            if (tickCnt == gyroOffsetStartCnt + 1000)
-            { // set average offset
-              offsetGyro[0] /= 1000;
-              offsetGyro[1] /= 1000;
-              offsetGyro[2] /= 1000;
-//               usb.send("%% gyro offset finished\r\n");
-              gyroOffsetDone  = true;
-              const int MSL = 150;
-              char s[MSL];
-              snprintf(s, MSL,"%% UImu2::gyro offset: %g %g %g\r\n", offsetGyro[0], offsetGyro[1], offsetGyro[2]);
-              usb.send(s);
-            }
-          }
-          else
-            // redo of calibrate requested
-            gyroOffsetStartCnt = tickCnt + 10;
         }
+        for (unsigned k = 0; k < 3; ++k)
+          gyro[k] = reported[k] - (gyroOffsetDone ? offsetGyro[k] : 0.0f);
         if (imuAvailable < 10)
           imuAvailable++;
       }

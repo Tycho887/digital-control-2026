@@ -44,6 +44,7 @@ void printStatus();
 #include "kalman.h"
 #include "pid.h"
 #include "trajectory.h"
+#include "tuning.h"
 
 // Linker heap bounds, used by the status command.
 extern "C"
@@ -70,8 +71,8 @@ float poseVel[2];
 // must update these axis/sign choices.
 const int imuForwardAxis = 2;             // forward = -IMU Z
 const float imuForwardAccelSign = -1.0f;
-const int imuYawAxis = 0;                  // CCW yaw = -IMU X
-const float imuYawRateSign = -1.0f;
+const int imuYawAxis = tuning::yawAxis;
+const float imuYawRateSign = tuning::yawSign;
 const float gravity = 9.80665f;
 const float gyroToRad = PI / 180.0f;
 float kfAccelBias = 0.0f;
@@ -89,6 +90,11 @@ float controlOmegaRefLimited = 0.0f;
 float controlHeadingCorrection = 0.0f;
 float kfForwardAccelInput = 0.0f; // m/s^2, after startup offset removal
 float kfGyroYawInput = 0.0f;      // rad/s, forward KF sign convention
+uint32_t kfGyroTimestampUs = 0;
+uint32_t kfWheelTimestampUs = 0;
+float kfWheelVInput = 0.0f;
+float kfWheelOmegaInput = 0.0f;
+bool kfWheelEncoderSource = false;
 const bool useKfFeedback = true;  // false: outer heading/yaw feed-forward only
 TrajectoryConfig closedLoopConfig;
 
@@ -186,6 +192,8 @@ enum CalMode : uint8_t
   CAL_NOISE = 2,
   CAL_TRACK = 3,
   CAL_UPSIDE_DOWN = 4,
+  CAL_YAW = 5,
+  CAL_TURN_RATE = 6,
 };
 
 enum CalFlag : uint16_t
@@ -201,6 +209,9 @@ enum CalFlag : uint16_t
   CAL_MAG_ATTEMPT = 1 << 8,
   CAL_MAG_DRDY = 1 << 9,
   CAL_MAG_OVERFLOW = 1 << 10,
+  CAL_GYRO_CALIBRATED = 1 << 11,
+  CAL_ACCEL_CALIBRATED = 1 << 12,
+  CAL_GYRO_CONFIG_VALID = 1 << 13,
 };
 
 enum KfUpdateFlag : uint16_t
@@ -254,9 +265,22 @@ typedef struct
   uint16_t magStatus;      // AK8963 ST1 (low byte) and ST2 (high byte)
   uint16_t imuDtUs;        // measured IMU interval, microseconds
   int16_t encoder[2];      // low 16 bits of the raw quadrature count
+  float yawReference;
+  float yawReferenceLimited;
+  float yawCommand;
+  float gyroInput;
+  float wheelVInput;
+  float wheelOmegaInput;
+  uint32_t gyroTimestampUs;
+  uint32_t wheelTimestampUs;
+  uint32_t accelTimestampUs;
+  uint16_t diagnosticFlags;
+  int16_t gyroCounts[3];
+  float gyroIntegral[3];
+  uint32_t gyroSampleCount;
 } CalData;
 
-// The closed-loop trajectory lasts 7.6 s. Format-3 rows are captured at
+// The closed-loop trajectory lasts 7.6 s. Format-4 rows are captured at
 // 250 Hz; the compile-time check below requires margin around the full run.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
@@ -268,10 +292,13 @@ static_assert(logsMax * sampleTimeUs * logDivider >= logCoverageUs,
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 CalData * calLogs = (CalData*)logs;
 const int calMax = (logsMax * sizeof(LogData)) / sizeof(CalData);
-static_assert(sizeof(CalData) == 164,
+static_assert(sizeof(CalData) == 224,
               "CalData layout changed; update the printCalLog columns");
-static_assert(calMax >= 3000,
-              "Calibration buffer must hold the 6 s track capture at 500 Hz");
+static_assert(calMax >= 1502,
+              "Calibration buffer must hold 3 s noise at 500 Hz plus margin");
+static_assert(tuning::logDivider(tuning::duration(tuning::turnRateCalibration), calMax) *
+                  (calMax - 1) * sampleTimeUs >= 40000000,
+              "Calibration buffer must cover the complete turn-rate sequence");
 const float currentScale = 0.0045; // A/count; requires hardware calibration
 const float currentOffset[2] = {0.260, -0.275}; // legacy Tania offsets
 uint32_t captureStartUs = 0;
@@ -300,6 +327,15 @@ int calTickCnt = 0;
 int calTrackIndex = 0;
 float calTrackStepEnd = 0.0f;
 uint16_t calPhase = 0;
+turnrate::Run turnRateRun;
+turnrate::ButtonLatch turnRateButton;
+struct TurnRateMetadata
+{
+  bool readable = false, valid = false, calibrated = false;
+  uint8_t config = 0, dlpf = 0, divider = 0;
+  float gyroOffsets[3] = {};
+  uint32_t gyroSamples = 0;
+} turnRateMetadata;
 
 // Unbuffered sensor stream for long static captures (noise, Allan, mag).
 // It does not use the log buffer and is printed while the robot is idle.
@@ -390,23 +426,20 @@ class AlphaBetaFilter {
 AlphaBetaFilter leftVelFilter (0.5f, 0.1f, sampleTimeUs * 1e-6f);
 AlphaBetaFilter rightVelFilter(0.8f, 0.2f, sampleTimeUs * 1e-6f);
 
-// Actuator limit for the wheel-speed PI. The Simulink reference uses 9 V;
-// 3 V is retained here for safety, and the tracking experiment reports
-// saturation.
-const float controlVoltageLimit = 3.0f;
+const float controlVoltageLimit = tuning::wheelVoltageLimit;
 
 // Week10 Tustin difference equations from Motor_model_param.m (Ts = 1 ms):
 //   u[k] = b0*e[k] + b1*e[k-1] + b2*e[k-2] - a1*u[k-1] - a2*u[k-2]
 // The per-wheel velocity PI is the forward-rate controller, acting on
 // motor-shaft speed as in the colleague's Simulink model.
-PID_Coefficients left_wheel_coeffs  = {0.05005f, -0.04995f, 0.0f, -1.0f, 0.0f};
-PID_Coefficients right_wheel_coeffs = {0.04005f, -0.03995f, 0.0f, -1.0f, 0.0f};
+PID_Coefficients left_wheel_coeffs = tuning::pi(tuning::leftKp, tuning::wheelKi);
+PID_Coefficients right_wheel_coeffs = tuning::pi(tuning::rightKp, tuning::wheelKi);
 
 PIDController leftController(left_wheel_coeffs, controlVoltageLimit);
 PIDController rightController(right_wheel_coeffs, controlVoltageLimit);
 
-// Turn-rate PI, Kpt = 5 and taui_t = 0.2 s.
-PID_Coefficients yaw_pid_coeffs = {5.0125f, -4.9875f, 0.0f, -1.0f, 0.0f};
+// Trial turn-rate PI, Kp = 2.5, Ki = 12.5 (Ti = 0.2 s).
+PID_Coefficients yaw_pid_coeffs = tuning::pi(tuning::yawKp, tuning::yawKi);
 
 // Heading lead-lag from heading_conversion.m. The coefficients already include
 // Kph = 2.5, so the wrapped heading error is applied directly.
@@ -463,6 +496,13 @@ ReferenceLimiter turnLimiter(KpLT, Lim_TL, Lim_TU);
 PIDController headingPid(heading_coeffs, Lim_TU);
 PIDController yawRatePid(yaw_pid_coeffs, Lim_TU);
 
+struct ControllerSnapshot
+{
+  PID_Coefficients left, right, yaw;
+};
+ControllerSnapshot runControllers = {left_wheel_coeffs, right_wheel_coeffs, yaw_pid_coeffs};
+ControllerSnapshot calControllers = runControllers;
+
 float computedControl[2] = {0.0f, 0.0f};
 float controlSetpoint[2] = {0.0f, 0.0f};
 float controlFeedback[2] = {0.0f, 0.0f}; // PI feedback, forward-positive motor rad/s
@@ -516,6 +556,9 @@ void printLog(bool manual)
   Serial.print("% maximum log samples ");  Serial.print(logsMax);
   Serial.print(" each sized ");  Serial.print(sizeof(LogData)); Serial.println(" bytes");
   Serial.print("% KF heading/yaw feedback "); Serial.println(useKfFeedback ? 1 : 0);
+  Serial.print("% Yaw mapping axis,sign,scale ");
+  Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
+  printLogValue(tuning::yawScale); Serial.println();
   Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
   printLogValue(closedLoopConfig.initialRest);
   printLogValue(closedLoopConfig.forwardDuration);
@@ -524,10 +567,10 @@ void printLog(bool manual)
   Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
   printLogValue(closedLoopConfig.forwardSpeed);
   printLogValue(closedLoopConfig.turnRate); Serial.println();
-  printPidHeader("Wheel PI L", left_wheel_coeffs, controlVoltageLimit);
-  printPidHeader("Wheel PI R", right_wheel_coeffs, controlVoltageLimit);
+  printPidHeader("Wheel PI L", runControllers.left, controlVoltageLimit);
+  printPidHeader("Wheel PI R", runControllers.right, controlVoltageLimit);
   printPidHeader("Heading", heading_coeffs, Lim_TU);
-  printPidHeader("Yaw rate", yaw_pid_coeffs, Lim_TU);
+  printPidHeader("Yaw rate", runControllers.yaw, Lim_TU);
   Serial.print("% Reference limiters KpLV,KpLT,Lim_VL,Lim_VU,Lim_TL,Lim_TU");
   printLogValue(KpLV); printLogValue(KpLT); printLogValue(Lim_VL);
   printLogValue(Lim_VU); printLogValue(Lim_TL); printLogValue(Lim_TU);
@@ -734,6 +777,7 @@ bool start()
   computedControl[0] = 0.0f;
   computedControl[1] = 0.0f;
   captureStartUs = micros();
+  runControllers = {left_wheel_coeffs, right_wheel_coeffs, yaw_pid_coeffs};
   motor.setPWMfrq(80000);
   time_sec = 0;
   encoder.encoder[0] = 0; 
@@ -1069,11 +1113,8 @@ void closedLoopTrajectory()
   encoder velocity is recorded as controlFeedback so the tracking experiment
   can compare the controller's own signal with AS5X47/estimator velocity.
  */
-void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
+void updateWheelFeedback()
 {
-  controlSetpoint[0] = leftSetpoint;
-  controlSetpoint[1] = rightSetpoint;
-
   // Feed encoder counts (with sign convention: forward positive on both sides)
   float leftCounts  = -encoder.encoder[0];
   float rightCounts =  encoder.encoder[1];
@@ -1086,6 +1127,13 @@ void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
   const float countsToRad = 2.0f * PI / encoder.pulsPerRev;
   controlFeedback[0] = leftCountsPerSec  * countsToRad;
   controlFeedback[1] = rightCountsPerSec * countsToRad;
+}
+
+void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
+{
+  controlSetpoint[0] = leftSetpoint;
+  controlSetpoint[1] = rightSetpoint;
+  updateWheelFeedback();
 
   computedControl[0] = leftController.ComputeCCDE(leftSetpoint - controlFeedback[0]);
   computedControl[1] = rightController.ComputeCCDE(rightSetpoint - controlFeedback[1]);
@@ -1103,17 +1151,19 @@ void wheelSpeedControl(float leftSetpoint, float rightSetpoint)
  * (after the velocity limiter). useKfFeedback selects estimator feedback;
  * when false, heading/yaw errors are zero and only feed-forward remains.
  * headingRef is in rad; vRef and omegaRef in m/s and rad/s. */
-void trackingControlUpdate(float vRef, float omegaRef, float headingRef)
+void trackingControlUpdate(float vRef, float omegaRef, float headingRef,
+                           bool enableHeading = true, bool useGyroYaw = false)
 {
   desiredValue = vRef;
   desiredYawRate = omegaRef;
 
   const float vCmd = velLimiter.update(vRef);
   const float headingFeedback = useKfFeedback ? poseHeading : headingRef;
-  controlHeadingCorrection =
-      headingPid.ComputeCCDE(wrapAngle(headingRef - headingFeedback));
+  controlHeadingCorrection = enableHeading ?
+      headingPid.ComputeCCDE(wrapAngle(headingRef - headingFeedback)) : 0.0f;
   controlOmegaRefLimited = turnLimiter.update(omegaRef + controlHeadingCorrection);
-  const float omegaFeedback = useKfFeedback ? estimator.omega : controlOmegaRefLimited;
+  const float omegaFeedback = useGyroYaw ? kfGyroYawInput :
+      (useKfFeedback ? estimator.omega : controlOmegaRefLimited);
   const float omegaCmd = controlOmegaRefLimited +
       yawRatePid.ComputeCCDE(controlOmegaRefLimited - omegaFeedback);
 
@@ -1158,8 +1208,12 @@ bool readWheelAngle(AS5X47 &sensor, float &angleRad)
 - Feed one wheel-velocity pair (m/s, forward-positive) to the estimator. */
 void applyWheelMeasurements(float vLeft, float vRight)
 {
-  estimator.updateWheelV(0.5f * (vLeft + vRight));
-  estimator.updateWheelOmega((vRight - vLeft) / wheelBase);
+  kfWheelVInput = 0.5f * (vLeft + vRight);
+  kfWheelOmegaInput = (vRight - vLeft) / wheelBase;
+  kfWheelTimestampUs = micros();
+  kfWheelEncoderSource = false;
+  estimator.updateWheelV(kfWheelVInput);
+  estimator.updateWheelOmega(kfWheelOmegaInput);
   if (estimator.lastInnovationValid[KF_M_WHEEL_V])
     kfUpdateMask |= CAL_KF_WHEEL_V;
   if (estimator.lastInnovationValid[KF_M_WHEEL_OMEGA])
@@ -1185,7 +1239,8 @@ void wheelOdometryUpdate()
   // controlFeedback is only refreshed while a wheel-speed loop runs.
   const bool wheelLoopActive =
       state > 0 or (calState > 0 and
-                    (calMode == CAL_TRACK or calMode == CAL_UPSIDE_DOWN));
+                    (calMode == CAL_TRACK or calMode == CAL_UPSIDE_DOWN or
+                     calMode == CAL_YAW or calMode == CAL_TURN_RATE));
   float angleLeft = 0.0f, angleRight = 0.0f;
   if (!readWheelAngle(leftWheelSensor(), angleLeft) or
       !readWheelAngle(rightWheelSensor(), angleRight))
@@ -1211,6 +1266,7 @@ void wheelOdometryUpdate()
     float vLeft = controlFeedback[0] * wheelRadius / gear;
     float vRight = controlFeedback[1] * wheelRadius / gear;
     applyWheelMeasurements(vLeft, vRight);
+    kfWheelEncoderSource = true;
     kfUpdateMask |= CAL_KF_WHEEL_ENCODER;
     return;
   }
@@ -1264,6 +1320,7 @@ void wheelOdometryUpdate()
     as5Valid = false;
     applyWheelMeasurements(controlFeedback[0] * wheelRadius / gear,
                            controlFeedback[1] * wheelRadius / gear);
+    kfWheelEncoderSource = true;
     kfUpdateMask |= CAL_KF_WHEEL_ENCODER;
     wheelOdoAccum[0] = 0.0f;
     wheelOdoAccum[1] = 0.0f;
@@ -1298,13 +1355,13 @@ void estimatorUpdate()
     return;
   }
   float aRaw = imuForwardAccelSign * imu2.acc[imuForwardAxis] * gravity;
-  // Average every fresh IMU read at power-on. The driver's data-ready flag can
-  // stay false even while accelUpdate() returns new samples, so use the
-  // timestamp rather than imu2.accelFresh.
+  // Average distinct data-ready samples at power-on. The automatic turn-rate
+  // sequence instead collects and freezes its own stationary offset.
   static uint32_t lastAccelUs = 0;
   const bool accelNew = imu2.accelTimestampUs != lastAccelUs;
   lastAccelUs = imu2.accelTimestampUs;
-  if (!kfAccelCalDone && accelNew)
+  if (!kfAccelCalDone && accelNew &&
+      !(calState > 0 && calMode == CAL_TURN_RATE))
   {
     kfAccelCalCnt++;
     kfAccelBias += (aRaw - kfAccelBias) / kfAccelCalCnt;
@@ -1314,9 +1371,11 @@ void estimatorUpdate()
   // filter's b_a tracks the residual.
   kfForwardAccelInput = kfAccelCalDone ? aRaw - kfAccelBias : 0.0f;
   estimator.predict(kfForwardAccelInput, dt);
-  if (imu2.gyroFresh && imu2.gyroOffsetDone)
+  if (imu2.gyroFresh && imu2.gyroOffsetDone && imu2.gyroConfigurationValid)
   {
-    kfGyroYawInput = imuYawRateSign * imu2.gyro[imuYawAxis] * gyroToRad;
+    kfGyroYawInput = imuYawRateSign * tuning::yawScale *
+                     imu2.gyro[imuYawAxis] * gyroToRad;
+    kfGyroTimestampUs = imu2.gyroTimestampUs;
     estimator.updateGyro(kfGyroYawInput);
     if (estimator.lastInnovationValid[KF_M_GYRO])
       kfUpdateMask |= CAL_KF_GYRO;
@@ -1466,13 +1525,8 @@ void sendLiveLog()
 // ////////////////////////////////////////
 // Calibration experiments
 
-const float calTrackSpeed[] = {
-  0.0f, 0.05f, 0.10f, 0.15f, 0.0f, -0.05f, -0.10f, -0.15f, 0.0f
-};
-const float calTrackDuration[] = {
-  0.3f, 0.8f, 0.8f, 0.8f, 0.5f, 0.8f, 0.8f, 0.8f, 0.4f
-};
-const int calTrackSteps = sizeof(calTrackSpeed) / sizeof(calTrackSpeed[0]);
+const int calTrackSteps = sizeof(tuning::track) / sizeof(tuning::track[0]);
+const int calYawSteps = sizeof(tuning::yaw) / sizeof(tuning::yaw[0]);
 
 const float calUpsideDuration[] = {0.5f, 2.5f, 2.5f, 0.5f};
 const int calUpsideSteps = sizeof(calUpsideDuration) / sizeof(calUpsideDuration[0]);
@@ -1488,6 +1542,8 @@ const char * calModeName(CalMode mode)
     case CAL_NOISE: return "noise";
     case CAL_TRACK: return "track";
     case CAL_UPSIDE_DOWN: return "upside";
+    case CAL_YAW: return "yaw";
+    case CAL_TURN_RATE: return "turn-rate-calibration";
     default: return "none";
   }
 }
@@ -1496,8 +1552,8 @@ void resetWheelControl()
 {
   leftController.reset();
   rightController.reset();
-  leftVelFilter.reset();
-  rightVelFilter.reset();
+  leftVelFilter.reset(-encoder.encoder[0]);
+  rightVelFilter.reset(encoder.encoder[1]);
   controlSetpoint[0] = controlSetpoint[1] = 0.0f;
   controlFeedback[0] = controlFeedback[1] = 0.0f;
   computedControl[0] = computedControl[1] = 0.0f;
@@ -1531,25 +1587,39 @@ bool calStart(CalMode mode)
     usb.send("% calibration blocked: previous capture pending; send 'cal log' or 'cal clear' first\r\n");
     return false;
   }
+  if (mode == CAL_YAW && (!imu2.gyroOffsetDone ||
+      !imu2.gyroConfigurationValid || kfGyroTimestampUs == 0 ||
+      micros() - kfGyroTimestampUs > 20000))
+  {
+    usb.send("% cal yaw refused: gyro configuration/calibration/freshness unavailable\r\n");
+    return false;
+  }
   liveLogEnabled = false;
   calTruncated = false;
   calMode = mode;
+  calControllers = {left_wheel_coeffs, right_wheel_coeffs, yaw_pid_coeffs};
   calCnt = 0;
   calTickCnt = 0;
   calStartUs = micros();
-  calDivider = (mode == CAL_MAG) ? 5 : (mode == CAL_NOISE) ? 1 : 2;
+  calDivider = (mode == CAL_MAG) ?
+      tuning::logDivider(15.0f, calMax) : 2;
   motor.motorVoltage[0] = 0.0f;
   motor.motorVoltage[1] = 0.0f;
   motor.tick();
   resetWheelControl();
 
-  if (mode == CAL_TRACK or mode == CAL_UPSIDE_DOWN)
+  if (mode == CAL_TRACK or mode == CAL_UPSIDE_DOWN or mode == CAL_YAW or
+      mode == CAL_TURN_RATE)
   {
     calState = 0;
     calArmed = true;
     calPhase = 0;
     if (mode == CAL_TRACK)
       usb.send("% cal track armed: clear the floor, then press start\r\n");
+    else if (mode == CAL_YAW)
+      usb.send("% cal yaw armed: calibrated gyro required, heading disabled; press start\r\n");
+    else if (mode == CAL_TURN_RATE)
+      usb.send("% Turn-rate calibration sequence: keep still for 4 s, then automatic turns\r\n");
     else
       usb.send("% cal upside armed: secure the robot upside down with wheels clear, then press start\r\n");
     return true;
@@ -1577,19 +1647,56 @@ void calBeginMotion()
   calStartUs = micros();
   calTrackIndex = 0;
   calPhase = 10;
-  const float *durations = calMode == CAL_UPSIDE_DOWN ? calUpsideDuration : calTrackDuration;
-  const int steps = calMode == CAL_UPSIDE_DOWN ? calUpsideSteps : calTrackSteps;
-  calTrackStepEnd = time_sec + durations[0];
   motor.setPWMfrq(80000);
-  float total = 0.0f;
-  for (int i = 0; i < steps; i++)
-    total += durations[i];
+  float total = calMode == CAL_TURN_RATE ? tuning::duration(tuning::turnRateCalibration) :
+      calMode == CAL_YAW ? tuning::duration(tuning::yaw) :
+      calMode == CAL_TRACK ? tuning::duration(tuning::track) : 6.0f;
+  const float firstDuration = calMode == CAL_TURN_RATE ? tuning::turnRateCalibration[0].duration :
+      calMode == CAL_YAW ? tuning::yaw[0].duration :
+      calMode == CAL_TRACK ? tuning::track[0].duration : calUpsideDuration[0];
+  calTrackStepEnd = time_sec + firstDuration;
+  calDivider = tuning::logDivider(total, calMax);
   calEndTime = time_sec + total;
   resetWheelControl();
-  if (calMode == CAL_UPSIDE_DOWN)
+  headingPid.reset();
+  yawRatePid.reset();
+  velLimiter.reset();
+  turnLimiter.reset();
+  desiredYawRate = 0.0f;
+  controlVCommand = controlOmegaCommand = 0.0f;
+  controlOmegaRefLimited = controlHeadingCorrection = 0.0f;
+  wheelOdoInit = wheelEncoderInit = false;
+  if (calMode == CAL_TURN_RATE)
+  {
+    imu2.readGyroConfiguration();
+    turnRateMetadata = {};
+    turnRateMetadata.readable = imu2.gyroConfigurationReadable;
+    turnRateMetadata.valid = imu2.gyroConfigurationValid;
+    turnRateMetadata.config = imu2.gyroConfigRegister;
+    turnRateMetadata.dlpf = imu2.gyroDlpfRegister;
+    turnRateMetadata.divider = imu2.gyroDividerRegister;
+    imu2.beginGyroCalibration();
+    turnRateRun = {};
+    turnRateRun.encoder.seed(-encoder.encoder[0], encoder.encoder[1]);
+    turnRateRun.transition(0, 0);
+    kfAccelBias = 0;
+    kfAccelCalCnt = 0;
+    kfAccelCalDone = false;
+    kfGyroTimestampUs = 0;
+    estimator.reset();
+    poseHeading = poseStartTheta = 0;
+    posePrevV = posePrevOmega = 0;
+    pose[0] = pose[1] = pose[2] = distA = 0;
+    kfLastUs = micros();
+    calStartUs = micros();
+    usb.send("% Turn-rate calibration sequence started: 40 s, wheel PI only\r\n");
+  }
+  else if (calMode == CAL_UPSIDE_DOWN)
     usb.send("% cal upside started; motors stop automatically after 6 s\r\n");
+  else if (calMode == CAL_YAW)
+    usb.send("% cal yaw started: gyro feedback, no heading correction, 22 s\r\n");
   else
-    usb.send("% cal track started\r\n");
+    usb.send("% cal track started: 19 s, +/-0.05 to +/-0.20 m/s\r\n");
 }
 
 void calFinish()
@@ -1605,8 +1712,105 @@ void calFinish()
   calPending = calCnt > 0;
 }
 
+void updateTurnRateMeasurements()
+{
+  if (calState == 0 || calMode != CAL_TURN_RATE) return;
+  if (imu2.accelFresh && turnRateRun.acceleration.add(
+          imu2.acc, turnrate::accelCalibrationSamples))
+  {
+    kfAccelCalCnt = turnRateRun.acceleration.count;
+    if (kfAccelCalCnt == turnrate::accelCalibrationSamples)
+    {
+      kfAccelBias = imuForwardAccelSign *
+          turnRateRun.acceleration.value[imuForwardAxis] * gravity;
+      kfAccelCalDone = true;
+    }
+  }
+  if (imu2.gyroFresh && imu2.gyroOffsetDone)
+  {
+    float rates[3];
+    for (unsigned k = 0; k < 3; ++k) rates[k] = imu2.gyro[k] * gyroToRad;
+    if (!turnRateRun.gyro.add(rates, imu2.gyroTimestampUs))
+      turnRateRun.measurementGap = true;
+  }
+  const float metresPerCount = 2.0f * PI * wheelRadius / (gear * encoder.pulsPerRev);
+  turnRateRun.encoder.add(-encoder.encoder[0], encoder.encoder[1], metresPerCount, wheelBase);
+}
+
+void finishTurnRateCalibration(const char *reason)
+{
+  const float elapsed = (micros() - calStartUs) * 1e-6f;
+  turnRateRun.transition(-1, elapsed);
+  turnRateRun.reason = reason;
+  turnRateMetadata.gyroSamples = imu2.gyroCalibration.count;
+  turnRateMetadata.calibrated = imu2.gyroOffsetDone && kfAccelCalDone;
+  for (unsigned k = 0; k < 3; ++k)
+    turnRateMetadata.gyroOffsets[k] = imu2.gyroOffset(k);
+  calFinish();
+}
+
+void turnRateCalibrationTick()
+{
+  const float elapsed = (micros() - calStartUs) * 1e-6f;
+  const turnrate::Command command = turnrate::command(elapsed);
+  if (elapsed >= tuning::turnRateCalibration[0].duration)
+  {
+    if (!turnRateMetadata.valid)
+    { finishTurnRateCalibration("gyro configuration unavailable or inconsistent"); return; }
+    if (!imu2.gyroOffsetDone || !kfAccelCalDone)
+    { finishTurnRateCalibration("stationary calibration incomplete"); return; }
+    if (turnRateRun.measurementGap || !turnRateRun.gyro.seeded ||
+        micros() - turnRateRun.gyro.timestamp > 20000)
+    { finishTurnRateCalibration("gyro sample gap or invalid measurement"); return; }
+  }
+  if (command.index < 0)
+  { finishTurnRateCalibration("complete"); return; }
+  if (command.index != turnRateRun.index)
+  {
+    turnRateRun.transition(command.index, elapsed);
+    if (!command.motorsOff) resetWheelControl();
+    else { leftController.reset(); rightController.reset(); }
+  }
+  calPhase = 10 + command.index;
+  desiredValue = controlVCommand = 0;
+  desiredYawRate = controlOmegaRefLimited = controlOmegaCommand = command.reference;
+  controlHeadingCorrection = 0;
+  if (command.motorsOff)
+  {
+    // Observe coast-down without driving the motors or resetting filters.
+    updateWheelFeedback();
+    controlSetpoint[0] = controlSetpoint[1] = 0;
+    computedControl[0] = computedControl[1] = 0;
+    motor.motorVoltage[0] = motor.motorVoltage[1] = 0;
+  }
+  else
+  {
+    // Direct wheel reference steps: no heading, yaw PI, or turn limiter.
+    const WheelSpeeds wheels = polar2Cartesian(0, command.reference);
+    wheelSpeedControl(wheels.left * gear / wheelRadius, wheels.right * gear / wheelRadius);
+  }
+  turnrate::PhaseSummary &summary = turnRateRun.phases[command.index];
+  ++summary.ticks;
+  if (fabsf(computedControl[0]) >= 0.99f * controlVoltageLimit ||
+      fabsf(computedControl[1]) >= 0.99f * controlVoltageLimit)
+    ++summary.saturatedTicks;
+}
+
+void turnRateCalibrationSequence(bool newPress)
+{
+  if (!newPress && !robot.missionStart) return;
+  robot.missionStart = 0;
+  if (calArmed || !calStart(CAL_TURN_RATE)) return;
+  calBeginMotion();
+}
+
 void calStop()
 {
+  if (calState > 0 && calMode == CAL_TURN_RATE)
+  {
+    finishTurnRateCalibration("stopped");
+    return;
+  }
   bool wasStreaming = streamActive;
   streamActive = false;
   calArmed = false;
@@ -1675,21 +1879,43 @@ void upsideDownCalibrationSequence()
 
 void calTick()
 {
-  if (calMode == CAL_TRACK)
+  if (calMode == CAL_TURN_RATE)
   {
-    if (time_sec >= calTrackStepEnd)
+    turnRateCalibrationTick();
+    return;
+  }
+  if (calMode == CAL_TRACK or calMode == CAL_YAW)
+  {
+    const tuning::Step *steps = calMode == CAL_YAW ? tuning::yaw : tuning::track;
+    const int count = calMode == CAL_YAW ? calYawSteps : calTrackSteps;
+    while (time_sec >= calTrackStepEnd)
     {
       calTrackIndex++;
-      if (calTrackIndex >= calTrackSteps)
+      if (calTrackIndex >= count)
       {
         calFinish();
         return;
       }
-      calTrackStepEnd += calTrackDuration[calTrackIndex];
+      calTrackStepEnd += steps[calTrackIndex].duration;
     }
     calPhase = 10 + calTrackIndex;
-    float motorSp = calTrackSpeed[calTrackIndex] * (gear / wheelRadius);
-    wheelSpeedControl(motorSp, motorSp);
+    if (calMode == CAL_YAW)
+    {
+      if (!imu2.gyroOffsetDone || !imu2.gyroConfigurationValid ||
+          micros() - kfGyroTimestampUs > 20000)
+      {
+        usb.send("% cal yaw stopped: gyro unavailable\r\n");
+        calFinish();
+        return;
+      }
+      trackingControlUpdate(0.0f, steps[calTrackIndex].reference,
+                            poseHeading, false, true);
+    }
+    else
+    {
+      float motorSp = steps[calTrackIndex].reference * (gear / wheelRadius);
+      wheelSpeedControl(motorSp, motorSp);
+    }
   }
   else if (calMode == CAL_UPSIDE_DOWN)
   {
@@ -1718,7 +1944,7 @@ void updateCalLog()
     return;
   }
   CalData &d = calLogs[calCnt];
-  d.time = time_sec;
+  d.time = calMode == CAL_TURN_RATE ? (micros() - calStartUs) * 1e-6f : time_sec;
   d.mode = (uint16_t)calMode;
   uint16_t flags = 0;
   if (imu2.accelFresh) flags |= CAL_ACCEL_FRESH;
@@ -1726,6 +1952,9 @@ void updateCalLog()
   if (imu2.magFresh) flags |= CAL_MAG_FRESH;
   if (imu2.magHeadingValid) flags |= CAL_MAG_VALID;
   if (imu2.magAvailable) flags |= CAL_MAG_AVAILABLE;
+  if (imu2.gyroOffsetDone) flags |= CAL_GYRO_CALIBRATED;
+  if (kfAccelCalDone) flags |= CAL_ACCEL_CALIBRATED;
+  if (imu2.gyroConfigurationValid) flags |= CAL_GYRO_CONFIG_VALID;
   if (as5Valid) flags |= CAL_AS5_VALID;
   if (as5Fresh) flags |= CAL_AS5_FRESH;
   if (estimator.healthy) flags |= CAL_KF_HEALTHY;
@@ -1772,6 +2001,29 @@ void updateCalLog()
   d.imuDtUs = dtUs > 0xFFFF ? 0xFFFF : (uint16_t)dtUs;
   d.encoder[0] = (int16_t)(-encoder.encoder[0]);
   d.encoder[1] = (int16_t)(encoder.encoder[1]);
+  const bool yawCapture = calMode == CAL_YAW || calMode == CAL_TURN_RATE;
+  d.yawReference = yawCapture ? desiredYawRate : 0.0f;
+  d.yawReferenceLimited = yawCapture ? controlOmegaRefLimited : 0.0f;
+  d.yawCommand = yawCapture ? controlOmegaCommand : 0.0f;
+  d.gyroInput = kfGyroYawInput;
+  d.wheelVInput = kfWheelVInput;
+  d.wheelOmegaInput = kfWheelOmegaInput;
+  d.gyroTimestampUs = kfGyroTimestampUs;
+  d.wheelTimestampUs = kfWheelTimestampUs;
+  d.accelTimestampUs = imu2.accelTimestampUs;
+  d.diagnosticFlags = kfWheelEncoderSource ? LOG_WHEEL_ENCODER_FALLBACK : 0;
+  if (fabsf(computedControl[0]) >= 0.99f * controlVoltageLimit)
+    d.diagnosticFlags |= LOG_LEFT_SATURATED;
+  if (fabsf(computedControl[1]) >= 0.99f * controlVoltageLimit)
+    d.diagnosticFlags |= LOG_RIGHT_SATURATED;
+  if (calMode == CAL_YAW && fabsf(yawRatePid.lastOutput()) >= 0.99f * Lim_TU)
+    d.diagnosticFlags |= LOG_YAW_RATE_SATURATED;
+  for (unsigned k = 0; k < 3; ++k)
+  {
+    d.gyroCounts[k] = imu2.gyroCounts[k];
+    d.gyroIntegral[k] = calMode == CAL_TURN_RATE ? turnRateRun.gyro.value[k] : 0;
+  }
+  d.gyroSampleCount = calMode == CAL_TURN_RATE ? turnRateRun.gyro.count : 0;
   calCnt++;
 }
 
@@ -1814,6 +2066,48 @@ void printCalLog(bool manual = false)
   streamActive = false;
   Serial.print("% CAL ");
   Serial.println(calModeName(calMode));
+  if (calMode == CAL_TURN_RATE)
+  {
+    Serial.println("% Title: Turn-rate calibration sequence");
+    Serial.print("% Result: "); Serial.println(turnRateRun.reason);
+    Serial.println("% Control: wheel PI only, zero forward reference, no yaw/heading correction or turn limiter");
+    Serial.print("% Stationary calibration duration "); printLogValue(tuning::turnRateCalibration[0].duration);
+    Serial.print(" gyro samples "); Serial.print(turnRateMetadata.gyroSamples);
+    Serial.print(" accel samples "); Serial.print(turnRateRun.acceleration.count);
+    Serial.print(" complete "); Serial.println(turnRateMetadata.calibrated ? 1 : 0);
+    Serial.print("% Gyro readback at start: readable "); Serial.print(turnRateMetadata.readable ? 1 : 0);
+    Serial.print(" valid "); Serial.print(turnRateMetadata.valid ? 1 : 0);
+    Serial.print(" register "); Serial.print(turnRateMetadata.config);
+    Serial.print(" dlpf "); Serial.print(turnRateMetadata.dlpf);
+    Serial.print(" divider "); Serial.println(turnRateMetadata.divider);
+    Serial.print("% Gyro offsets (library deg/s)");
+    for (unsigned k = 0; k < 3; ++k) printLogValue(turnRateMetadata.gyroOffsets[k]);
+    Serial.println();
+    Serial.print("% Stationary gravity (library g)");
+    for (unsigned k = 0; k < 3; ++k) printLogValue(turnRateRun.acceleration.value[k]);
+    Serial.println();
+    Serial.println("% Sequence rows: phase, reference rad/s, duration s");
+    for (unsigned i = 0; i < turnrate::phaseCount; ++i)
+    {
+      Serial.print("% turn-step "); Serial.print(10 + i);
+      printLogValue(tuning::turnRateCalibration[i].reference);
+      printLogValue(tuning::turnRateCalibration[i].duration); Serial.println();
+    }
+    Serial.println("% Phase summary: phase reference start_s end_s gyro_X_rad gyro_Y_rad gyro_Z_rad wheel_rad fresh_gyro_samples wheel_saturation_fraction");
+    for (unsigned i = 0; i < turnrate::phaseCount; ++i)
+    {
+      const turnrate::PhaseSummary &phase = turnRateRun.phases[i];
+      if (!phase.recorded) continue;
+      Serial.print("% turn-phase "); Serial.print(10 + i);
+      printLogValue(tuning::turnRateCalibration[i].reference);
+      printLogValue(phase.start); printLogValue(phase.end);
+      for (unsigned k = 0; k < 3; ++k) printLogValue(phase.gyroAngle[k]);
+      printLogValue(phase.wheelAngle);
+      Serial.print(" "); Serial.print(phase.gyroSamples);
+      printLogValue(phase.ticks ? static_cast<float>(phase.saturatedTicks) / phase.ticks : 0);
+      Serial.println();
+    }
+  }
   Serial.print("% max cal samples ");
   Serial.print(calMax);
   Serial.print(" each sized ");
@@ -1823,17 +2117,23 @@ void printCalLog(bool manual = false)
   Serial.print(" us, log divider "); Serial.print(calDivider);
   Serial.print(", gear "); Serial.print(gear, 7);
   Serial.print(", wheel radius "); Serial.print(wheelRadius, 7);
-  Serial.print(" m, wheel base "); Serial.print(wheelBase, 7); Serial.println(" m");
+  Serial.print(" m, wheel base "); Serial.print(wheelBase, 7);
+  Serial.print(" m, PPR "); Serial.println(encoder.pulsPerRev);
   Serial.print("% Wheel PI L b0,b1,b2,a1,a2 ");
-  printLogValue(left_wheel_coeffs.b0); printLogValue(left_wheel_coeffs.b1);
-  printLogValue(left_wheel_coeffs.b2); printLogValue(left_wheel_coeffs.a1);
-  printLogValue(left_wheel_coeffs.a2); Serial.println();
+  printLogValue(calControllers.left.b0); printLogValue(calControllers.left.b1);
+  printLogValue(calControllers.left.b2); printLogValue(calControllers.left.a1);
+  printLogValue(calControllers.left.a2); Serial.println();
   Serial.print("% Wheel PI R b0,b1,b2,a1,a2 ");
-  printLogValue(right_wheel_coeffs.b0); printLogValue(right_wheel_coeffs.b1);
-  printLogValue(right_wheel_coeffs.b2); printLogValue(right_wheel_coeffs.a1);
-  printLogValue(right_wheel_coeffs.a2); Serial.println();
+  printLogValue(calControllers.right.b0); printLogValue(calControllers.right.b1);
+  printLogValue(calControllers.right.b2); printLogValue(calControllers.right.a1);
+  printLogValue(calControllers.right.a2); Serial.println();
   Serial.print("% Wheel voltage limit "); Serial.print(controlVoltageLimit, 6);
   Serial.println(" V");
+  printPidHeader("Yaw rate", calControllers.yaw, Lim_TU);
+  Serial.print("% Yaw mapping axis,sign,scale ");
+  Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
+  printLogValue(tuning::yawScale); Serial.println();
+  imu2.printGyroConfiguration();
   if (calMode == CAL_UPSIDE_DOWN)
   {
     Serial.print("% Upside schedule: 0.5 s zero, 2.5 s at ");
@@ -1845,8 +2145,9 @@ void printCalLog(bool manual = false)
   if (calTruncated)
     Serial.println("% WARNING: cal buffer filled; final samples are missing.");
   Serial.println("% 1 time (s)");
-  Serial.println("% 2 mode (1 mag, 2 noise, 3 track, 4 upside)");
-  Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag valid, bit4 mag available, bit5 AS5X47 valid, bit6 AS5X47 velocity fresh, bit7 KF healthy, bit8 mag attempt, bit9 mag DRDY, bit10 mag overflow)");
+  Serial.println("% 2 mode (1 mag, 2 noise, 3 track, 4 upside, 5 yaw, 6 turn-rate calibration)");
+  Serial.println("% 3 flags (bit0 accel fresh, bit1 gyro fresh, bit2 mag fresh, bit3 mag heading valid, bit4 mag available, bit5 AS5 valid, bit6 AS5 fresh, bit7 KF healthy)");
+  Serial.println("% flags continued: bit8 mag attempt, bit9 mag DRDY, bit10 mag overflow, bit11 gyro calibrated, bit12 accel calibrated, bit13 gyro configuration valid");
   Serial.println("% 4 kfMask (bit0 gyro, bit1 wheel v, bit2 wheel omega, bits3-4 reserved, bit5 wheel v/omega from encoder fallback)");
   Serial.println("% 5-6 setpoint (left,right) (motor rad/s)");
   Serial.println("% 7-8 PI feedback (left,right) (motor rad/s)");
@@ -1863,12 +2164,21 @@ void printCalLog(bool manual = false)
   Serial.println("% 31-32 estimator b_a, reserved (m/s^2, 0)");
   Serial.println("% 33-36 estimator innovation y (gyro, wheel v, wheel omega, reserved)");
   Serial.println("% 37-40 innovation variance S (0: static gains do not propagate P)");
-  Serial.println("% 41 sequence phase (10 baseline, 11 forward, 12 turn, 2 settling; track uses 10 + step index)");
+  Serial.println("% 41 sequence phase (track/yaw/turn-rate: 10 + step index; upside: 10 baseline, 11 forward, 12 turn, 2 settling)");
   Serial.println("% 42 mag status (low byte ST1, high byte ST2)");
   Serial.println("% 43 IMU sample interval (us)");
   Serial.println("% 44-45 encoder count low 16 bits (left,right), forward-positive");
+  Serial.println("% 46-48 yaw reference, effective reference, command (rad/s; yaw/turn-rate modes)");
+  Serial.println("% 49 mapped/scaled gyro input (rad/s)");
+  Serial.println("% 50-51 latest wheel update v,omega (m/s,rad/s; includes encoder fallback)");
+  Serial.println("% 52-54 gyro,wheel,accel measurement timestamp (us; held between updates)");
+  Serial.println("% 55 diagnostic flags (bit4 latest wheel source encoder, bits5/6 wheel saturation, bit8 yaw saturation)");
+  Serial.println("% 56-58 hardware gyro counts X,Y,Z (before library sign/scale and offset removal)");
+  Serial.println("% 59-61 unwrapped gyro angle integrals X,Y,Z (rad, library axes, fresh timestamps; turn-rate mode)");
+  Serial.println("% 62 accumulated fresh calibrated gyro samples (turn-rate mode)");
+  Serial.println("% Decimated capture: timestamps identify distinct measurements; intermediate updates are not captured.");
   Serial.println("% IMU bus 400 kHz; gyro DLPF 92 Hz; accel DLPF 94 Hz; AK8963 continuous 100 Hz");
-  Serial.println("% IMU axes: forward = -acc[2], CCW yaw = -gyro[0]");
+  Serial.println("% Forward acceleration = -acc[2]; yaw uses the mapping printed above.");
   Serial.print("% AK8963 ASA ");
   Serial.print(imu2.magAsa[0]); Serial.print(",");
   Serial.print(imu2.magAsa[1]); Serial.print(",");
@@ -1910,6 +2220,19 @@ void printCalLog(bool manual = false)
     Serial.print(" "); Serial.print(d.imuDtUs);
     Serial.print(" "); Serial.print(d.encoder[0]);
     Serial.print(" "); Serial.print(d.encoder[1]);
+    printLogValue(d.yawReference);
+    printLogValue(d.yawReferenceLimited);
+    printLogValue(d.yawCommand);
+    printLogValue(d.gyroInput);
+    printLogValue(d.wheelVInput);
+    printLogValue(d.wheelOmegaInput);
+    Serial.print(" "); Serial.print(d.gyroTimestampUs);
+    Serial.print(" "); Serial.print(d.wheelTimestampUs);
+    Serial.print(" "); Serial.print(d.accelTimestampUs);
+    Serial.print(" "); Serial.print(d.diagnosticFlags);
+    for (unsigned k = 0; k < 3; ++k) { Serial.print(" "); Serial.print(d.gyroCounts[k]); }
+    for (unsigned k = 0; k < 3; ++k) printLogValue(d.gyroIntegral[k]);
+    Serial.print(" "); Serial.print(d.gyroSampleCount);
     Serial.println("");
   }
   Serial.print("% sent ");
@@ -1952,8 +2275,13 @@ void streamHeader(int hz)
   usb.send("% 15-16 AS5X47 angle (left,right) (rad)\r\n");
   usb.send("% 17-18 encoder counts (left,right), forward-positive\r\n");
   usb.send("% 19 MPU temperature (C, updated at 1 Hz)\r\n");
-  usb.send("% IMU axes: forward = -acc[2], CCW yaw = -gyro[0]\r\n");
-  usb.send("% Keep the robot still; this stream is for stationary captures.\r\n");
+  usb.send("% 20-21 gyro/accel measurement timestamp (us)\r\n");
+  Serial.print("% Yaw mapping axis,sign,scale ");
+  Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
+  printLogValue(tuning::yawScale); Serial.println();
+  usb.send("% Forward acceleration = -acc[2]; yaw uses the mapping printed above.\r\n");
+  usb.send("% Motors off: keep still for noise, or rotate a measured angle for yaw calibration.\r\n");
+  imu2.printGyroConfiguration();
   printMagProbeSummary();
 }
 
@@ -2018,7 +2346,7 @@ void streamTick()
   char buf[280];
   int n = snprintf(buf, sizeof(buf),
       "%.4f %u %u %u %u %.6g %.6g %.6g %.6g %.6g %.6g "
-      "%.4f %.4f %.4f %.6f %.6f %d %d %.3f\r\n",
+      "%.4f %.4f %.4f %.6f %.6f %d %d %.3f %lu %lu\r\n",
       time_sec, (unsigned)dtUs, (unsigned)flags,
       (unsigned)imu2.magSt1, (unsigned)imu2.magSt2,
       imu2.gyro[0], imu2.gyro[1], imu2.gyro[2],
@@ -2026,7 +2354,8 @@ void streamTick()
       imu2.mag[0], imu2.mag[1], imu2.mag[2],
       as5AngleLast[0], as5AngleLast[1],
       (int)(-encoder.encoder[0]), (int)(encoder.encoder[1]),
-      imu2.temperatureValid ? imu2.temperatureC : NAN);
+      imu2.temperatureValid ? imu2.temperatureC : NAN,
+      (unsigned long)kfGyroTimestampUs, (unsigned long)imu2.accelTimestampUs);
   if (n > 0)
   {
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
@@ -2047,6 +2376,41 @@ bool decodeExperiment(const char *buf)
     calStart(CAL_NOISE);
   else if (strncmp(p, "track", 5) == 0)
     calStart(CAL_TRACK);
+  else if (strncmp(p, "yaw", 3) == 0)
+    calStart(CAL_YAW);
+  else if (strncmp(p, "imu", 3) == 0)
+    imu2.printGyroConfiguration();
+  else if (strncmp(p, "gains", 5) == 0)
+  {
+    if (state > 0 || calState > 0 || calArmed || streamActive)
+    {
+      usb.send("% cal gains refused: stop the active/armed experiment first\r\n");
+      return true;
+    }
+    char loopName[8], extra;
+    float kp, ki;
+    if (sscanf(p + 5, "%7s %f %f %c", loopName, &kp, &ki, &extra) != 3 ||
+        !isfinite(kp) || !isfinite(ki) || kp < 0 || ki < 0)
+    {
+      usb.send("% usage: cal gains left|right|yaw Kp Ki (finite, nonnegative)\r\n");
+      return true;
+    }
+    PID_Coefficients *coeffs = nullptr;
+    PIDController *pid = nullptr;
+    if (strcmp(loopName, "left") == 0) { coeffs = &left_wheel_coeffs; pid = &leftController; }
+    if (strcmp(loopName, "right") == 0) { coeffs = &right_wheel_coeffs; pid = &rightController; }
+    if (strcmp(loopName, "yaw") == 0) { coeffs = &yaw_pid_coeffs; pid = &yawRatePid; }
+    const PID_Coefficients proposed = tuning::pi(kp, ki);
+    if (!pid || !isfinite(proposed.b0) || !isfinite(proposed.b1))
+      usb.send("% invalid PI loop or coefficients\r\n");
+    else
+    {
+      *coeffs = proposed;
+      pid->setCoefficients(proposed);
+      printPidHeader(loopName, *coeffs, pid->limit());
+      usb.send("% trial gains applied; reset restores tuning.h defaults\r\n");
+    }
+  }
   else if (strncmp(p, "upside", 6) == 0)
     calStart(CAL_UPSIDE_DOWN);
   else if (strncmp(p, "stream", 6) == 0)
@@ -2070,7 +2434,7 @@ bool decodeExperiment(const char *buf)
   else if (strncmp(p, "retrymag", 8) == 0)
     imu2.retryMag();
   else
-    usb.send("% cal commands: mag | noise | track | upside | stream [Hz] | stop | clear | status | log | retrymag\r\n");
+    usb.send("% cal commands: mag | noise | track | yaw | upside | imu | gains left|right|yaw Kp Ki | stream [Hz] | stop | clear | status | log | retrymag\r\n");
   return true;
 }
 
@@ -2110,6 +2474,8 @@ void loop ( void )
       isSampleTime = false;
       imu2.tick();
       encoder.tick();
+      const bool newTurnRatePress = turnRateButton.update(digitalReadFast(PIN_START_BUTTON));
+      updateTurnRateMeasurements();
       estimatorUpdate();
       if (calState > 0)
       {
@@ -2123,7 +2489,10 @@ void loop ( void )
       }
       else
       {
-        closedLoopTrajectory();
+        if (tuning::mainExperiment == tuning::MainExperiment::TurnRateCalibration)
+          turnRateCalibrationSequence(newTurnRatePress);
+        else
+          closedLoopTrajectory();
         //upsideDownCalibrationSequence();
         //sequenceTwoSteps();
         //yawRateStep();

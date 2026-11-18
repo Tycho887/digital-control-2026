@@ -17,6 +17,23 @@ the Teensy requires to recognize an attached serial reader. Wait for that
 startup output, then press the robot's run button once. A completed run is
 sent and saved automatically; no `log` command is required.
 
+The default experiment is **Turn-rate calibration sequence**. Keep the robot
+still for four seconds after pressing start: gyro and forward-acceleration
+offsets are calibrated automatically. It then performs six four-second turns
+at +0.2, −0.2, +0.4, −0.4, +0.6 and −0.6 rad/s, with two seconds of motors-off
+coast-down after each turn. The complete run lasts 40 seconds. Only the wheel
+PI controllers drive the motors; yaw/heading feedback and reference limiters
+are bypassed. [The sequence and interpretation are documented here](TUNING.md).
+
+Run `src/scripts/plot_latest_log.m` in MATLAB from the repository root. It
+automatically recognizes the new capture, plots gyro/wheel/fused yaw,
+three-axis gyro rates and integrated angles, and wheel tracking, and prints
+per-turn ratios and actual gyro sample rates. It saves a PNG beside the log.
+Repeat the same button sequence with the body secured upside down and wheels
+clear to compare motor vibration with the stationary gyro. Wheel-derived yaw
+is not body rotation in that orientation. No device commands or firmware
+change are needed for either run.
+
 If the logging startup line never appears, the file writer has not started.
 Check the task's upload result and that it is using this `platformio.ini`;
 the firmware cannot create a file on the computer without an active monitor.
@@ -79,7 +96,9 @@ status, encoder fallback, and wheel/heading/yaw-controller saturation. The
 header also records the controller coefficients, reference limiters, trajectory
 parameters, geometry, log divider, and whether KF feedback was enabled.
 
-The main loop currently selects `closedLoopTrajectory()`. Place the robot
+`MainExperiment::TurnRateCalibration` in `src/src/tuning.h` selects the default
+button sequence. To restore the original controller trajectory, select
+`MainExperiment::OriginalTrajectory` and rebuild/upload. Place the robot
 upright with clear floor space, keep the monitor open, and press start once.
 The run starts on a new button press and the button must be released before
 another run; the input uses the internal pull-down, so a held or floating
@@ -91,12 +110,11 @@ complete run is logged at 250 Hz (`logDivider = 4`) as one format-4 capture.
 The 216-byte rows fit the shared 495 kB buffer with margin; a compile-time
 check requires 8 s of coverage.
 
-To run the wheels-off calibration instead, comment `closedLoopTrajectory()` in
-`loop()` and uncomment `upsideDownCalibrationSequence()`. That sequence runs
-the six-second schedule below and sends one `% CAL upside` capture instead of
-the standard format-4 header. Older experiments remain available by commenting
-the selected call and uncommenting `sequenceTwoSteps()`, `yawRateStep()`, or
-`forwardThreeSeconds()`.
+The older six-second wheels-off experiment remains available through
+`upsideDownCalibrationSequence()` or `cal upside`; it sends `% CAL upside`
+instead of the standard format-4 header. The default 40-second sequence can
+also run upside down without changing the selected mode. Other older
+experiments remain available in `loop()` as commented calls.
 The firmware applies zero PWM before printing the completed log. During a
 standard run it also streams a 20 Hz status line, prefixed `% live ...`. The
 live rows are comments for the format-4 analyzer, but they show time, state,
@@ -146,7 +164,9 @@ after calibration.
 The control path uses reference limiters for forward speed and turn rate, a
 heading lead-lag controller, yaw-rate PI, and the per-wheel encoder PI. The
 current wheel coefficients come from `Motor_model_param.m` (`Kp = 0.05/0.04`,
-`Ki = 0.1` at 1 ms), with a conservative 3 V actuator limit. There is no outer
+`Ki = 0.1` at 1 ms), with a 7 V actuator limit. Trial yaw PI gains are
+`Kp = 2.5`, `Ki = 12.5`. [Follow the tuning sequence](TUNING.md) for measured
+yaw calibration and isolated wheel/yaw trials. There is no outer
 forward-velocity PID in this architecture. `useKfFeedback` near the top of
 `basebot_6.ino` defaults to `true`; setting it to `false` bypasses only the KF
 heading/yaw feedback, leaving reference-limited feed-forward and the inner
@@ -155,18 +175,24 @@ the selected mode is printed in each log header.
 
 ## Calibration experiments
 
-Four USB-triggered experiments share a compact raw capture and the same
-495 kB buffer, plus an unbuffered stream. A standard run and a calibration
-capture are mutually exclusive: starting one discards an unread capture from
-the other.
+The automatic turn-rate sequence and optional USB-triggered experiments share
+a compact raw capture and the same 495 kB buffer, plus an unbuffered stream.
+The USB commands below are not required for the default sequence.
+A standard run and a calibration
+capture are mutually exclusive; send or clear a pending capture before
+starting another.
 
 | Command | Motors | Capture | Procedure |
 | --- | --- | --- | --- |
-| `cal mag` | off | 200 Hz, 15 s | Rotate the robot 360 degrees by hand and back. |
-| `cal noise` | off | 1 kHz, 3 s | Hold the robot still. |
-| `cal track` | PI | 500 Hz, 6 s | Clear the floor, then press the start button (or send `start`). |
-| `cal upside` | wheel PI | 500 Hz, 6 s | Secure the robot upside down with wheels clear, then press start. |
-| `cal stream [Hz]` | off | 50-500 Hz, 20 min | Keep the robot still; end with `cal stop`. No RAM buffer. |
+| Start button (default mode) | wheel PI | ~52.6 Hz, 40 s | Keep still for 4 s; automatic bidirectional turns and stops follow. |
+| `cal mag` | off | ~143 Hz, 15 s | Rotate the robot 360 degrees by hand and back. |
+| `cal noise` | off | 500 Hz, 3 s | Hold the robot still. |
+| `cal track` | wheel PI | ~111 Hz, 19 s | Clear the floor, then press the start button (or send `start`). |
+| `cal yaw` | wheel + yaw PI | 100 Hz, 22 s | Calibrate yaw first, then press start. Heading disabled. |
+| `cal upside` | wheel PI | ~333 Hz, 6 s | Secure the robot upside down with wheels clear, then press start. |
+| `cal imu` | unchanged | - | Read back gyro range, DLPF, divider and calibration status. |
+| `cal gains left\|right\|yaw Kp Ki` | off | - | Apply RAM-only PI trial gains while idle and disarmed. |
+| `cal stream [Hz]` | off | 50-500 Hz, 20 min | Keep still for noise or manually rotate for calibration; end with `cal stop`. |
 | `cal stop` | off | - | Stop now and keep the samples captured so far. |
 | `cal log` | off | - | Re-send a completed calibration capture. |
 | `cal clear` | off | - | Discard a completed calibration capture. |
@@ -176,9 +202,13 @@ the other.
 | `cal retrymag` | off | - | Probe the AK8963 and print WHO_AM_I, bypass, CNTL1, ST1/ST2 and raw values. |
 
 `cal mag` and `cal noise` start immediately and print their instructions.
-`cal track` and `cal upside` arm first. `cal track` runs the step schedule
-0, +0.05, +0.10, +0.15,
-0, -0.05, -0.10, -0.15, 0 m/s with 0.3-0.8 s segments. The firmware sends a
+`cal track`, `cal yaw`, and `cal upside` arm first. `cal track` runs
+0, +0.05, +0.10, +0.15, +0.20, 0, -0.05, -0.10, -0.15, -0.20, 0 m/s,
+with two-second moving plateaus and one-second zero plateaus (19 s total).
+`cal yaw` isolates the yaw-rate PI with calibrated gyro feedback, no heading
+correction, and zero forward reference for 22 s. `cal gains left|right|yaw Kp Ki`
+changes trial gains while idle; `cal imu` checks gyro configuration readback.
+The firmware sends a
 completed capture automatically when the monitor is connected; `cal log`
 repeats it while the robot stays powered. A pending capture is retained until
 it is sent or discarded with `cal clear`, and a new run is refused meanwhile.
@@ -207,14 +237,27 @@ start-button press. Do not call the low-level phase stepper directly from
 
 The calibration and driving procedures are separate. A standard ground run and
 a calibration capture share one RAM buffer, so save the completed capture
-before starting the other. `closedLoopTrajectory()` is selected by default;
-for the wheels-off calibration, comment it and uncomment
-`upsideDownCalibrationSequence()`, then rebuild/upload. For a feed-forward
-comparison, set `useKfFeedback = false` and repeat the upright trajectory.
+before starting the other. The turn-rate sequence is selected by default in
+`tuning.h`. For a feed-forward comparison of the original trajectory, select
+`MainExperiment::OriginalTrajectory`, set `useKfFeedback = false` and repeat it
+upright after rebuilding/uploading.
 
 The capture header is `% CAL <mode>` followed by 40 original columns, column
 41 sequence phase, and columns 42-45: AK8963 status (low byte ST1, high byte
 ST2), IMU sample interval (us), and the low 16 bits of the encoder counts.
+Columns 46-55 append yaw reference/limited reference/command, mapped gyro
+input, actual wheel-update inputs, gyro/wheel/acceleration timestamps, and
+source/saturation flags. The logging divider covers the complete longer
+trials; stationary noise uses 500 Hz. Rows now use 224 bytes and append hardware
+gyro XYZ counts in columns 56–58, three-axis unwrapped gyro integrals in radians
+in 59–61, and cumulative fresh calibrated gyro sample count in 62. The last
+four fields are populated for the turn-rate sequence; each gyro integral uses
+every fresh update before decimation. Its `% turn-phase` comments preserve
+phase-boundary angles and sample counts, and the header records the automatic
+calibration, gravity and gyro-register readback. Flags 11–13 identify completed
+gyro calibration, completed acceleration calibration and valid gyro
+configuration. `analyze_tuning.py capture LOG` handles
+these timestamps and encoder count wrapping.
 The original columns are time, mode,
 sensor-fresh flags, estimator-update mask, setpoints, PI feedback, motor
 voltage and encoder velocity, raw gyro/accel/mag, AS5X47 angle and velocity,
@@ -228,7 +271,9 @@ The zero variance columns are intentional: the stationary filter does not
 propagate `S`. Noise captures provide measurements for later gain retuning;
 there is no on-device `R` matrix to update automatically.
 
-Analyze the newest existing mag/noise/track/upside capture with:
+Analyze the newest turn-rate capture with MATLAB's `plot_latest_log.m` or
+`python3 src/scripts/analyze_turn_rate_calibration.py`. Analyze older
+mag/noise/track/yaw/upside captures with:
 
 ```sh
 python3 src/scripts/analyze_calibration.py
@@ -241,7 +286,7 @@ pair/sign against gyro-integrated yaw (including the firmware's current
 `atan2(Y, -Z)`). `noise` reports measured 1-sigma values against the filter's
 assumed values; NIS is unavailable because the stationary gains do not
 propagate `S`. `track` reports rise time, overshoot, settling time,
-steady-state and RMS error, and 3 V saturation for the PI feedback, AS5X47
+steady-state and RMS error, and saturation at the recorded voltage limit for the PI feedback, AS5X47
 velocity and estimator velocity. `upside` reports sensor health (dead AS5X47
 bus, magnetometer availability, encoder-fallback share, zero-velocity feed
 events), per-phase gyro and accelerometer noise, the estimator's first-order

@@ -12,6 +12,7 @@ Examples:
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -85,7 +86,7 @@ def load_stream(path):
             float(parts[0])
         except ValueError:
             break
-        rows.append(parts[:N_COLUMNS])
+        rows.append(parts)
     if not rows:
         raise SystemExit("%s contains no stream rows." % path)
     return np.array(rows, dtype=float)
@@ -138,16 +139,23 @@ def white_noise_fit(taus, adev, points=4):
     return q, slope
 
 
-def analyze_stream(t, data, outdir=None, show=False):
+def analyze_stream(t, data, outdir=None, show=False,
+                   yaw_axis=0, yaw_sign=-1, yaw_scale=1):
     flags = data[:, COL_FLAGS].astype(np.uint16)
     gyro = data[:, COL_GYRO:COL_GYRO + 3]
     acc = data[:, COL_ACC:COL_ACC + 3]
     mag = data[:, COL_MAG:COL_MAG + 3]
 
-    gyro_yaw = -gyro[:, 0] * np.pi / 180.0      # rad/s
+    gyro_yaw = yaw_sign * yaw_scale * gyro[:, yaw_axis] * np.pi / 180.0
     accel_forward = -acc[:, 2] * GRAVITY         # m/s^2
     dt_us = data[:, COL_DT]
-    rate = 1e6 / float(np.median(dt_us))
+    rate = 1 / float(np.median(np.diff(t)))
+    if data.shape[1] >= 21:
+        gyro_valid = (data[:, 19] != 0) & np.r_[True, np.diff(data[:, 19]) != 0]
+        accel_valid = (data[:, 20] != 0) & np.r_[True, np.diff(data[:, 20]) != 0]
+    else:
+        gyro_valid = (flags & FLAG_GYRO_FRESH) != 0
+        accel_valid = (flags & FLAG_ACCEL_FRESH) != 0
 
     print("\n=== Stream ===")
     print("samples %d over %.3f s, median rate %.1f Hz"
@@ -174,14 +182,15 @@ def analyze_stream(t, data, outdir=None, show=False):
     print("  ST2 unique: %s" % np.unique(data[:, COL_ST2].astype(int))[:8])
 
     print("\n=== Sensor noise (1-sigma) ===")
-    gyro_sigma = [_sigma(t, gyro[:, k]) for k in range(3)]
-    acc_sigma = [_sigma(t, acc[:, k]) * GRAVITY for k in range(3)]
+    gyro_sigma = [_sigma(t[gyro_valid], gyro[gyro_valid, k]) for k in range(3)]
+    yaw_sigma = abs(yaw_scale) * gyro_sigma[yaw_axis]
+    acc_sigma = [_sigma(t[accel_valid], acc[accel_valid, k]) * GRAVITY for k in range(3)]
     print("gyro deg/s: x=%.4f y=%.4f z=%.4f"
           % tuple(gyro_sigma))
     print("accel m/s^2: x=%.4f y=%.4f z=%.4f"
           % tuple(acc_sigma))
     print("gyro yaw %.4f deg/s (%.3e rad/s)"
-          % (abs(gyro_sigma[0]), abs(gyro_sigma[0]) * np.pi / 180.0))
+          % (abs(yaw_sigma), abs(yaw_sigma) * np.pi / 180.0))
     print("accel forward %.4f m/s^2" % abs(acc_sigma[2]))
 
     mag_sigma = [_sigma(t, mag[:, k]) for k in range(3)]
@@ -200,9 +209,9 @@ def analyze_stream(t, data, outdir=None, show=False):
 
     print("\n=== Allan deviation ===")
     allan = {}
-    for name, signal, unit in (("gyro yaw", gyro_yaw, "rad/sqrt(s)"),
-                               ("accel forward", accel_forward, "m/s^1.5")):
-        taus, adev = allan_deviation(t, signal)
+    for name, signal, valid, unit in (("gyro yaw", gyro_yaw, gyro_valid, "rad/sqrt(s)"),
+                                     ("accel forward", accel_forward, accel_valid, "m/s^1.5")):
+        taus, adev = allan_deviation(t[valid], signal[valid]) if np.sum(valid) >= 10 else (np.array([]), np.array([]))
         q, slope = white_noise_fit(taus, adev)
         adev_min = float(np.min(adev)) if adev.size else float("nan")
         tau_min = float(taus[int(np.argmin(adev))]) if adev.size else float("nan")
@@ -242,8 +251,8 @@ def analyze_stream(t, data, outdir=None, show=False):
         "rate": rate,
         "duration": float(t[-1] - t[0]),
         "sigma": {
-            "gyro_yaw_deg": abs(gyro_sigma[0]),
-            "gyro_yaw_rad": abs(gyro_sigma[0]) * np.pi / 180.0,
+            "gyro_yaw_deg": abs(yaw_sigma),
+            "gyro_yaw_rad": abs(yaw_sigma) * np.pi / 180.0,
             "accel_forward": abs(acc_sigma[2]),
             "mag_x": mag_sigma[0],
             "mag_heading": heading_sigma,
@@ -291,7 +300,12 @@ def main():
     t = data[:, COL_TIME]
     print("Log:  %s" % path)
     show = not args.no_plots and args.outdir is None
-    analyze_stream(t, data, outdir=args.outdir, show=show)
+    mapping = re.search(r"% Yaw mapping axis,sign,scale\s+(\d+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)", path.read_text())
+    options = {}
+    if mapping:
+        options = {"yaw_axis": int(mapping[1]), "yaw_sign": float(mapping[2]),
+                   "yaw_scale": float(mapping[3])}
+    analyze_stream(t, data, outdir=args.outdir, show=show, **options)
     return 0
 
 

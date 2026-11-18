@@ -21,7 +21,8 @@ enum KfMeasurement : uint8_t
 };
 
 // Constant gains for the decoupled stationary filter. Each entry maps one
-// scalar innovation into its state block. Values come from the block DARE in
+// scalar innovation into its state block. Translation uses a lifted DARE;
+// yaw uses a joint periodic covariance with a constant mean gyro gain in
 // kalman_filter_tuning/solve_dare.m; regenerate them when its parameters
 // change.
 //
@@ -31,8 +32,8 @@ enum KfMeasurement : uint8_t
 namespace kf_gains
 {
 constexpr float K_WHEEL_V[2] = {0.197604345f, -0.018533077f};
-constexpr float K_GYRO = 0.209729549f;
-constexpr float K_WHEEL_OMEGA = 0.012222362f;
+constexpr float K_GYRO = 0.209727561f;
+constexpr float K_WHEEL_OMEGA = 0.000056983f;
 } // namespace kf_gains
 
 /**

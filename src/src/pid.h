@@ -62,6 +62,13 @@ public:
   const PID_Coefficients &coefficients() const { return coeffs; }
   float limit() const { return outputLimit; }
 
+  // Firmware permits this only while idle; discard all previous PI memory.
+  void setCoefficients(const PID_Coefficients &c)
+  {
+    coeffs = c;
+    reset();
+  }
+
 private:
   PID_Coefficients coeffs;
   float outputLimit;

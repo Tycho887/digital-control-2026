@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyze a firmware calibration capture.
 
-Handles `cal mag`, `cal noise`, `cal track` and `cal upside`. The firmware
+Handles `cal mag`, `cal noise`, `cal track`, `cal yaw` and `cal upside`. The firmware
 prints a `% CAL <mode>` line followed by the column header and rows documented
 in `printCalLog()` (src/src/basebot_6.ino). With no log argument the newest
 file in ../logs is used.
@@ -23,7 +23,7 @@ import numpy as np
 GEAR = 9.6
 WHEEL_RADIUS = 0.0315
 WHEEL_BASE = 0.14
-CONTROL_VOLTAGE_LIMIT = 3.0
+CONTROL_VOLTAGE_LIMIT = 7.0
 SIGMA_GYRO_DEG = 0.17                 # deg/s, DARE input from the 14 Nov logs
 SIGMA_ACCEL = 0.12                    # m/s^2, in-motion DARE input
 SIGMA_ANGLE_DEG = 0.068               # deg
@@ -128,6 +128,9 @@ def load_cal(path):
 
 
 def _bool_mask(data, bit):
+    if data.shape[1] >= 55 and bit in (FLAG_GYRO_FRESH, FLAG_ACCEL_FRESH):
+        col = 51 if bit == FLAG_GYRO_FRESH else 53
+        return (data[:, col] != 0) & np.r_[True, np.diff(data[:, col]) != 0]
     return (data[:, COL_FLAGS].astype(np.uint16) & bit) != 0
 
 
@@ -372,6 +375,10 @@ def analyze_noise(t, data, outdir=None, show=False):
         np.std(_detrend(gyro_rows[:, COL_TIME], gyro_rows[:, COL_GYRO + k]))
         for k in range(3)
     ]
+    yaw_sigma_deg = gyro_sigma_deg[0]
+    if data.shape[1] >= 55:
+        yaw_sigma_deg = np.rad2deg(np.std(_detrend(
+            gyro_rows[:, COL_TIME], gyro_rows[:, 48])))
 
     acc_rows = _select(data, _bool_mask(data, FLAG_ACCEL_FRESH))
     acc_g = acc_rows[:, COL_ACC:COL_ACC + 3]
@@ -420,7 +427,7 @@ def analyze_noise(t, data, outdir=None, show=False):
     print("%-22s %12s %12s %8s  %s" %
           ("quantity", "assumed", "measured", "ratio", "verdict"))
     checks = [
-        ("gyro yaw (deg/s)", SIGMA_GYRO_DEG, gyro_sigma_deg[0]),
+        ("gyro yaw (deg/s)", SIGMA_GYRO_DEG, yaw_sigma_deg),
         ("accel forward (m/s^2)", SIGMA_ACCEL, acc_sigma[2]),
         ("AS5X47 angle (rad)", assume_angle, angle_sigma),
         ("wheel v (m/s)", assumed_v, v_sigma),
@@ -491,7 +498,8 @@ def analyze_noise(t, data, outdir=None, show=False):
     return {"checks": results, "nis": nis_rows}
 
 
-def _step_metrics(t, y, target, baseline, u, start, end):
+def _step_metrics(t, y, target, baseline, u, start, end,
+                  voltage_limit=None, minimum_band=0.5):
     y_seg = y[start:end]
     t_seg = t[start:end]
     delta = target - baseline
@@ -499,7 +507,7 @@ def _step_metrics(t, y, target, baseline, u, start, end):
     if abs(delta) < 1e-9 or t_seg.size < 3:
         return None
 
-    frac = direction * (y_seg - baseline) / delta
+    frac = (y_seg - baseline) / delta
     i10 = np.flatnonzero(frac >= 0.1)
     i90 = np.flatnonzero(frac >= 0.9)
     rise = float("nan")
@@ -509,7 +517,7 @@ def _step_metrics(t, y, target, baseline, u, start, end):
     overshoot = max(0.0, float(np.max(direction * (y_seg - target))) /
                     abs(delta))
 
-    band = max(0.05 * abs(delta), 0.5)
+    band = max(0.05 * abs(delta), minimum_band)
     outside = np.flatnonzero(np.abs(y_seg - target) > band)
     settle = float("nan")
     if outside.size == 0:
@@ -520,7 +528,8 @@ def _step_metrics(t, y, target, baseline, u, start, end):
     tail = max(1, int(0.3 * y_seg.size))
     ss_error = float(np.mean(y_seg[-tail:] - target))
     rms = float(np.sqrt(np.mean((y_seg - target) ** 2)))
-    sat = float(np.mean(np.abs(u[start:end]) >= 0.99 * CONTROL_VOLTAGE_LIMIT))
+    limit = CONTROL_VOLTAGE_LIMIT if voltage_limit is None else voltage_limit
+    sat = float(np.mean(np.abs(u[start:end]) >= 0.99 * limit))
     return {
         "rise": rise,
         "overshoot": overshoot,
@@ -939,6 +948,33 @@ def analyze_upside(t, data, outdir=None, show=False):
     return result
 
 
+def analyze_yaw(t, data, outdir=None, show=False):
+    from analyze_tuning import capture
+    config = {"radius": WHEEL_RADIUS, "gear": GEAR, "base": WHEEL_BASE,
+              "ppr": 48, "limit": CONTROL_VOLTAGE_LIMIT}
+    result = capture(data, "yaw", config)
+    print("\n=== Isolated yaw PI (calibrated gyro feedback, heading disabled) ===")
+    for m in result["steps"]:
+        print("phase %d target %+.4f rad/s rise %.3f s overshoot %.1f%% "
+              "SS error %+.4f limited-reference RMS %.4f correction saturation %.1f%%" % (
+            m["phase"], m["target"], m["rise"], 100*m["overshoot"],
+            m["ss_error"], m["limited_reference_rms"], 100*m["saturation"]))
+    print("Encoder angle %.2f deg; gyro angle %.2f deg" % (
+        result["wheel_angle_deg"], result["gyro_angle_deg"]))
+    if outdir is not None or show:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for col, label in ((45, "programmed"), (46, "limited reference"),
+                           (47, "command"), (48, "gyro feedback")):
+            ax.plot(t, data[:, col], label=label)
+        ax.set(xlabel="time (s)", ylabel="yaw rate (rad/s)")
+        ax.legend()
+        ax.grid(True, alpha=.3)
+        fig.tight_layout()
+        _finish_fig(fig, outdir, "cal_yaw")
+    return result
+
+
 def _finish_fig(fig, outdir, stem):
     if outdir is not None:
         outdir = Path(outdir)
@@ -969,6 +1005,12 @@ def main():
     args = parser.parse_args()
 
     path = args.log or latest_log(default_logs)
+    # Historical captures used 3 V; use their recorded limit when present.
+    import re
+    global CONTROL_VOLTAGE_LIMIT
+    match = re.search(r"% Wheel voltage limit\s+([\d.eE+-]+)", path.read_text())
+    if match:
+        CONTROL_VOLTAGE_LIMIT = float(match.group(1))
     data, mode = load_cal(path)
     t = data[:, COL_TIME]
     print("Log:  %s" % path)
@@ -993,6 +1035,8 @@ def main():
         analyze_track(t, data, outdir=outdir, show=show)
     elif mode == "upside":
         analyze_upside(t, data, outdir=outdir, show=show)
+    elif mode == "yaw":
+        analyze_yaw(t, data, outdir=outdir, show=show)
     else:
         raise SystemExit("Unknown calibration mode %r" % mode)
     return 0

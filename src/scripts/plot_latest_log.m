@@ -6,7 +6,13 @@ logDirectory = fullfile(sourceDirectory, 'logs');
 
 % These columns cover every signal shown in the controller tracking plots.
 signalColumns = [1, 3, 30, 31, 32, 33, 34, 42, 43];
-[data, logPath] = loadNewestFormat4Log(logDirectory, signalColumns);
+[data, logPath, turnRateCalibration] = loadNewestFormat4Log(logDirectory, signalColumns);
+
+if turnRateCalibration
+    addpath(scriptDirectory);
+    [figureHandle, pngPath, calibration] = plot_turn_rate_calibration(logPath);
+    time_s = data(:,1);
+else
 
 time_s = data(:, 1);
 referenceSpeed_m_s = data(:, 3);
@@ -97,8 +103,9 @@ fprintf('Selected log: %s\n', logPath);
 fprintf('Plotted %d samples over %.3f s.\n', ...
     numel(time_s), time_s(end) - time_s(1));
 fprintf('Saved figure: %s\n', pngPath);
+end
 
-function [data, selectedPath] = loadNewestFormat4Log(logDirectory, signalColumns)
+function [data, selectedPath, turnRateCalibration] = loadNewestFormat4Log(logDirectory, signalColumns)
     logs = dir(fullfile(logDirectory, '*.log'));
     if isempty(logs)
         error('plot_latest_log:NoLogs', ...
@@ -112,6 +119,14 @@ function [data, selectedPath] = loadNewestFormat4Log(logDirectory, signalColumns
         candidatePath = fullfile(logDirectory, logs(index).name);
         try
             logText = fileread(candidatePath);
+            if contains(logText, '% CAL turn-rate-calibration')
+                addpath(fileparts(mfilename('fullpath')));
+                capture = read_turn_rate_calibration(candidatePath);
+                data = capture.data;
+                selectedPath = candidatePath;
+                turnRateCalibration = true;
+                return;
+            end
             if ~contains(lower(logText), '% log format 4')
                 continue;
             end
@@ -136,6 +151,7 @@ function [data, selectedPath] = loadNewestFormat4Log(logDirectory, signalColumns
 
         data = candidateData;
         selectedPath = candidatePath;
+        turnRateCalibration = false;
         return;
     end
 

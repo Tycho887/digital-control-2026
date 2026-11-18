@@ -95,14 +95,25 @@ def expected_gains():
     K_v = dare_gain(F_tw, np.array([[1.0, 0.0]]), Q_tw,
                     np.array([[SIGMA_WHEEL_V ** 2]]))
 
-    K_g = dare_gain(np.array([[1.0]]), np.array([[1.0]]),
-                    np.array([[(Q_OM * DT) ** 2]]),
-                    np.array([[sigma_gyro ** 2]]))
-
-    K_w = dare_gain(np.array([[1.0]]), np.array([[1.0]]),
-                    np.array([[WHEEL_DIVIDER * (Q_OM * DT) ** 2]]),
-                    np.array([[SIGMA_WHEEL_OMEGA ** 2]]))
-    return K_v.ravel(), K_g.ravel(), K_w.ravel()
+    # Shared periodic covariance: gyro each tick, then wheel at cycle end.
+    rg, rw = sigma_gyro ** 2, SIGMA_WHEEL_OMEGA ** 2
+    posterior = rg
+    for _ in range(100000):
+        previous = posterior
+        gyro_cycle = []
+        for tick in range(WHEEL_DIVIDER):
+            prior = posterior + (Q_OM * DT) ** 2
+            kg = prior / (prior + rg)
+            gyro_cycle.append(kg)
+            posterior = (1 - kg) * prior
+            if tick == WHEEL_DIVIDER - 1:
+                kw = posterior / (posterior + rw)
+                posterior *= 1 - kw
+        if abs(posterior - previous) < 1e-12 * max(rg, rw):
+            break
+    else:
+        raise RuntimeError("Joint covariance did not converge")
+    return K_v.ravel(), np.array([np.mean(gyro_cycle)]), np.array([kw])
 
 
 def predict_matrix():

@@ -1,3 +1,7 @@
+function result = solve_dare(options)
+% Optional struct fields override noise/disturbance defaults.
+% options.output_dir selects where generated artifacts are written.
+if nargin == 0, options = struct(); end
 %% ========================================================================
 %  kalman_filter_tuning/solve_dare.m
 %
@@ -13,11 +17,10 @@
 %      theta += 0.5*(omega_prev + omega)*Ts
 %      s     += 0.5*(v_prev + v)*Ts
 %
-%  The DARE is solved per observable block at the rate each measurement is
-%  actually applied:
+%  Translation DARE and joint periodic yaw covariance use the rates at which
+%  measurements are actually applied:
 %      [v, b_a]  1 kHz predict, 100 Hz wheel-v update
-%      omega     1 kHz gyro update
-%      omega     100 Hz wheel-omega update
+%      omega     1 kHz gyro + 100 Hz wheel-omega on a shared covariance
 %
 %  Noise inputs are the 1-sigma values recorded in the `cal upside` logs
 %  (src/logs/device-monitor-261114-152906.log and the 14:40 capture):
@@ -34,8 +37,6 @@
 %  Toolbox (`dare`) are required.
 % ========================================================================
 
-clear; close all; clc;
-
 %% ---------------- 1. PARAMETERS -----------------------------------------
 Ts          = 1e-3;   % filter period [s]
 wheel_div   = 10;     % wheel update every 10 filter steps (100 Hz)
@@ -51,6 +52,17 @@ sigma_wheel_omega = 0.18;    % [rad/s], encoder fallback, 10 ms
 q_v  = 1.0;     % [m/s^2] unmodelled velocity disturbance
 q_om = 0.7;     % [rad/s^2] unmodelled angular acceleration (turn limiter)
 q_ba = 3e-3;    % [m/s^2/sqrt(s)] accelerometer bias random walk
+
+sigma_gyro_dps = parameter(options, 'sigma_gyro_dps', sigma_gyro_dps, true);
+sigma_accel = parameter(options, 'sigma_accel', sigma_accel, false);
+sigma_wheel_v = parameter(options, 'sigma_wheel_v', sigma_wheel_v, true);
+sigma_wheel_omega = parameter(options, 'sigma_wheel_omega', sigma_wheel_omega, true);
+q_v = parameter(options, 'q_v', q_v, false);
+q_om = parameter(options, 'q_om', q_om, true);
+q_ba = parameter(options, 'q_ba', q_ba, true);
+output_dir = fileparts(mfilename('fullpath'));
+if isfield(options, 'output_dir'), output_dir = options.output_dir; end
+if ~isfolder(output_dir), mkdir(output_dir); end
 
 d2r         = pi/180;
 sigma_gyro  = sigma_gyro_dps * d2r;   % [rad/s]
@@ -81,20 +93,17 @@ R_v = sigma_wheel_v^2;
 [P_v, ~, ~] = dare(F_tw', H_v', Q_tw, R_v);
 K_wheel_v = P_v * H_v' / (H_v * P_v * H_v' + R_v);   % 2x1 over [v, b_a]
 
-%% ---------------- 3. ROTATION BLOCK, GYRO AT 1 kHz ----------------------
-F_r = 1;
+%% ---------------- 3. JOINT MULTI-RATE ROTATION BLOCK --------------------
+% Both sensors correct the SAME omega covariance. Separate DAREs ignore
+% the uncertainty removed by ten intervening gyro updates.
 Q_g = (q_om * Ts)^2;
 R_g = sigma_gyro^2;
-
-[P_g, ~, ~] = dare(F_r', 1, Q_g, R_g);
-K_gyro = P_g / (P_g + R_g);                         % scalar over omega
-
-%% ---------------- 4. ROTATION BLOCK, WHEEL OMEGA AT 100 Hz ---------------
-Q_w = wheel_div * (q_om * Ts)^2;
 R_w = sigma_wheel_omega^2;
-
-[P_w, ~, ~] = dare(F_r', 1, Q_w, R_w);
-K_wheel_omega = P_w / (P_w + R_w);                  % scalar over omega
+[K_gyro, K_wheel_omega, P_g, P_w, gyro_cycle] = ...
+    joint_yaw_gains(Q_g, R_g, R_w, wheel_div);
+% Retain the firmware's constant gyro gain using the periodic cycle mean.
+fprintf('Periodic gyro gains %.9g..%.9g; constant mean %.9g\n', ...
+    min(gyro_cycle), max(gyro_cycle), K_gyro);
 
 %% ---------------- 5. OBSERVABILITY AND MULTI-RATE CHECK ----------------
 F = [1,  0, -Ts;
@@ -136,17 +145,53 @@ if cycle_eig >= 1
 end
 
 %% ---------------- 7. SAVE ----------------------------------------------
-save('dare_results.mat', 'Ts', 'wheel_div', 'F', 'H', 'K_wheel_v', ...
+save(fullfile(output_dir, 'dare_results.mat'), 'Ts', 'wheel_div', 'F', 'H', 'K_wheel_v', ...
      'K_gyro', 'K_wheel_omega', 'P_v', 'P_g', 'P_w', 'sigma_gyro', ...
      'sigma_accel', 'sigma_wheel_v', 'sigma_wheel_omega', 'q_v', 'q_om', ...
-     'q_ba');
-write_csv('dare_gains.csv', K_wheel_v, K_gyro, K_wheel_omega);
-write_header('dare_gains.h', K_wheel_v, K_gyro, K_wheel_omega);
+     'q_ba', 'gyro_cycle');
+write_csv(fullfile(output_dir, 'dare_gains.csv'), K_wheel_v, K_gyro, K_wheel_omega);
+write_header(fullfile(output_dir, 'dare_gains.h'), K_wheel_v, K_gyro, K_wheel_omega);
 fprintf('\nSaved dare_results.mat, dare_gains.csv and dare_gains.h\n');
+result = struct('K_wheel_v', K_wheel_v, 'K_gyro', K_gyro, ...
+    'K_wheel_omega', K_wheel_omega, 'cycle_eig', cycle_eig, ...
+    'gyro_cycle', gyro_cycle);
+end
 
 %% ========================================================================
 %  Local functions
 %% ========================================================================
+
+function value = parameter(options, name, default, positive)
+    value = default;
+    if isfield(options, name), value = options.(name); end
+    assert(isnumeric(value) && isscalar(value) && isfinite(value) && ...
+        value >= 0 && (~positive || value > 0), 'Invalid parameter %s', name);
+end
+
+function [Kg, Kw, Pg, Pw, gains] = joint_yaw_gains(Q, Rg, Rw, count)
+    posterior = Rg;
+    converged = false;
+    for cycle = 1:100000
+        previous = posterior;
+        gains = zeros(count, 1);
+        for tick = 1:count
+            Pg = posterior + Q;
+            gains(tick) = Pg / (Pg + Rg);
+            posterior = (1 - gains(tick)) * Pg;
+            if tick == count
+                Pw = posterior;
+                Kw = Pw / (Pw + Rw);
+                posterior = (1 - Kw) * Pw;
+            end
+        end
+        if abs(posterior - previous) < 1e-12 * max(Rg, Rw)
+            converged = true;
+            break;
+        end
+    end
+    assert(converged, 'Joint yaw covariance did not converge');
+    Kg = mean(gains);
+end
 
 function r = observability_rank(F, H)
     n = size(F, 1);
