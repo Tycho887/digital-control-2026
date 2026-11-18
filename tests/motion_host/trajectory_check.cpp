@@ -30,6 +30,14 @@ int main()
   assert(trajectoryCommand(c, c.duration() - 0.001f).phase == 2);
   assert(trajectoryCommand(c, c.duration()).phase == 0);
 
+  // Experiment 4: a 2 m straight, with the final 0.60 s reserved for braking.
+  const float cruiseSpeed = 2.0f / 3.7f;
+  assert(near(trajectoryCommand(c, c.initialRest).velocity, cruiseSpeed, 1e-6f));
+  assert(near(trajectoryCommand(c, 3.60f).velocity, cruiseSpeed, 1e-6f));
+  assert(near(trajectoryCommand(c, 3.90f).velocity, cruiseSpeed / 2, 1e-6f));
+  assert(near(trajectoryCommand(c, turnStart - 0.001f).velocity, cruiseSpeed / 600, 1e-6f));
+  assert(trajectoryCommand(c, turnStart).velocity == 0.0f);
+
   float distance = 0.0f;
   float heading = 0.0f;
   for (float t = 0.0f; t < c.duration(); t += 0.001f)
@@ -62,6 +70,17 @@ int main()
   c.turnRate = 0.0f;
   assert(!c.valid());
   assert(trajectoryCommand(c, turnStart).phase == 0);
+
+  c = TrajectoryConfig{};
+  c.forwardDuration = 0.4f; // Braking can occupy the entire straight.
+  assert(near(trajectoryCommand(c, c.initialRest).velocity, 2 * c.forwardSpeed, 1e-6f));
+  assert(near(trajectoryCommand(c, c.initialRest + 0.2f).velocity, c.forwardSpeed, 1e-6f));
+  c.forwardBrakeTime = 0.0f;
+  assert(trajectoryCommand(c, c.initialRest + 0.399f).velocity == c.forwardSpeed);
+  c.forwardBrakeTime = -0.1f;
+  assert(!c.valid());
+  c.forwardBrakeTime = NAN;
+  assert(!c.valid());
 
   c = TrajectoryConfig{};
   c.forwardSpeed = 0.0f;

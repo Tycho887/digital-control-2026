@@ -6,12 +6,13 @@
 struct TrajectoryConfig
 {
   float initialRest = 0.2f;
-  float forwardSpeed = 0.5f;      // m/s
+  float forwardSpeed = 0.5f;      // mean m/s over the straight (2 m in 4 s)
   float forwardDuration = 4.0f;   // s
   float turnRate = 0.78539816f;   // mean rad/s over the turn (180 deg in 4 s)
   float turnDuration = 4.0f;      // s
   float finalRest = 0.6f;         // s
   float turnRampTime = 0.5f;      // s at each end of the turn; 0 restores the step
+  float forwardBrakeTime = 0.6f;  // s of braking at the end of the straight; 0 restores the step
 
   float duration() const
   {
@@ -23,6 +24,7 @@ struct TrajectoryConfig
     return isfinite(initialRest) && initialRest >= 0.0f &&
            isfinite(forwardSpeed) && forwardSpeed > 0.0f &&
            isfinite(forwardDuration) && forwardDuration > 0.0f &&
+           isfinite(forwardBrakeTime) && forwardBrakeTime >= 0.0f &&
            isfinite(turnRate) && fabsf(turnRate) > 0.0f &&
            isfinite(turnDuration) && turnDuration > 0.0f &&
            isfinite(turnRampTime) && turnRampTime >= 0.0f &&
@@ -49,7 +51,15 @@ inline TrajectoryCommand trajectoryCommand(const TrajectoryConfig &c, float elap
 
   end += c.forwardDuration;
   if (elapsed < end)
-    return {c.forwardSpeed, 0.0f, 11};
+  {
+    const float brake = fminf(c.forwardBrakeTime, c.forwardDuration);
+    if (brake == 0.0f)
+      return {c.forwardSpeed, 0.0f, 11};
+
+    // The cruise and linear brake cover cruiseSpeed * (forwardDuration - brake / 2).
+    const float cruiseSpeed = c.forwardSpeed / (1.0f - 0.5f * brake / c.forwardDuration);
+    return {cruiseSpeed * fminf(1.0f, (end - elapsed) / brake), 0.0f, 11};
+  }
 
   const float turnStart = end;
   end += c.turnDuration;
