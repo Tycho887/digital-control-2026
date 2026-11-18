@@ -1,6 +1,6 @@
 Ts = 0.001; 
 
-num_s = Kph * [head_tau_d, 1];
+num_s = (Kph)  * [head_tau_d, 1];
 den_s = [head_alpha * head_tau_d, 1];
 sys_c = tf(num_s, den_s);
 

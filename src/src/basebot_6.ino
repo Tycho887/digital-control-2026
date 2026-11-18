@@ -1070,12 +1070,19 @@ void forwardThreeSeconds()
 
 void closedLoopTrajectory()
 {
-  // Require a new press for each run. A held or floating start input must not
-  // restart the sequence immediately after the log has been sent.
   static bool startButtonLatched = false;
+  static float startDist = 0.0f;
   const bool button = digitalReadFast(PIN_START_BUTTON);
   const bool newPress = button and !startButtonLatched;
   startButtonLatched = button;
+
+  TrajectoryConfig myTrack;
+  myTrack.speed = 1.0f;               
+  myTrack.radius = 0.5f;            
+  myTrack.entryDistance = 1.0f;       
+  myTrack.arcDistance = 2.837f;       // R * theta (5.674 rad)
+  myTrack.exitDistance = 1.5f;       
+  myTrack.initialDelay = 0.1f;       
 
   if (state == 0)
   {
@@ -1083,14 +1090,19 @@ void closedLoopTrajectory()
     {
       if (!start()) return;
       state = 10;
+      startDist = distA; // Record starting distance
       desiredValue = 0.0f;
       desiredYawRate = 0.0f;
-      endTime = closedLoopConfig.duration();
+      desiredHeading = poseHeading;
     }
     return;
   }
 
-  TrajectoryCommand command = trajectoryCommand(closedLoopConfig, time_sec);
+  float distanceTraveled = distA - startDist;
+  float elapsed = time_sec; 
+
+  TrajectoryCommand command = trajectoryCommand(myTrack, distanceTraveled, elapsed);
+  
   if (command.phase == 0)
   {
     finished();
@@ -1100,9 +1112,9 @@ void closedLoopTrajectory()
   state = command.phase;
   desiredValue = command.velocity;
   desiredYawRate = command.yawRate;
-  if (state == 12)
-  {
-    desiredHeading = wrapAngle(desiredHeading +
+
+  if (fabsf(desiredYawRate) > 0.01f) {
+    desiredHeading = wrapAngle(desiredHeading + 
                                desiredYawRate * sampleTimeUs * 1e-6f);
   }
 }
