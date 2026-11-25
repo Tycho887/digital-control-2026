@@ -163,13 +163,36 @@ sequence exceeds capacity, its log includes a warning about missing samples.
 The pose and velocity columns come from the stationary decoupled estimator in
 `src/src/kalman.h` and `kalman.cpp`. It runs at 1 kHz with state
 `[v, omega, b_a]`: forward acceleration drives `v`, wheel `v` corrects
-`[v, b_a]`, and the gyro / wheel `omega` correct `omega`. Heading `theta` and
-distance `x`, `y`, `s` are dead-reckoned outside the filter from `v` and
-`omega` with the trapezoidal rule. The gains are constant; no covariance is
-propagated. The stock 48-edge quadrature encoders feed both the filter and the
+`[v, b_a]`, and the gyro / wheel `omega` correct `omega`. The firmware
+dead-reckons heading, XY position, and signed forward distance outside the filter.
+Experiment 12 enabled `useSimpsonOdometry` in `src/src/tuning.h` for the
+button trajectory. In that mode each first tick uses a trapezoid. The next tick completes a
+quadratic (Simpson) integral of `v` and `omega` over the two measured time
+intervals. A rejected tick breaks the pair, and a pair with an interval ratio
+above 2 uses two trapezoids. XY uses the distance increment projected at the
+midpoint heading. The post-run `% Paired Simpson minus trapezoid` line gives
+the signed final and peak absolute differences in integrated forward distance
+(mm), then yaw (degrees), accumulated from identical full-rate KF samples.
+Setting the switch to `false` restores experiment 11 integration.
+The filter uses fixed gains. The stock 48-edge quadrature encoders feed both the filter and the
 inner wheel-speed PI. Columns 11-14 report pose, columns 27-28 linear and
 angular velocity, column 29 the raw magnetometer heading (diagnostic only,
 `NaN` when unavailable), and columns 33-37 `[v, omega, theta, b_a, 0]`.
+
+**Experiment 13 compares physical heading with both integration rules.** Run
+the same course in A–B–B–A order. The default A build uses trapezoids
+(`useSimpsonOdometry = false`). For B set the flag to `true` and use PlatformIO
+Upload and Monitor, then restore A for the last run. The column 14 header
+identifies the active rule in each capture. Use the same floor, starting marks,
+and stationary gyro warm-up for each run.
+
+Before and after each run, align a straightedge with the same edge of the
+stationary chassis and mark the line through both ends. Compare the directions
+of the two lines to measure final yaw independently of translation. Over a
+50 cm straightedge, 1° corresponds to 8.7 mm. Record the signed angle (CCW
+positive) and the displacement of the wheel-mark midpoint along the starting
+heading (+X forward) with each log filename. Compare absolute physical yaw
+and X errors across repeats, alongside the onboard estimates.
 
 The IMU driver brings up the AK8963 behind the MPU-9250's bypass path. The
 whole IMU bus runs at 400 kHz, the MPU-9250 and AK8963 limit; the old 1 MHz

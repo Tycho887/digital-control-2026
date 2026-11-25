@@ -42,6 +42,7 @@ void printStatus();
 #include "uencoder.h"
 #include "AS5X47.h"
 #include "kalman.h"
+#include "odometry.h"
 #include "pid.h"
 #include "trajectory.h"
 #include "tuning.h"
@@ -94,10 +95,11 @@ uint32_t kfAccelCalCnt = 0;
 bool kfAccelCalDone = false;
 float poseHeading = 0.0f;      // dead-reckoned heading, not a filter state
 float poseStartTheta = 0.0f;   // heading at start(), for run-relative pose
-float poseHeadingTotal = 0.0f;      // unwrapped trapezoidal heading
+float poseHeadingTotal = 0.0f;      // unwrapped integrated heading
 float poseStartHeadingTotal = 0.0f; // unwrapped heading at start()
-float posePrevV = 0.0f;        // previous v for trapezoidal dead reckoning
-float posePrevOmega = 0.0f;    // previous omega for trapezoidal heading
+float posePrevV = 0.0f;        // previous forward speed
+float posePrevOmega = 0.0f;    // previous yaw rate
+PairedSimpson runQuadrature;
 uint32_t kfLastUs = 0;
 // Outer-loop commands from the last control tick, for logging.
 float controlVCommand = 0.0f;     // m/s
@@ -201,7 +203,7 @@ typedef struct
   float kfInnov[KF_MEAS_COUNT];
   float gyroRaw[3];       // imu2.gyro[], deg/s, offset-corrected
   float accRaw[3];        // imu2.acc[], g
-  float totalAngle;       // rad, unwrapped trapezoidal integral since start
+  float totalAngle;       // rad, unwrapped integral since start
   float yawRateCorrection; // rad/s, yaw-rate PID output
   uint16_t kfMask;
   uint16_t diagnosticFlags;
@@ -571,6 +573,14 @@ void printLog(bool manual)
   Serial.print("% maximum log samples ");  Serial.print(logsMax);
   Serial.print(" each sized ");  Serial.print(sizeof(LogData)); Serial.println(" bytes");
   Serial.print("% KF heading/yaw feedback "); Serial.println(useKfFeedback ? 1 : 0);
+  if (tuning::useSimpsonOdometry && logsCnt > 0)
+  {
+    Serial.print("% Paired Simpson minus trapezoid: final,peak abs distance (mm), final,peak abs yaw (deg)");
+    printLogValue(1000.0 * runQuadrature.distanceDifference);
+    printLogValue(1000.0 * runQuadrature.peakDistanceDifference);
+    printLogValue(RAD_TO_DEG * runQuadrature.yawDifference);
+    printLogValue(RAD_TO_DEG * runQuadrature.peakYawDifference); Serial.println();
+  }
   Serial.print("% Yaw mapping axis,sign,scale ");
   Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
   printLogValue(tuning::yawScale); Serial.println();
@@ -614,7 +624,9 @@ void printLog(bool manual)
   Serial.println("% 8-9 motor vel (left, right) (rad/s)");
   Serial.println("% 10  Battery voltage (V)");
   Serial.println("% 11-13 pose (x,y,theta) (m, m, rad)");
-  Serial.println("% 14 total distance (m, trapezoidal)");
+  Serial.println(tuning::useSimpsonOdometry ?
+                 "% 14 total integrated forward distance (m, paired Simpson)" :
+                 "% 14 total distance (m, trapezoidal)");
   Serial.println("% 15-16 legacy calibrated current (left, right) (A), forward-positive");
   Serial.println("% 17 capture timestamp (us since start), ADC read follows actuator update");
   Serial.println("% 18-19 raw current ADC counts (left A1, right A0), 12 bit");
@@ -645,7 +657,7 @@ void printLog(bool manual)
   Serial.println("% 57 diagnostic flags: bit0 KF feedback, bit1 KF healthy, bit2 AS5 valid, bit3 AS5 fresh, bit4 encoder fallback, bits5/6 wheel L/R saturation, bit7 heading saturation, bit8 yaw-rate saturation, bit9 gyro fresh, bit10 gyro offset done, bit11 gyro config valid, bit12 accel fresh, bit13 gyro saturated");
   Serial.println("% 58-60 gyro raw (x,y,z) (deg/s, offset-corrected)");
   Serial.println("% 61-63 accel raw (x,y,z) (g)");
-  Serial.println("% 64 total angle (rad, unwrapped trapezoidal since start)");
+  Serial.println("% 64 total angle (rad, unwrapped since start)");
   Serial.println("% 65 yaw-rate PID output (rad/s)");
   Serial.println("% 66-67 AS5047P/AS5147 MAG L/R (14-bit field magnitude counts, CS 24/25)");
   Serial.println("% 68-69 AS5047P/AS5147 ANGLECOM L/R (native motor-shaft counts, 16384/rev)");
@@ -867,6 +879,7 @@ bool start()
   desiredHeading = poseHeading;
   poseStartTheta = poseHeading;
   poseStartHeadingTotal = poseHeadingTotal;
+  runQuadrature = {};
   posePrevV = estimator.v;
   posePrevOmega = estimator.omega;
   // Make the first logged row use the new origin, before the next estimator tick.
@@ -1409,6 +1422,7 @@ void estimatorUpdate()
   kfUpdateMask = 0;
   if (dt <= 0.0f || dt > 0.020f)
   {
+    runQuadrature.discardPendingInterval();
     for (auto &wheel : wheelMagnetic) wheel.angle = -1;
     as5Fresh = false;
     as5Valid = false;
@@ -1452,12 +1466,18 @@ void estimatorUpdate()
   // quadrature feedback is the flagged fallback when the read fails.
   wheelOdometryUpdate();
 
-  // External dead reckoning: heading and position are deliberately outside
-  // the filter. Both use the trapezoidal rule over the filter's v and omega.
+  // Dead-reckon distance and heading from the corrected KF samples.
   const float vNow = estimator.v;
   const float omegaNow = estimator.omega;
-  const float ds = 0.5f * (posePrevV + vNow) * dt;
-  const float dtheta = 0.5f * (posePrevOmega + omegaNow) * dt;
+  float ds = 0.5f * (posePrevV + vNow) * dt;
+  float dtheta = 0.5f * (posePrevOmega + omegaNow) * dt;
+  if (tuning::useSimpsonOdometry && state > 0)
+  {
+    const OdometryIncrement delta = runQuadrature.correction(dt, vNow - posePrevV,
+                                                             omegaNow - posePrevOmega);
+    ds += delta.distance;
+    dtheta += delta.yaw;
+  }
   const float thetaMid = wrapAngle(poseHeading + 0.5f * dtheta);
   pose[0] += ds * cosf(thetaMid);
   pose[1] += ds * sinf(thetaMid);

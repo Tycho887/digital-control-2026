@@ -8,6 +8,8 @@ namespace tuning
 enum class MainExperiment { TurnRateCalibration, OriginalTrajectory };
 constexpr MainExperiment mainExperiment = MainExperiment::OriginalTrajectory;
 constexpr float sampleTime = 0.001f;
+// Experiment 13 A/B trial: A uses experiment 11 trapezoids, B uses paired Simpson.
+constexpr bool useSimpsonOdometry = false;
 
 // ============================================================================
 // Controller tuning
