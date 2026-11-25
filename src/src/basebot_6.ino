@@ -96,7 +96,8 @@ float kfWheelVInput = 0.0f;
 float kfWheelOmegaInput = 0.0f;
 bool kfWheelEncoderSource = false;
 const bool useKfFeedback = true;  // false: outer heading/yaw feed-forward only
-TrajectoryConfig closedLoopConfig;
+TrajectoryConfig closedLoopConfig{0.2f, 0.5f, 1.0f, 2.837f, 1.5f, 0.2f};
+TrajectoryState trajState; 
 
 // Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
 // the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
@@ -559,14 +560,7 @@ void printLog(bool manual)
   Serial.print("% Yaw mapping axis,sign,scale ");
   Serial.print(imuYawAxis); printLogValue(imuYawRateSign);
   printLogValue(tuning::yawScale); Serial.println();
-  Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
-  printLogValue(closedLoopConfig.initialRest);
-  printLogValue(closedLoopConfig.forwardDuration);
-  printLogValue(closedLoopConfig.turnDuration);
-  printLogValue(closedLoopConfig.finalRest); Serial.println();
-  Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
-  printLogValue(closedLoopConfig.forwardSpeed);
-  printLogValue(closedLoopConfig.turnRate); Serial.println();
+  Serial.print("% Trajectory speed (m/s), radius (m), entry (m), arc length (m), exit (m), corner (rad), turn speed (rad/s) ");
   printPidHeader("Wheel PI L", runControllers.left, controlVoltageLimit);
   printPidHeader("Wheel PI R", runControllers.right, controlVoltageLimit);
   printPidHeader("Heading", heading_coeffs, Lim_TU);
@@ -1071,26 +1065,17 @@ void forwardThreeSeconds()
 void closedLoopTrajectory()
 {
   static bool startButtonLatched = false;
-  static float startDist = 0.0f;
   const bool button = digitalReadFast(PIN_START_BUTTON);
   const bool newPress = button and !startButtonLatched;
   startButtonLatched = button;
-
-  TrajectoryConfig myTrack;
-  myTrack.speed = 1.0f;               
-  myTrack.radius = 0.5f;            
-  myTrack.entryDistance = 1.0f;       
-  myTrack.arcDistance = 2.837f;       // R * theta (5.674 rad)
-  myTrack.exitDistance = 1.5f;       
-  myTrack.initialDelay = 0.1f;       
 
   if (state == 0)
   {
     if (newPress or robot.missionStart)
     {
       if (!start()) return;
+      trajState = TrajectoryState(); 
       state = 10;
-      startDist = distA; // Record starting distance
       desiredValue = 0.0f;
       desiredYawRate = 0.0f;
       desiredHeading = poseHeading;
@@ -1098,25 +1083,22 @@ void closedLoopTrajectory()
     return;
   }
 
-  float distanceTraveled = distA - startDist;
-  float elapsed = time_sec; 
-
-  TrajectoryCommand command = trajectoryCommand(myTrack, distanceTraveled, elapsed);
-  
-  if (command.phase == 0)
+  if (state == 2) 
   {
-    finished();
-    return;
-  }
+    if (time_sec > endTime) finished(); 
+    return; 
+  } 
+
+  
+  TrajectoryCommand command = trajectoryCommand(closedLoopConfig, trajState,
+                                                distA, desiredHeading, time_sec); 
+  if (command.phase < 0) { finished(); return; } 
+  if (command.phase == 0) { stop(0.6f); return; }
 
   state = command.phase;
   desiredValue = command.velocity;
   desiredYawRate = command.yawRate;
-
-  if (fabsf(desiredYawRate) > 0.01f) {
-    desiredHeading = wrapAngle(desiredHeading + 
-                               desiredYawRate * sampleTimeUs * 1e-6f);
-  }
+  desiredHeading = wrapAngle(desiredHeading + desiredYawRate * sampleTimeUs * 1e-6f);
 }
 
 /**
