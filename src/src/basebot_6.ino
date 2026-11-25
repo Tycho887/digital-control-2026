@@ -115,6 +115,10 @@ float kfWheelOmegaInput = 0.0f;
 bool kfWheelEncoderSource = false;
 const bool useKfFeedback = true;  // false: outer heading/yaw feed-forward only
 constexpr TrajectoryConfig closedLoopConfig{};
+constexpr bool useLecture10Trajectory = true; // false selects the two-straight test
+constexpr auto lecture10Profile = lecture10::rampedFullRoute; // fullRoute replays cycle 2, arcTrial cycle 1
+lecture10::State lecture10Run;
+const char *trajectoryResult = "no run";
 
 // Absolute angle wheel sensors (AS5047P/AS5147) on the motor shafts, sharing
 // the hardware SPI bus (MOSI 11, MISO 12, SCK 13). Chip selects are
@@ -314,11 +318,12 @@ typedef struct
   uint32_t gyroSampleCount;
 } CalData;
 
-// Fit both straight legs, both turns and the final hold in one format-4 capture.
+// Retain the full selected trial, including a stalled run that reaches its deadline.
 const int logBufferBytes = 495000; // leaves ~16 kB of the OCRAM heap free
 const int logsMax = logBufferBytes / sizeof(LogData);
-const int logDivider = tuning::logDivider(closedLoopConfig.duration(), logsMax);
-static_assert((logsMax - 1) * sampleTimeUs * logDivider >= closedLoopConfig.duration() * 1e6f,
+constexpr float captureDuration = useLecture10Trajectory ? lecture10::deadline : closedLoopConfig.duration();
+const int logDivider = tuning::logDivider(captureDuration, logsMax);
+static_assert((logsMax - 1) * sampleTimeUs * logDivider >= captureDuration * 1e6f,
               "Log buffer must cover the complete sequence plus margin");
 LogData * logs = (LogData*)malloc(logsMax * sizeof(LogData));
 CalData * calLogs = (CalData*)logs;
@@ -589,21 +594,59 @@ void printLog(bool manual)
     for (int col = 0; col < 3; col++)
       printLogValue(imuToBody[row][col]);
   Serial.println();
-  Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
-  printLogValue(closedLoopConfig.initialRest);
-  printLogValue(closedLoopConfig.forwardDuration);
-  printLogValue(closedLoopConfig.turnDuration);
-  printLogValue(closedLoopConfig.finalRest); Serial.println();
-  Serial.print("% Trajectory post-turn settle,return duration (s) ");
-  printLogValue(closedLoopConfig.turnSettle);
-  printLogValue(closedLoopConfig.forwardDuration); Serial.println();
-  Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
-  printLogValue(closedLoopConfig.forwardSpeed);
-  printLogValue(closedLoopConfig.turnRate); Serial.println();
-  Serial.print("% Final turn duration (s), mean rate (rad/s), pre-turn stop (s)");
-  printLogValue(closedLoopConfig.turnDuration);
-  printLogValue(-closedLoopConfig.turnRate);
-  printLogValue(closedLoopConfig.preTurnSettle); Serial.println();
+  Serial.print("% Trajectory result "); Serial.println(trajectoryResult);
+  if (useLecture10Trajectory)
+  {
+    if (lecture10Profile.driveExit)
+    {
+      Serial.print(lecture10Profile.pivotRise > 0 ? "% Trajectory Lecture 10 cycle 3" : "% Trajectory Lecture 10 cycle 2");
+      Serial.println(": 10 rest, 20 entry, 21 CW pivot, 22 CCW arc, 23 CW exit pivot, 24 exit straight, 2 stop capture");
+    }
+    else
+      Serial.println("% Trajectory Lecture 10 cycle 1: 10 rest, 20 entry, 21 CW pivot, 22 CCW arc, 2 stop capture");
+    Serial.print("% Entry, radius, gap, arc length (m)");
+    printLogValue(lecture10::entryDistance); printLogValue(lecture10::radius);
+    printLogValue(lecture10::gap); printLogValue(lecture10::arcDistance); Serial.println();
+    if (lecture10Profile.driveExit)
+    {
+      Serial.print("% Exit length (m), exit heading (rad), arc cruise (m/s)");
+      printLogValue(lecture10::exitDistance); printLogValue(lecture10::exitHeading);
+      printLogValue(lecture10Profile.arcSpeed); Serial.println();
+      Serial.println("% Route distance uses mean wheel travel from encoder columns 6-7; column 14 is the KF estimate");
+    }
+    Serial.print("% Pivot and arc angles (rad), cruise (m/s), pivot rate (rad/s), braking (m/s^2)");
+    printLogValue(-lecture10::pivotAngle); printLogValue(lecture10::arcAngle);
+    printLogValue(lecture10Profile.straightSpeed); printLogValue(-lecture10Profile.pivotSpeed);
+    printLogValue(lecture10::brakingAccel); Serial.println();
+    Serial.print("% Pivot rise, fall, commanded duration (s)");
+    printLogValue(lecture10Profile.pivotRise); printLogValue(lecture10Profile.pivotFall);
+    printLogValue(lecture10::pivotDuration(lecture10Profile)); Serial.println();
+    Serial.print("% Distance tolerance (m), pivot tolerance (rad), settled rate (rad/s)");
+    printLogValue(lecture10::distanceTolerance); printLogValue(lecture10::pivotTolerance);
+    printLogValue(lecture10::settledRate); Serial.println();
+    Serial.print("% Initial rest, stop capture, deadline (s)");
+    printLogValue(lecture10::initialRest); printLogValue(lecture10::stopCapture);
+    printLogValue(lecture10::deadline); Serial.println();
+  }
+  else
+  {
+    Serial.println("% Trajectory two-straight test");
+    Serial.print("% Trajectory baseline,forward duration,turn duration,settling (s) ");
+    printLogValue(closedLoopConfig.initialRest);
+    printLogValue(closedLoopConfig.forwardDuration);
+    printLogValue(closedLoopConfig.turnDuration);
+    printLogValue(closedLoopConfig.finalRest); Serial.println();
+    Serial.print("% Trajectory post-turn settle,return duration (s) ");
+    printLogValue(closedLoopConfig.turnSettle);
+    printLogValue(closedLoopConfig.forwardDuration); Serial.println();
+    Serial.print("% Trajectory forward speed (m/s), turn rate (rad/s) ");
+    printLogValue(closedLoopConfig.forwardSpeed);
+    printLogValue(closedLoopConfig.turnRate); Serial.println();
+    Serial.print("% Final turn duration (s), mean rate (rad/s), pre-turn stop (s)");
+    printLogValue(closedLoopConfig.turnDuration);
+    printLogValue(-closedLoopConfig.turnRate);
+    printLogValue(closedLoopConfig.preTurnSettle); Serial.println();
+  }
   printPidHeader("Wheel PI L", runControllers.left, controlVoltageLimit);
   printPidHeader("Wheel PI R", runControllers.right, controlVoltageLimit);
   printPidHeader("Heading", heading_coeffs, tuning::Lim_TU);
@@ -1151,7 +1194,11 @@ void closedLoopTrajectory()
 
   if (useKfFeedback && !gyroFeedbackReady())
   {
-    if (state != 0) finished();  // zero PWM and preserve the captured rows
+    if (state != 0)
+    {
+      trajectoryResult = "aborted: gyro feedback unavailable";
+      finished();  // zero PWM and preserve the captured rows
+    }
     usb.send("% trajectory disabled: gyro feedback unavailable; check 'cal imu', then press start again\r\n");
     return;
   }
@@ -1162,14 +1209,46 @@ void closedLoopTrajectory()
     state = 10;
     desiredValue = 0.0f;
     desiredYawRate = 0.0f;
-    endTime = closedLoopConfig.duration();
+    trajectoryResult = "running";
+    if (useLecture10Trajectory)
+      lecture10Run = {};
+    else
+      endTime = closedLoopConfig.duration();
     return;
   }
 
   const float elapsed = (micros() - captureStartUs) * 1e-6f;
+  if (useLecture10Trajectory)
+  {
+    // start() zeros both counters. The raw left encoder decreases going forward.
+    const float routeDistance = lecture10Profile.driveExit ?
+        (float(encoder.encoder[1]) - float(encoder.encoder[0])) * PI * wheelRadius /
+            (gear * encoder.pulsPerRev) : distA;
+    const auto ref = lecture10::lecture10TrajectoryCommand(
+        lecture10Run, elapsed, routeDistance, poseHeadingTotal - poseStartHeadingTotal,
+        estimator.omega, lecture10Profile);
+    if (lecture10Run.phase <= lecture10::Complete)
+    {
+      switch (lecture10Run.phase)
+      {
+        case lecture10::TimedOut: trajectoryResult = "aborted: run deadline"; break;
+        case lecture10::InvalidInput: trajectoryResult = "aborted: invalid trajectory input"; break;
+        default: trajectoryResult = lecture10Profile.driveExit ?
+                     "completed exit straight" : "completed at arc exit"; break;
+      }
+      finished();
+      return;
+    }
+    state = lecture10Run.phase;
+    desiredValue = ref.velocity;
+    desiredYawRate = ref.yawRate;
+    desiredHeading = wrapAngle(poseStartTheta + ref.heading);
+    return;
+  }
   TrajectoryCommand command = trajectoryCommand(closedLoopConfig, elapsed);
   if (command.phase == 0)
   {
+    trajectoryResult = "completed two-straight test";
     finished();
     return;
   }
